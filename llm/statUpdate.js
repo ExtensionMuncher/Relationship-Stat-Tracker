@@ -4,7 +4,7 @@
  * narrative summaries, AND scene summaries (single LLM call)
  */
 
-import { generateRaw, chat } from "../../../../script.js";
+import { generateRaw, chat } from "../../../../../script.js";
 import { withProfile } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getCharacterProfile, cloneStats, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";

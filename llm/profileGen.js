@@ -3,7 +3,7 @@
  * Generates character descriptions, notes, and initial stats from scene context
  */
 
-import { generateRaw, chat } from "../../../../script.js";
+import { generateRaw, chat } from "../../../../../script.js";
 import { withProfile } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getAllSceneSummaries } from "../data/scenes.js";

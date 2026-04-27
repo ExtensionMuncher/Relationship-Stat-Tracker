@@ -11,7 +11,7 @@ import {
     saveSettingsDebounced,
     saveChatDebounced,
     extension_settings,
-} from "../../../script.js";
+} from "../../../../script.js";
 
 import { initSettings, isEnabled, getSetting } from "./settings.js";
 import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter } from "./data/storage.js";
