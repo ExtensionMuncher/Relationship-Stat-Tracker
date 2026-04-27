@@ -3,7 +3,7 @@
  * Injects character relationship stats into the ST system prompt
  */
 
-import { setExtensionPrompt } from "../../../../../script.js";
+import { setExtensionPrompt } from "../../../../script.js";
 import { getSettings, getPresentCharacters } from "../data/storage.js";
 import { getCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 

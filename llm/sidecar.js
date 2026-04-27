@@ -3,7 +3,7 @@
  * Calls a lightweight LLM to detect character names in recent messages
  */
 
-import { generateRaw, chat, name1 } from "../../../../../script.js";
+import { generateRaw, chat, name1 } from "../../../../script.js";
 import { withProfile } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getAllCharacters } from "../data/characters.js";

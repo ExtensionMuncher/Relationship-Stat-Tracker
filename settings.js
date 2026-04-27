@@ -3,7 +3,7 @@
  * Handles initialization, loading, and saving of extension settings
  */
 
-import { saveSettingsDebounced } from "../../../../../script.js";
+import { saveSettingsDebounced } from "../../../script.js";
 import { getSettings, getDefaultSettings, saveSetting, saveAllSettings, persistSettings } from "./data/storage.js";
 
 // ─── Initialization ───────────────────────────────────────
