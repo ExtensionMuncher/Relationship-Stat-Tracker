@@ -1,0 +1,637 @@
+/* ============================================================
+   Relationship State Tracker — Extension Styles
+   All classes prefixed with rst- to avoid conflicts
+   ============================================================ */
+
+/* --- CSS Custom Properties --- */
+:root {
+    --rst-accent: #7F77DD;
+    --rst-positive: #0F6E56;
+    --rst-negative: #993C1D;
+    --rst-zero: #999;
+    --rst-avatar-bg: #EEEDFE;
+    --rst-avatar-text: #3C3489;
+    --rst-pending-border: #AFA9EC;
+    --rst-info-bg: #EEEDFE;
+    --rst-success-bg: #E1F5EE;
+    --rst-success-text: #085041;
+    --rst-danger: #993C1D;
+    --rst-badge-closed-bg: #F1EFE8;
+    --rst-badge-closed-text: #444441;
+    --rst-badge-pending-bg: #EEEDFE;
+    --rst-badge-pending-text: #3C3489;
+    --rst-border: var(--SmartThemeBorderColor, #ddd);
+    --rst-text: var(--SmartThemeBodyColor, #111);
+    --rst-text-muted: var(--SmartThemeBodyColor, #999);
+    --rst-bg: var(--SmartThemeBlurTintColor, #fff);
+    --rst-bg-hover: var(--SmartThemeBlurTintColor, #f8f8f8);
+    --rst-font: system-ui, sans-serif;
+    --rst-font-size: 13px;
+}
+
+/* --- Main Shell --- */
+.rst-shell {
+    border: 0.5px solid var(--rst-border);
+    border-radius: 12px;
+    overflow: hidden;
+    background: var(--rst-bg);
+    font-family: var(--rst-font);
+    font-size: var(--rst-font-size);
+    color: var(--rst-text);
+    margin-bottom: 10px;
+}
+
+/* --- Tabs --- */
+.rst-tabs {
+    display: flex;
+    border-bottom: 0.5px solid var(--rst-border);
+    background: var(--rst-bg-hover);
+}
+
+.rst-tab {
+    padding: 9px 13px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    color: var(--rst-text-muted);
+    font-size: var(--rst-font-size);
+    white-space: nowrap;
+    user-select: none;
+}
+
+.rst-tab:hover {
+    color: var(--rst-text);
+}
+
+.rst-tab.on {
+    color: var(--rst-text);
+    border-bottom: 2px solid var(--rst-accent);
+    font-weight: 500;
+}
+
+/* --- Panes --- */
+.rst-pane {
+    padding: 16px;
+    display: none;
+}
+
+.rst-pane.on {
+    display: block;
+}
+
+/* --- Labels --- */
+.rst-lbl {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--rst-text-muted);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+
+/* --- Cards --- */
+.rst-card {
+    background: var(--rst-bg);
+    border: 0.5px solid var(--rst-border);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 10px;
+}
+
+.rst-pending-card {
+    background: var(--rst-bg);
+    border: 0.5px solid var(--rst-pending-border);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 10px;
+}
+
+/* --- Chips (Character List Items) --- */
+.rst-chip {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 12px;
+    border: 0.5px solid var(--rst-border);
+    border-radius: 8px;
+    cursor: pointer;
+    margin-bottom: 6px;
+}
+
+.rst-chip:hover,
+.rst-chip.on {
+    background: var(--rst-bg-hover);
+}
+
+/* --- Avatar --- */
+.rst-av {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    background: var(--rst-avatar-bg);
+    color: var(--rst-avatar-text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 500;
+    flex-shrink: 0;
+}
+
+/* --- Presence Dot --- */
+.rst-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #1D9E75;
+    flex-shrink: 0;
+}
+
+/* --- Buttons --- */
+.rst-btn {
+    font-size: 12px;
+    padding: 5px 11px;
+    border: 0.5px solid var(--rst-border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--rst-text);
+    cursor: pointer;
+    font-family: var(--rst-font);
+}
+
+.rst-btn:hover {
+    background: var(--rst-bg-hover);
+}
+
+.rst-btn-approve {
+    font-size: 12px;
+    padding: 5px 11px;
+    border: 0.5px solid #1D9E75;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--rst-positive);
+    cursor: pointer;
+    font-family: var(--rst-font);
+}
+
+.rst-btn-approve:hover {
+    background: var(--rst-success-bg);
+}
+
+.rst-btn-danger {
+    font-size: 12px;
+    padding: 5px 11px;
+    border: 0.5px solid var(--rst-border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--rst-danger);
+    cursor: pointer;
+    font-family: var(--rst-font);
+}
+
+.rst-btn-danger:hover {
+    background: var(--rst-bg-hover);
+}
+
+.rst-btn-row {
+    display: flex;
+    gap: 7px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+/* --- Divider --- */
+.rst-div {
+    border: none;
+    border-top: 0.5px solid var(--rst-border);
+    margin: 13px 0;
+}
+
+/* --- Form Elements --- */
+.rst-shell textarea,
+.rst-shell select,
+.rst-shell input[type="number"] {
+    width: 100%;
+    font-size: var(--rst-font-size);
+    padding: 6px 10px;
+    border: 0.5px solid var(--rst-border);
+    border-radius: 8px;
+    background: var(--rst-bg);
+    color: var(--rst-text);
+    font-family: var(--rst-font);
+}
+
+.rst-shell input[type="number"] {
+    width: auto;
+}
+
+.rst-shell textarea {
+    resize: vertical;
+    line-height: 1.5;
+}
+
+/* --- Icon Button --- */
+.rst-icon-btn {
+    width: 28px;
+    height: 28px;
+    border: 0.5px solid var(--rst-border);
+    border-radius: 8px;
+    background: transparent;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    color: var(--rst-text-muted);
+}
+
+.rst-icon-btn:hover {
+    background: var(--rst-bg-hover);
+}
+
+/* --- Toggle Switch --- */
+.rst-toggle {
+    position: relative;
+    width: 40px;
+    height: 22px;
+    flex-shrink: 0;
+}
+
+.rst-toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+    position: absolute;
+}
+
+.rst-slider {
+    position: absolute;
+    inset: 0;
+    border-radius: 22px;
+    background: #ccc;
+    cursor: pointer;
+    transition: 0.2s;
+}
+
+.rst-slider::before {
+    content: '';
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    left: 3px;
+    top: 3px;
+    border-radius: 50%;
+    background: #fff;
+    transition: 0.2s;
+}
+
+.rst-toggle input:checked + .rst-slider {
+    background: var(--rst-accent);
+}
+
+.rst-toggle input:checked + .rst-slider::before {
+    transform: translateX(18px);
+}
+
+/* --- Stat Grid --- */
+.rst-stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.rst-stat-cat {
+    border: 0.5px solid var(--rst-border);
+    border-radius: 8px;
+    padding: 10px;
+    cursor: pointer;
+}
+
+.rst-stat-cat:hover,
+.rst-stat-cat.open {
+    background: var(--rst-bg-hover);
+}
+
+.rst-sct {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--rst-text-muted);
+    margin-bottom: 7px;
+    display: flex;
+    justify-content: space-between;
+}
+
+.rst-sr {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    font-size: 12px;
+    padding: 3px 0;
+    gap: 6px;
+}
+
+.rst-sn {
+    color: var(--rst-text-muted);
+}
+
+.rst-sv {
+    font-weight: 500;
+    flex-shrink: 0;
+}
+
+.rst-sv.p { color: var(--rst-positive); }
+.rst-sv.n { color: var(--rst-negative); }
+.rst-sv.z { color: var(--rst-zero); }
+
+/* --- Stat Commentary (hidden until category opened) --- */
+.rst-sc {
+    font-size: 11px;
+    color: var(--rst-text-muted);
+    line-height: 1.4;
+    padding: 5px 0 2px;
+    border-top: 0.5px solid var(--rst-border);
+    margin-top: 3px;
+    display: none;
+}
+
+.rst-stat-cat.open .rst-sc {
+    display: block;
+}
+
+/* --- Dynamic Title --- */
+.rst-dyn {
+    font-size: 13px;
+    font-weight: 500;
+    padding: 8px 10px;
+    background: var(--rst-info-bg);
+    border-radius: 8px;
+    color: var(--rst-avatar-text);
+    margin-top: 10px;
+}
+
+/* --- Narrative Summary --- */
+.rst-narr {
+    font-size: 12px;
+    color: var(--rst-text-muted);
+    line-height: 1.6;
+    margin-top: 8px;
+    padding: 8px 10px;
+    border-left: 2px solid #CECBF6;
+    border-radius: 0;
+}
+
+/* --- Info Box --- */
+.rst-info-box {
+    background: var(--rst-info-bg);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 12px;
+    color: var(--rst-avatar-text);
+    margin-bottom: 14px;
+    line-height: 1.5;
+}
+
+/* --- Pending Banner --- */
+.rst-pending-banner {
+    background: var(--rst-info-bg);
+    border: 0.5px solid var(--rst-pending-border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+/* --- Scene Entry --- */
+.rst-scene-entry {
+    border: 0.5px solid var(--rst-border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    overflow: hidden;
+}
+
+.rst-scene-hdr {
+    padding: 10px 12px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.rst-scene-hdr:hover {
+    background: var(--rst-bg-hover);
+}
+
+.rst-scene-body {
+    padding: 12px;
+    border-top: 0.5px solid var(--rst-border);
+    display: none;
+}
+
+.rst-scene-entry.open .rst-scene-body {
+    display: block;
+}
+
+/* --- Badges --- */
+.rst-badge-closed {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 100px;
+    background: var(--rst-badge-closed-bg);
+    color: var(--rst-badge-closed-text);
+}
+
+.rst-badge-pending {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 100px;
+    background: var(--rst-badge-pending-bg);
+    color: var(--rst-badge-pending-text);
+}
+
+/* --- Log Entry --- */
+.rst-log-entry {
+    border: 0.5px solid var(--rst-border);
+    border-radius: 8px;
+    padding: 10px;
+    margin-bottom: 8px;
+}
+
+.rst-log-meta {
+    font-size: 11px;
+    color: var(--rst-text-muted);
+    margin-bottom: 6px;
+}
+
+/* --- Overlay / Modal --- */
+.rst-overlay {
+    background: rgba(0, 0, 0, 0.38);
+    border-radius: 12px;
+    padding: 30px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 200px;
+}
+
+.rst-modal {
+    background: var(--rst-bg);
+    border: 0.5px solid var(--rst-border);
+    border-radius: 12px;
+    padding: 16px;
+    width: 100%;
+    max-width: 300px;
+}
+
+/* --- Two Column Layout --- */
+.rst-two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+/* --- Settings Row --- */
+.rst-setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 0;
+    border-bottom: 0.5px solid var(--rst-border);
+    gap: 12px;
+}
+
+.rst-setting-row:last-child {
+    border-bottom: none;
+}
+
+.rst-setting-label {
+    font-size: 13px;
+}
+
+.rst-setting-sub {
+    font-size: 11px;
+    color: var(--rst-text-muted);
+    margin-top: 2px;
+}
+
+/* --- Regeneration Box --- */
+.rst-regen-box {
+    background: var(--rst-bg-hover);
+    border-radius: 8px;
+    padding: 10px;
+    margin-top: 10px;
+    display: none;
+}
+
+.rst-regen-box.open {
+    display: block;
+}
+
+/* --- Pending Character Block --- */
+.rst-char-pending {
+    border: 0.5px solid var(--rst-border);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 8px;
+}
+
+.rst-char-pending-hdr {
+    padding: 9px 12px;
+    background: var(--rst-bg-hover);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+}
+
+.rst-char-pending-hdr:hover {
+    background: #f0f0f0;
+}
+
+.rst-char-pending-body {
+    padding: 12px;
+    display: none;
+}
+
+.rst-char-pending.open .rst-char-pending-body {
+    display: block;
+}
+
+/* --- Rollback Confirmation Dialog --- */
+.rst-rollback-dialog {
+    background: var(--rst-bg);
+    border: 0.5px solid var(--rst-danger);
+    border-radius: 12px;
+    padding: 16px;
+    width: 100%;
+    max-width: 340px;
+}
+
+.rst-rollback-warning {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--rst-danger);
+    margin-bottom: 10px;
+}
+
+.rst-rollback-detail {
+    font-size: 12px;
+    color: var(--rst-text-muted);
+    line-height: 1.5;
+    margin-bottom: 12px;
+}
+
+.rst-rollback-detail ul {
+    margin: 6px 0 0 16px;
+    padding: 0;
+}
+
+.rst-rollback-detail li {
+    margin-bottom: 2px;
+}
+
+/* --- Message Action Buttons (Scene Start/End) --- */
+.rst-scene-btn {
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    font-size: 14px;
+    transition: opacity 0.2s;
+    opacity: 0.7;
+}
+
+.rst-scene-btn:hover {
+    opacity: 1;
+}
+
+.rst-scene-btn.rst-scene-start {
+    color: var(--rst-positive);
+}
+
+.rst-scene-btn.rst-scene-end {
+    color: var(--rst-danger);
+}
+
+.rst-scene-btn.rst-scene-active {
+    opacity: 1;
+    background: var(--rst-success-bg);
+}
+
+/* --- Scrollbar Styling --- */
+.rst-shell ::-webkit-scrollbar {
+    width: 6px;
+}
+
+.rst-shell ::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.rst-shell ::-webkit-scrollbar-thumb {
+    background: var(--rst-border);
+    border-radius: 3px;
+}
