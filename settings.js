@@ -116,7 +116,7 @@ export function getInjectionSettings() {
  * Export all RST data (settings + characters) as a JSON string.
  * @returns {string}
  */
-export function exportAllData() {
+export async function exportAllData() {
     const data = {
         settings: getSettings(),
         characters: (await import("./data/storage.js")).getCharacters(),
