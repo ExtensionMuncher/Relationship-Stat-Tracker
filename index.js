@@ -4,14 +4,14 @@
  */
 
 import {
-    eventSource,
-    event_types,
     chat,
     chat_metadata,
     saveSettingsDebounced,
     saveChatDebounced,
-    extension_settings,
 } from "../../../../script.js";
+
+import { eventSource, event_types } from "../../../../scripts/events.js";
+import { extension_settings } from "../../../../scripts/extensions.js";
 
 import { initSettings, isEnabled, getSetting } from "./settings.js";
 import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter } from "./data/storage.js";

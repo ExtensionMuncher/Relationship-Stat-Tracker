@@ -3,7 +3,8 @@
  * Handles extension_settings.rst and chat_metadata.rst
  */
 
-import { chat_metadata, extension_settings, saveSettingsDebounced, saveChatDebounced } from "../../../../../script.js";
+import { chat_metadata, saveSettingsDebounced, saveChatDebounced } from "../../../../../script.js";
+import { extension_settings } from "../../../../../scripts/extensions.js";
 
 const NAMESPACE = "rst";
 
