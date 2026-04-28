@@ -16,7 +16,7 @@ import { extension_settings } from "../../../../scripts/extensions.js";
 import { initSettings, isEnabled, getSetting } from "./settings.js";
 import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter } from "./data/storage.js";
 import { createCharacter, findCharacterByName } from "./data/characters.js";
-import { createScene, closeScene, getOpenScene, initSceneCounter } from "./data/scenes.js";
+import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
 import { generateStatUpdate } from "./llm/statUpdate.js";
 import { updateInjection, removeInjection } from "./inject/promptInjector.js";
@@ -200,6 +200,15 @@ function onChatChanged() {
     // Update injection
     if (isEnabled()) {
         updateInjection();
+
+        // Re-add scene buttons to all existing messages
+        // (buttons are lost when ST re-renders the chat on switch)
+        $(".mes").each(function () {
+            const mesId = $(this).attr("mesid");
+            if (mesId !== undefined) {
+                addSceneButtons(parseInt(mesId, 10));
+            }
+        });
     }
 }
 
@@ -242,6 +251,15 @@ function addSceneButtons(mesId) {
             toastr?.warning?.("A scene is already open. Close it first.");
             return;
         }
+
+        // Prevent duplicate: check if this message already starts any scene
+        const allScenes = getAllScenes();
+        const alreadyStartsScene = allScenes.some((s) => s.messageStart === mesId);
+        if (alreadyStartsScene) {
+            toastr?.warning?.(`Message ${mesId} already starts a scene.`);
+            return;
+        }
+
         createScene(mesId);
         toastr?.success?.(`Scene started at message ${mesId}.`);
         $startBtn.addClass("rst-scene-active");

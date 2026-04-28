@@ -4,7 +4,7 @@
  * narrative summaries, AND scene summaries (single LLM call)
  */
 
-import { chat } from "../../../../../script.js";
+import { chat, getContext } from "../../../../../script.js";
 import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getCharacterProfile, cloneStats, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
@@ -82,6 +82,14 @@ Your task:
 1. Write a concise SCENE SUMMARY for internal reference (clinical, factual)
 2. For each character present, analyze how the scene affected their relationship stats
 3. Determine if any relationship milestones were reached, triggering a dynamic title change
+
+# PERSPECTIVE RULE (CRITICAL — DO NOT VIOLATE):
+- All stats represent how the DETECTED CHARACTER feels toward {{user}} — NOT the other way around!
+- Example: "Alice's platonic.trust = 30%" means Alice trusts {{user}} at 30%, NOT that {{user}} trusts Alice at 30%
+- Each character's stats are ALWAYS measured from that character's perspective toward {{user}}
+- Commentary must explain why the CHARACTER's feelings toward {{user}} changed based on scene events
+- Dynamic titles describe the CHARACTER's relationship role/attitude toward {{user}}
+- Never generate stats from {{user}}'s perspective toward a character — always character → user direction
 
 # RELATIONSHIP ATTRACTION TYPES:
 - Platonic: A deep, non-romantic desire for connection, characterized by emotional closeness, shared values, and a strong friendship bond. It involves trust, openness, and a sense of mutual support.
@@ -165,7 +173,7 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
     }
 
     // Current character stats
-    parts.push("\nCURRENT CHARACTER STATS:");
+    parts.push("\nCURRENT CHARACTER STATS (character → {{user}} perspective):");
     for (const char of characters) {
         parts.push(`\n${char.name}:`);
         parts.push(`  Current dynamic title: "${char.dynamicTitle || "None"}"`);
@@ -178,11 +186,13 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
     }
 
     // Scene messages
-    parts.push("\nSCENE MESSAGES:");
+    const userName = getContext().name1 || "User";
+    parts.push(`\nSCENE MESSAGES ("${userName}" is the user/player, all other named speakers are characters):`);
     messages.forEach((m, i) => {
         const speaker = m.name || "Unknown";
         const text = m.mes || "";
-        parts.push(`[${i}] ${speaker}: ${text}`);
+        const isUser = m.is_user ? " [USER]" : "";
+        parts.push(`[${i}]${isUser} ${speaker}: ${text}`);
     });
 
     // Optional guidance

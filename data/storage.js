@@ -269,6 +269,8 @@ export function getDefaultSettings() {
             injectProfile: true,
             format: "stats_and_narrative",
             placement: "above_card",
+            passiveLibraryRef: false,
+            libraryRefDepth: 2,
         },
     };
 }

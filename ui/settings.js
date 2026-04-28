@@ -112,11 +112,45 @@ function renderBatchScan($pane) {
                 scene summaries, and an initial stat block per character. Runs once — does not compound on existing data.
             </div>
             <button class="rst-btn" style="border-color:var(--rst-accent);color:var(--rst-avatar-text)" id="rst-batch-scan">Run batch scan</button>
+            <div id="rst-batch-progress" style="display:none;margin-top:8px;font-size:12px;color:var(--rst-text-muted)"></div>
         </div>
     `);
 
-    $card.find("#rst-batch-scan").on("click", () => {
-        toastr?.warning?.("Batch scan is not yet implemented. This feature will be available in a future update.");
+    $card.find("#rst-batch-scan").on("click", async function () {
+        const $btn = $(this);
+        const $progress = $card.find("#rst-batch-progress");
+
+        $btn.prop("disabled", true);
+        $btn.text("Scanning...");
+        $progress.show().text("Analyzing chat history for scene boundaries...");
+
+        try {
+            const { runBatchScan } = await import("../llm/batchScan.js");
+            const result = await runBatchScan();
+
+            if (result.scenesCreated > 0 || result.profilesCreated.length > 0) {
+                $progress.text(`Done! ${result.scenesCreated} scenes created, ${result.profilesCreated.length} new profiles. Refreshing UI...`);
+
+                // Re-render tabs to show new data
+                const { renderHomeTab } = await import("./home.js");
+                const { renderLibraryTab } = await import("./library.js");
+                const { renderScenesTab } = await import("./scenes.js");
+                const { getPane } = await import("./panel.js");
+
+                renderHomeTab(getPane("home"));
+                renderLibraryTab(getPane("lib"));
+                renderScenesTab(getPane("scenes"));
+            } else {
+                $progress.text("No new scenes or profiles were created.");
+            }
+        } catch (err) {
+            console.error("[RST] Batch scan failed:", err);
+            $progress.text("Batch scan failed. Check console for details.");
+            toastr?.error?.("Batch scan failed. See console for details.");
+        } finally {
+            $btn.prop("disabled", false);
+            $btn.text("Run batch scan");
+        }
     });
 
     $pane.append($card);
@@ -346,6 +380,31 @@ function renderInjectionSettings($pane, settings) {
         </div>
     `);
 
+    // Passive library reference
+    $card.append(`
+        <div class="rst-setting-row" style="border-top:1px solid var(--rst-border);padding-top:12px;margin-top:4px">
+            <div>
+                <div class="rst-setting-label">Passive library reference</div>
+                <div class="rst-setting-sub">Inject ALL character stats as passive context — lets the main LLM reference any character's relationship data</div>
+            </div>
+            <label class="rst-toggle">
+                <input type="checkbox" id="rst-passive-ref" ${inj.passiveLibraryRef ? "checked" : ""}>
+                <span class="rst-slider"></span>
+            </label>
+        </div>
+        <div class="rst-setting-row">
+            <div>
+                <div class="rst-setting-label">Library reference depth</div>
+                <div class="rst-setting-sub">Where in the context the library block is inserted (higher = later in context)</div>
+            </div>
+            <select id="rst-ref-depth" style="width:160px;flex-shrink:0">
+                <option value="0"${(inj.libraryRefDepth === 0) ? " selected" : ""}>Top of prompt</option>
+                <option value="1"${(inj.libraryRefDepth === 1 || inj.libraryRefDepth === undefined) ? " selected" : ""}>Above character card</option>
+                <option value="2"${(inj.libraryRefDepth === 2) ? " selected" : ""}>Below character card</option>
+            </select>
+        </div>
+    `);
+
     $pane.append($card);
 
     // Listeners
@@ -369,6 +428,18 @@ function renderInjectionSettings($pane, settings) {
 
     $("#rst-inject-placement").on("change", async function () {
         saveSetting("injection.placement", $(this).val());
+        const { updateInjection } = await import("../inject/promptInjector.js");
+        updateInjection();
+    });
+
+    $("#rst-passive-ref").on("change", async function () {
+        saveSetting("injection.passiveLibraryRef", $(this).prop("checked"));
+        const { updateInjection } = await import("../inject/promptInjector.js");
+        updateInjection();
+    });
+
+    $("#rst-ref-depth").on("change", async function () {
+        saveSetting("injection.libraryRefDepth", parseInt($(this).val(), 10));
         const { updateInjection } = await import("../inject/promptInjector.js");
         updateInjection();
     });

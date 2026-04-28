@@ -3,7 +3,7 @@
  * Generates character descriptions, notes, and initial stats from scene context
  */
 
-import { chat } from "../../../../../script.js";
+import { chat, getContext } from "../../../../../script.js";
 import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getAllSceneSummaries } from "../data/scenes.js";
@@ -70,6 +70,13 @@ STAT CATEGORIES:
 - Romantic: trust, openness, support, affection
 - Sexual: trust, openness, support, affection
 
+# PERSPECTIVE RULE (CRITICAL):
+- All stats represent how [Character] feels toward {{user}} — NOT the other way around!
+- For example, "trust: 30%" means this character trusts {{user}} at 30%, NOT that {{user}} trusts them
+- Stats are ALWAYS measured from the character's perspective toward {{user}}
+- Description, notes, dynamic title, and narrative summary should all describe the character's relationship with {{user}}
+- Never generate stats from {{user}}'s perspective toward a character
+
 RESPONSE FORMAT — return ONLY valid JSON:
 {
   "description": "Character description...",
@@ -104,11 +111,13 @@ function buildProfileGenRequestPrompt(characterName, prompt, fromScene) {
         // Include recent chat context
         const recentMessages = getRecentMessages(20);
         if (recentMessages.length > 0) {
-            parts.push("\nRECENT CHAT MESSAGES (for context):");
+            const userName = getContext().name1 || "User";
+            parts.push(`\nRECENT CHAT MESSAGES ("${userName}" is the user/player, other named speakers are characters):`);
             recentMessages.forEach((m, i) => {
                 const speaker = m.name || "Unknown";
                 const text = (m.mes || "").slice(0, 300);
-                parts.push(`[${i}] ${speaker}: ${text}`);
+                const isUser = m.is_user ? " [USER]" : "";
+                parts.push(`[${i}]${isUser} ${speaker}: ${text}`);
             });
         }
 
