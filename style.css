@@ -556,12 +556,17 @@
     opacity: 1;
 }
 
-.rst-scene-btn.rst-scene-start {
+.rst-scene-btn.rst-scene-begin {
     color: var(--rst-positive);
 }
 
-.rst-scene-btn.rst-scene-end {
+.rst-scene-btn.rst-scene-conclude {
     color: var(--rst-danger);
+}
+
+/* Edit button */
+.rst-icon-btn.rst-edit-btn {
+    color: var(--rst-accent);
 }
 
 .rst-scene-btn.rst-scene-active {

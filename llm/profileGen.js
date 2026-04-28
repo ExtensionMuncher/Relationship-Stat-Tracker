@@ -3,7 +3,8 @@
  * Generates character descriptions, notes, and initial stats from scene context
  */
 
-import { chat, getContext } from "../../../../../script.js";
+import { chat } from "../../../../../script.js";
+import { getContext } from "../../../../extensions.js";
 import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getAllSceneSummaries } from "../data/scenes.js";
@@ -30,7 +31,8 @@ export async function generateProfile(characterName, prompt = "", fromScene = fa
 
         const result = await makeRequest(
             profileName,
-            systemPrompt + "\n\n" + requestPrompt,
+            systemPrompt,
+            requestPrompt,
             1000,
         );
 

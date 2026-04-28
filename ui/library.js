@@ -12,6 +12,8 @@ import {
     deleteCharacter,
     updateCharacterProfile,
     updateCharacterStats,
+    addUpdateLogEntry,
+    cloneStats,
     removeUpdateLogEntry,
     exportCharacters,
     importCharacters,
@@ -146,6 +148,7 @@ function renderCharacterCard($pane, profile) {
             </div>
             <div style="margin-left:auto;display:flex;gap:6px">
                 <button class="rst-icon-btn rst-wand-btn" title="Generate profile">✦</button>
+                <button class="rst-icon-btn rst-edit-btn" title="Edit stats">✎</button>
                 <button class="rst-icon-btn rst-log-btn" title="Update log">◷</button>
                 <button class="rst-icon-btn rst-delete-btn" style="color:var(--rst-danger)" title="Delete character">✕</button>
             </div>
@@ -153,6 +156,7 @@ function renderCharacterCard($pane, profile) {
     `);
 
     $header.find(".rst-wand-btn").on("click", () => showWandModal(profile));
+    $header.find(".rst-edit-btn").on("click", () => showEditStatsModal(profile));
     $header.find(".rst-log-btn").on("click", () => toggleLogPanel(profile));
     $header.find(".rst-delete-btn").on("click", () => confirmDeleteCharacter(profile));
 
@@ -371,6 +375,102 @@ async function showRollbackConfirmation(profile, entry) {
         console.error("[RST] Rollback failed:", err);
         toastr?.error?.("Rollback failed. Please try again.");
     }
+}
+
+// ─── Edit Stats Modal ───────────────────────────────────────
+
+/**
+ * Show the edit stats dialog via ST Popup.
+ * All 12 stat values and their 12 commentary texts are editable.
+ * On save: old stats → update log, new stats → current.
+ * @param {object} profile
+ */
+async function showEditStatsModal(profile) {
+    const catTitle = (cat) => cat.charAt(0).toUpperCase() + cat.slice(1);
+    const statLabel = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
+    // Build per-stat input groups
+    let fieldsHtml = "";
+    for (const cat of STAT_CATEGORIES) {
+        fieldsHtml += `<div style="font-weight:600;margin:10px 0 4px;font-size:13px;color:var(--SmartThemeBodyColor,#ccc)">── ${catTitle(cat)} ──</div>`;
+        for (const stat of STAT_NAMES) {
+            const val = profile.stats[cat][stat];
+            const commentary = profile.updateLog?.[0]?.commentary?.[cat]?.[stat] || "";
+            fieldsHtml += `
+                <div style="margin-bottom:8px">
+                    <div style="font-size:12px;font-weight:500;margin-bottom:2px">${statLabel(stat)}</div>
+                    <div style="display:flex;gap:6px;align-items:center">
+                        <input type="number" min="-100" max="100" value="${val}"
+                            data-cat="${cat}" data-stat="${stat}"
+                            class="rst-edit-val" style="width:80px;flex-shrink:0">
+                        <span style="font-size:11px;color:var(--SmartThemeBodyColor,#666)">%</span>
+                    </div>
+                    <textarea rows="2" data-cat="${cat}" data-stat="${stat}"
+                        class="rst-edit-com" style="width:100%;margin-top:2px"
+                        placeholder="Reason / commentary...">${commentary}</textarea>
+                </div>
+            `;
+        }
+    }
+
+    const html = `
+        <h3>Edit Stats — ${profile.name}</h3>
+        <p style="margin-bottom:6px;font-size:12px;color:var(--SmartThemeBodyColor,#999)">
+            Edit stat values (−100 to +100) and their associated commentary. Old values will be saved in the update log.
+        </p>
+        <div style="max-height:60vh;overflow-y:auto;padding-right:4px">
+            ${fieldsHtml}
+        </div>
+    `;
+
+    const popup = new Popup(html, POPUP_TYPE.TEXT, "", {
+        customButtons: [
+            {
+                text: "Save Changes",
+                result: 1,
+                action: async () => {
+                    // Collect values
+                    const newStats = {};
+                    const newCommentary = {};
+                    for (const cat of STAT_CATEGORIES) {
+                        newStats[cat] = {};
+                        newCommentary[cat] = {};
+                        for (const stat of STAT_NAMES) {
+                            const valInput = document.querySelector(`.rst-edit-val[data-cat="${cat}"][data-stat="${stat}"]`);
+                            const comInput = document.querySelector(`.rst-edit-com[data-cat="${cat}"][data-stat="${stat}"]`);
+                            newStats[cat][stat] = parseInt(valInput?.value, 10) || 0;
+                            newCommentary[cat][stat] = comInput?.value || "";
+                        }
+                    }
+
+                    // Clone old stats before overwriting
+                    const oldStats = cloneStats(profile.stats);
+
+                    // Update current stats
+                    updateCharacterStats(profile.id, newStats);
+
+                    // Add update log entry with old stats, new stats, and edited commentary
+                    addUpdateLogEntry(profile.id, {
+                        statsBefore: oldStats,
+                        statsAfter: newStats,
+                        commentary: newCommentary,
+                        source: "manual_edit",
+                        timestamp: Date.now(),
+                    });
+
+                    toastr?.success?.(`${profile.name} stats updated.`);
+
+                    // Refresh the library UI
+                    const $pane = $("#rst-p-lib");
+                    renderLibraryTab($pane);
+                    popup.complete(1);
+                },
+            },
+        ],
+        okButton: "Cancel",
+    });
+
+    await popup.show();
 }
 
 // ─── Wand Modal (Profile Generation) ─────────────────────

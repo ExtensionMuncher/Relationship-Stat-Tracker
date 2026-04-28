@@ -3,7 +3,7 @@
  * Calls a lightweight LLM to detect character names in recent messages
  */
 
-import { generateQuietPrompt, chat } from "../../../../../script.js";
+import { chat } from "../../../../../script.js";
 import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getAllCharacters } from "../data/characters.js";
@@ -33,7 +33,8 @@ export async function detectCharacters(messageCount = 10) {
     try {
         const result = await makeRequest(
             profileName,
-            systemPrompt + "\n\n" + requestPrompt,
+            systemPrompt,
+            requestPrompt,
             200,
         );
 

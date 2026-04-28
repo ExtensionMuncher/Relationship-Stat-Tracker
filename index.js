@@ -14,9 +14,9 @@ import { eventSource, event_types } from "../../../../scripts/events.js";
 import { extension_settings } from "../../../../scripts/extensions.js";
 
 import { initSettings, isEnabled, getSetting } from "./settings.js";
-import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter } from "./data/storage.js";
+import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter, savePendingUpdates } from "./data/storage.js";
 import { createCharacter, findCharacterByName } from "./data/characters.js";
-import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene } from "./data/scenes.js";
+import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
 import { generateStatUpdate } from "./llm/statUpdate.js";
 import { updateInjection, removeInjection } from "./inject/promptInjector.js";
@@ -227,16 +227,16 @@ function addSceneButtons(mesId) {
 
     const openScene = getOpenScene();
 
-    // Scene Start button
+    // Scene Begin button
     const $startBtn = $(`
-        <div class="rst-scene-btn rst-scene-start" title="Start new scene">
+        <div class="rst-scene-btn rst-scene-begin" title="Begin new scene">
             <i class="fa-solid fa-play"></i>
         </div>
     `);
 
-    // Scene End button
+    // Scene Conclude button
     const $endBtn = $(`
-        <div class="rst-scene-btn rst-scene-end" title="End current scene">
+        <div class="rst-scene-btn rst-scene-conclude" title="Conclude current scene">
             <i class="fa-solid fa-stop"></i>
         </div>
     `);
@@ -286,11 +286,9 @@ function addSceneButtons(mesId) {
             const result = await generateStatUpdate(closedScene.id);
 
             // Store the scene summary
-            const { updateSceneSummary } = await import("./data/scenes.js");
             updateSceneSummary(closedScene.id, result.sceneSummary);
 
             // Store pending updates
-            const { savePendingUpdates } = await import("./data/storage.js");
             savePendingUpdates(result);
 
             toastr?.success?.("Stat updates ready for review! Check the Home tab.");

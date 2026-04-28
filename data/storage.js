@@ -264,6 +264,12 @@ export function getDefaultSettings() {
         sceneSummaryPrompt:
             "Write a concise scene summary for internal reference. Include: key events, emotional turning points, characters present, and any significant relationship shifts. Keep it clinical and factual — this is a note for future analysis, not a narrative retelling.",
 
+        batchScan: {
+            sceneDetectionMaxTokens: 4000,
+            initialStatMaxTokens: 3000,
+            chunkSize: 100,
+        },
+
         injection: {
             injectStats: true,
             injectProfile: true,
@@ -271,6 +277,7 @@ export function getDefaultSettings() {
             placement: "above_card",
             passiveLibraryRef: false,
             libraryRefDepth: 2,
+            libraryRefRole: "system",
         },
     };
 }

@@ -4,7 +4,8 @@
  * narrative summaries, AND scene summaries (single LLM call)
  */
 
-import { chat, getContext } from "../../../../../script.js";
+import { chat } from "../../../../../script.js";
+import { getContext } from "../../../../extensions.js";
 import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getCharacterProfile, cloneStats, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
@@ -46,7 +47,8 @@ export async function generateStatUpdate(sceneId, guidance = "") {
 
         const result = await makeRequest(
             profileName,
-            systemPrompt + "\n\n" + requestPrompt,
+            systemPrompt,
+            requestPrompt,
             2000,
         );
 

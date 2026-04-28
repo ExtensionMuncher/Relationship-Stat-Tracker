@@ -104,6 +104,9 @@ function renderConnectionProfiles($pane, settings) {
  * @param {jQuery} $pane
  */
 function renderBatchScan($pane) {
+    const settings = getSettings();
+    const bs = settings.batchScan || {};
+
     $pane.append('<div class="rst-lbl">Batch scan</div>');
     const $card = $(`
         <div class="rst-card">
@@ -113,6 +116,36 @@ function renderBatchScan($pane) {
             </div>
             <button class="rst-btn" style="border-color:var(--rst-accent);color:var(--rst-avatar-text)" id="rst-batch-scan">Run batch scan</button>
             <div id="rst-batch-progress" style="display:none;margin-top:8px;font-size:12px;color:var(--rst-text-muted)"></div>
+
+            <hr class="rst-div" style="margin:12px 0">
+
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Scene detection max tokens</div>
+                    <div class="rst-setting-sub">Max tokens for scene boundary detection. Higher values give reasoning models room to think.</div>
+                </div>
+                <input type="number" min="1000" max="16000" step="500"
+                    value="${bs.sceneDetectionMaxTokens ?? 4000}"
+                    id="rst-bs-scene-tokens" style="width:100px;flex-shrink:0">
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Initial stat max tokens</div>
+                    <div class="rst-setting-sub">Max tokens for initial stat generation per chunk.</div>
+                </div>
+                <input type="number" min="1000" max="16000" step="500"
+                    value="${bs.initialStatMaxTokens ?? 3000}"
+                    id="rst-bs-stat-tokens" style="width:100px;flex-shrink:0">
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Chunk size (messages)</div>
+                    <div class="rst-setting-sub">Messages per chunk when scanning long chats. Larger chunks may hit token limits.</div>
+                </div>
+                <input type="number" min="20" max="500" step="10"
+                    value="${bs.chunkSize ?? 100}"
+                    id="rst-bs-chunk-size" style="width:100px;flex-shrink:0">
+            </div>
         </div>
     `);
 
@@ -151,6 +184,17 @@ function renderBatchScan($pane) {
             $btn.prop("disabled", false);
             $btn.text("Run batch scan");
         }
+    });
+
+    // Batch scan settings listeners
+    $card.find("#rst-bs-scene-tokens").on("change", async function () {
+        saveSetting("batchScan.sceneDetectionMaxTokens", parseInt($(this).val(), 10));
+    });
+    $card.find("#rst-bs-stat-tokens").on("change", async function () {
+        saveSetting("batchScan.initialStatMaxTokens", parseInt($(this).val(), 10));
+    });
+    $card.find("#rst-bs-chunk-size").on("change", async function () {
+        saveSetting("batchScan.chunkSize", parseInt($(this).val(), 10));
     });
 
     $pane.append($card);
@@ -381,11 +425,17 @@ function renderInjectionSettings($pane, settings) {
     `);
 
     // Passive library reference
+    const roleOptions = [
+        { value: "system", label: "System" },
+        { value: "user", label: "User" },
+        { value: "assistant", label: "Assistant" },
+    ].map((o) => `<option value="${o.value}"${(o.value === (inj.libraryRefRole || "system")) ? " selected" : ""}>${o.label}</option>`).join("");
+
     $card.append(`
         <div class="rst-setting-row" style="border-top:1px solid var(--rst-border);padding-top:12px;margin-top:4px">
             <div>
                 <div class="rst-setting-label">Passive library reference</div>
-                <div class="rst-setting-sub">Inject ALL character stats as passive context — lets the main LLM reference any character's relationship data</div>
+                <div class="rst-setting-sub">Inject library as freely-referenceable context — LLM can reference any tracked character's full relationship data when relevant (like timeline chapters)</div>
             </div>
             <label class="rst-toggle">
                 <input type="checkbox" id="rst-passive-ref" ${inj.passiveLibraryRef ? "checked" : ""}>
@@ -402,6 +452,13 @@ function renderInjectionSettings($pane, settings) {
                 <option value="1"${(inj.libraryRefDepth === 1 || inj.libraryRefDepth === undefined) ? " selected" : ""}>Above character card</option>
                 <option value="2"${(inj.libraryRefDepth === 2) ? " selected" : ""}>Below character card</option>
             </select>
+        </div>
+        <div class="rst-setting-row">
+            <div>
+                <div class="rst-setting-label">Library reference role</div>
+                <div class="rst-setting-sub">Speaker role for the injected library block</div>
+            </div>
+            <select id="rst-ref-role" style="width:160px;flex-shrink:0">${roleOptions}</select>
         </div>
     `);
 
@@ -442,6 +499,12 @@ function renderInjectionSettings($pane, settings) {
         saveSetting("injection.libraryRefDepth", parseInt($(this).val(), 10));
         const { updateInjection } = await import("../inject/promptInjector.js");
         updateInjection();
+    });
+
+    $("#rst-ref-role").on("change", async function () {
+        saveSetting("injection.libraryRefRole", $(this).val());
+        const { updatePassiveLibraryRef } = await import("../inject/promptInjector.js");
+        updatePassiveLibraryRef();
     });
 }
 

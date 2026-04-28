@@ -13,11 +13,6 @@ import { getScenes, saveScenes } from "../data/storage.js";
 import { findCharacterByName, createCharacter, updateCharacterStats, getCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { initSceneCounter, updateSceneSummary } from "../data/scenes.js";
 
-// ─── Constants ────────────────────────────────────────────
-
-const SCENE_DETECTION_MAX_TOKENS = 1500;
-const INITIAL_STAT_MAX_TOKENS = 1200;
-
 // ─── Main Entry Point ─────────────────────────────────────
 
 /**
@@ -65,7 +60,7 @@ export async function runBatchScan() {
     toastr?.info?.("Batch scan: Analyzing chat for scene boundaries...");
 
     // Phase 1: Detect scenes via LLM
-    const detectedScenes = await detectScenes(allMessages, ranges, autoGenProfile);
+    const detectedScenes = await detectScenes(allMessages, ranges, autoGenProfile, settings);
     if (!detectedScenes || detectedScenes.length === 0) {
         toastr?.warning?.("Batch scan: No scenes detected in the chat history.");
         return { scenesCreated: 0, profilesCreated: [] };
@@ -171,19 +166,45 @@ export async function runBatchScan() {
 
 /**
  * Detect scene boundaries and character names via LLM.
+ * Processes messages in configurable chunks to avoid token limits.
  * @param {Array} allMessages - Full chat array
  * @param {Array<{start: number, end: number}>} ranges - Unprocessed message ranges
  * @param {string} profileName - autoGenLLM profile name
+ * @param {object} settings - Full RST settings object
  * @returns {Promise<Array<{messageStart: number, messageEnd: number, characters: string[]}>>}
  */
-async function detectScenes(allMessages, ranges, profileName) {
+async function detectScenes(allMessages, ranges, profileName, settings) {
     const systemPrompt = buildSceneDetectionSystemPrompt();
-    const requestPrompt = buildSceneDetectionRequest(allMessages, ranges);
+    const maxTokens = settings.batchScan?.sceneDetectionMaxTokens ?? 4000;
+    const chunkSize = settings.batchScan?.chunkSize ?? 100;
+    const allScenes = [];
 
-    const result = await makeRequest(profileName, systemPrompt + "\n\n" + requestPrompt, SCENE_DETECTION_MAX_TOKENS);
-    if (!result) return [];
+    for (const range of ranges) {
+        const messageCount = range.end - range.start + 1;
+        if (messageCount <= chunkSize) {
+            // Single chunk — process as-is
+            const requestPrompt = buildSceneDetectionRequest(allMessages, [range]);
+            const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
+            if (result) {
+                const parsed = parseSceneDetectionResponse(result, [range]);
+                allScenes.push(...parsed);
+            }
+        } else {
+            // Split into chunkSize-sized pieces
+            for (let cs = range.start; cs <= range.end; cs += chunkSize) {
+                const ce = Math.min(cs + chunkSize - 1, range.end);
+                const chunkRange = { start: cs, end: ce };
+                const requestPrompt = buildSceneDetectionRequest(allMessages, [chunkRange]);
+                const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
+                if (result) {
+                    const parsed = parseSceneDetectionResponse(result, [chunkRange]);
+                    allScenes.push(...parsed);
+                }
+            }
+        }
+    }
 
-    return parseSceneDetectionResponse(result, ranges);
+    return allScenes;
 }
 
 /**
@@ -235,7 +256,7 @@ function buildSceneDetectionRequest(allMessages, ranges) {
         for (let i = range.start; i <= range.end && i < allMessages.length; i++) {
             const m = allMessages[i];
             const speaker = m.name || "Unknown";
-            const text = (m.mes || "").slice(0, 200);
+            const text = (m.mes || "");
             parts.push(`[${i}] ${speaker}: ${text}`);
         }
         parts.push("");
@@ -255,16 +276,18 @@ function parseSceneDetectionResponse(response, ranges) {
     try {
         parsed = JSON.parse(response.trim());
     } catch {
+        const preview = (response || "").substring(0, 200);
+        console.debug("[RST] Batch scan: Scene detection raw response preview:", preview);
         const match = response.match(/\{[\s\S]*\}/);
         if (match) {
             try {
                 parsed = JSON.parse(match[0]);
             } catch {
-                console.error("[RST] Batch scan: Failed to parse scene detection response as JSON");
+                console.error("[RST] Batch scan: Failed to parse scene detection response as JSON. finish_reason may be 'length' — try increasing max tokens.");
                 return [];
             }
         } else {
-            console.error("[RST] Batch scan: No JSON found in scene detection response");
+            console.error("[RST] Batch scan: No JSON found in scene detection response. Response may be empty due to token limit.");
             return [];
         }
     }
@@ -371,7 +394,8 @@ async function generateInitialStats(messages, characters, profileName, settings)
     const systemPrompt = buildInitialStatSystemPrompt(settings);
     const requestPrompt = buildInitialStatRequestPrompt(messages, characters, settings);
 
-    const result = await makeRequest(profileName, systemPrompt + "\n\n" + requestPrompt, INITIAL_STAT_MAX_TOKENS);
+    const maxTokens = settings.batchScan?.initialStatMaxTokens ?? 3000;
+    const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
     if (!result) {
         return { sceneSummary: "", characterUpdates: [] };
     }
@@ -480,15 +504,18 @@ function parseInitialStatResponse(response, characters) {
     try {
         parsed = JSON.parse(response.trim());
     } catch {
+        const preview = (response || "").substring(0, 200);
+        console.debug("[RST] Batch scan: Initial stat raw response preview:", preview);
         const match = response.match(/\{[\s\S]*\}/);
         if (match) {
             try {
                 parsed = JSON.parse(match[0]);
             } catch {
-                console.error("[RST] Batch scan: Failed to parse initial stat response as JSON");
+                console.error("[RST] Batch scan: Failed to parse initial stat response as JSON. finish_reason may be 'length' — try increasing max tokens.");
                 return { sceneSummary: "", characterUpdates: [] };
             }
         } else {
+            console.error("[RST] Batch scan: No JSON found in initial stat response. Response may be empty due to token limit.");
             return { sceneSummary: "", characterUpdates: [] };
         }
     }
