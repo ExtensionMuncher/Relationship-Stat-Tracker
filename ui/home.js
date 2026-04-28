@@ -16,19 +16,21 @@ import { switchTab } from "./panel.js";
  * @param {jQuery} $pane
  */
 export function renderHomeTab($pane) {
-    $pane.empty();
+    // Header is rendered by panel.js via renderHomeHeader — preserve it.
+    // Only clear content that we previously created.
+    $pane.find("#rst-home-content").remove();
 
-    // Header is rendered by panel.js via renderHomeHeader
-    // We just render the content below the divider
+    const $content = $('<div id="rst-home-content"></div>');
 
     const pending = getPendingUpdates();
     if (pending) {
-        renderPendingSection($pane, pending);
+        renderPendingSection($content, pending);
     } else {
-        renderNoPending($pane);
+        renderNoPending($content);
     }
 
-    renderPresentCharacters($pane);
+    renderPresentCharacters($content);
+    $pane.append($content);
 }
 
 /**

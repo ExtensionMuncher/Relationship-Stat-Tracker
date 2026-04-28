@@ -49,14 +49,14 @@ export function updateInjection() {
 
     const position = PLACEMENT_MAP[settings.injection.placement] || 1;
 
-    setExtensionPrompt(PROMPT_ID, content, position, ROLE_SYSTEM, false, true);
+    setExtensionPrompt(PROMPT_ID, content, position, ROLE_SYSTEM);
 }
 
 /**
  * Remove the injected stat block from the system prompt.
  */
 export function removeInjection() {
-    setExtensionPrompt(PROMPT_ID, "", 0, ROLE_SYSTEM, false, true);
+    setExtensionPrompt(PROMPT_ID, "", 0, ROLE_SYSTEM);
 }
 
 // ─── Stat Block Builder ───────────────────────────────────

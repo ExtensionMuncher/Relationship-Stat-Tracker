@@ -3,7 +3,7 @@
  * Creates the main RST panel and appends it to ST's extension settings area
  */
 
-import { isEnabled, toggleEnabled, setSetting, getSetting } from "../settings.js";
+import { isEnabled, toggleEnabled } from "../settings.js";
 
 // ─── Tab Definitions ──────────────────────────────────────
 
