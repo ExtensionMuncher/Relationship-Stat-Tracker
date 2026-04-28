@@ -4,8 +4,8 @@
  */
 
 import { getSettings, saveSetting } from "../data/storage.js";
-import { getConnectionProfiles } from "../llm/connections.js";
 import { setSetting, isEnabled, exportAllData, importAllData } from "../settings.js";
+import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -29,14 +29,12 @@ export function renderSettingsTab($pane) {
 // ─── Connection Profiles ──────────────────────────────────
 
 /**
- * Render the connection profiles section.
+ * Render the connection profiles section using ST's ConnectionManagerRequestService.handleDropdown.
+ * Each profile selector is a native ST dropdown grouped by API type.
  * @param {jQuery} $pane
  * @param {object} settings
  */
 function renderConnectionProfiles($pane, settings) {
-    const profiles = getConnectionProfiles();
-    const options = profiles.map((p) => `<option value="${p.name}">${p.name}</option>`).join("");
-
     $pane.append('<div class="rst-lbl">Connection profiles</div>');
     const $card = $('<div class="rst-card"></div>');
 
@@ -45,17 +43,11 @@ function renderConnectionProfiles($pane, settings) {
         <div class="rst-two-col" style="margin-bottom:10px">
             <div>
                 <div style="font-size:12px;color:var(--rst-text-muted);margin-bottom:4px">Stat update LLM</div>
-                <select id="rst-conn-stat" style="width:100%">
-                    <option value="">— Select —</option>
-                    ${options}
-                </select>
+                <select id="rst-conn-stat" style="width:100%"></select>
             </div>
             <div>
                 <div style="font-size:12px;color:var(--rst-text-muted);margin-bottom:4px">Sidecar detection LLM</div>
-                <select id="rst-conn-sidecar" style="width:100%">
-                    <option value="">— Select —</option>
-                    ${options}
-                </select>
+                <select id="rst-conn-sidecar" style="width:100%"></select>
             </div>
         </div>
     `);
@@ -64,10 +56,7 @@ function renderConnectionProfiles($pane, settings) {
     const $autoGen = $(`
         <div>
             <div style="font-size:12px;color:var(--rst-text-muted);margin-bottom:4px">Auto-gen profile LLM</div>
-            <select id="rst-conn-autogen" style="width:55%">
-                <option value="">— Select —</option>
-                ${options}
-            </select>
+            <select id="rst-conn-autogen" style="width:55%"></select>
         </div>
     `);
 
@@ -75,21 +64,37 @@ function renderConnectionProfiles($pane, settings) {
     $card.append($autoGen);
     $pane.append($card);
 
-    // Set current values
-    $("#rst-conn-stat").val(settings.connections?.statUpdateLLM || "");
-    $("#rst-conn-sidecar").val(settings.connections?.sidecarLLM || "");
-    $("#rst-conn-autogen").val(settings.connections?.autoGenLLM || "");
+    // Initialize ST-native dropdowns (replaces manual <option> building)
+    // These must be called after elements are in the DOM
+    try {
+        ConnectionManagerRequestService.handleDropdown(
+            "#rst-conn-stat",
+            settings.connections?.statUpdateLLM || "",
+            (profile) => { saveSetting("connections.statUpdateLLM", profile?.id || ""); },
+        );
+    } catch (err) {
+        console.warn("[RST] Connection Manager not available for stat update LLM:", err);
+    }
 
-    // Listen for changes
-    $("#rst-conn-stat").on("change", function () {
-        saveSetting("connections.statUpdateLLM", $(this).val());
-    });
-    $("#rst-conn-sidecar").on("change", function () {
-        saveSetting("connections.sidecarLLM", $(this).val());
-    });
-    $("#rst-conn-autogen").on("change", function () {
-        saveSetting("connections.autoGenLLM", $(this).val());
-    });
+    try {
+        ConnectionManagerRequestService.handleDropdown(
+            "#rst-conn-sidecar",
+            settings.connections?.sidecarLLM || "",
+            (profile) => { saveSetting("connections.sidecarLLM", profile?.id || ""); },
+        );
+    } catch (err) {
+        console.warn("[RST] Connection Manager not available for sidecar LLM:", err);
+    }
+
+    try {
+        ConnectionManagerRequestService.handleDropdown(
+            "#rst-conn-autogen",
+            settings.connections?.autoGenLLM || "",
+            (profile) => { saveSetting("connections.autoGenLLM", profile?.id || ""); },
+        );
+    } catch (err) {
+        console.warn("[RST] Connection Manager not available for auto-gen LLM:", err);
+    }
 }
 
 // ─── Batch Scan ───────────────────────────────────────────
@@ -111,8 +116,7 @@ function renderBatchScan($pane) {
     `);
 
     $card.find("#rst-batch-scan").on("click", () => {
-        toastr?.info?.("Batch scan started. This may take a while...");
-        // TODO: Implement batch scan
+        toastr?.warning?.("Batch scan is not yet implemented. This feature will be available in a future update.");
     });
 
     $pane.append($card);
@@ -133,6 +137,9 @@ function renderSceneSummaryPrompt($pane, settings) {
                 Customize how the LLM writes scene summaries. These are internal notes only — never injected into your main prompt.
             </div>
             <textarea rows="4" style="margin-bottom:8px" id="rst-summary-prompt">${settings.sceneSummaryPrompt || ""}</textarea>
+            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:8px;padding:6px 8px;background:var(--rst-info-bg,#EEEDFE);border-radius:6px;line-height:1.4">
+                ⚠ Importing a prompt will overwrite your current scene summary prompt. Export saves it as a .txt file for backup or sharing.
+            </div>
             <div class="rst-btn-row">
                 <button class="rst-btn" id="rst-import-prompt">Import</button>
                 <button class="rst-btn" id="rst-export-prompt">Export</button>
@@ -322,12 +329,11 @@ function renderInjectionSettings($pane, settings) {
         </div>
     `);
 
-    // Injection placement
+    // Injection placement — 3 ST-standard positions only
     const placementOptions = [
+        { value: "top", label: "Top of system prompt" },
         { value: "above_card", label: "Above character card" },
         { value: "below_card", label: "Below character card" },
-        { value: "top", label: "Top of system prompt" },
-        { value: "bottom", label: "Bottom of system prompt" },
     ].map((o) => `<option value="${o.value}"${o.value === (inj.placement || "above_card") ? " selected" : ""}>${o.label}</option>`).join("");
 
     $card.append(`

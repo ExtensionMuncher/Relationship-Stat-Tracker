@@ -75,7 +75,6 @@ jQuery(async () => {
             switch (tabId) {
                 case "home":
                     renderHomeTab($pane);
-                    renderHomeHeader($pane);
                     break;
                 case "lib":
                     renderLibraryTab($pane);
@@ -179,7 +178,6 @@ async function onMessageReceived(mesId) {
             const $homePane = getPane("home");
             if ($homePane.hasClass("on")) {
                 renderHomeTab($homePane);
-                renderHomeHeader($homePane);
             }
         } catch (err) {
             console.error("[RST] Sidecar detection error:", err);
@@ -195,7 +193,6 @@ function onChatChanged() {
 
     // Re-render all tabs
     const $homePane = getPane("home");
-    renderHomeHeader($homePane);
     renderHomeTab($homePane);
     renderLibraryTab(getPane("lib"));
     renderScenesTab(getPane("scenes"));
@@ -283,7 +280,6 @@ function addSceneButtons(mesId) {
             // Refresh UI
             const $homePane = getPane("home");
             renderHomeTab($homePane);
-            renderHomeHeader($homePane);
             renderScenesTab(getPane("scenes"));
         } catch (err) {
             console.error("[RST] Stat update failed after scene close:", err);

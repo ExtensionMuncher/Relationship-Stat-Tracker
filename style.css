@@ -464,26 +464,6 @@
     margin-bottom: 6px;
 }
 
-/* --- Overlay / Modal --- */
-.rst-overlay {
-    background: rgba(0, 0, 0, 0.38);
-    border-radius: 12px;
-    padding: 30px 20px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 200px;
-}
-
-.rst-modal {
-    background: var(--rst-bg);
-    border: 0.5px solid var(--rst-border);
-    border-radius: 12px;
-    padding: 16px;
-    width: 100%;
-    max-width: 300px;
-}
-
 /* --- Two Column Layout --- */
 .rst-two-col {
     display: grid;
@@ -556,39 +536,6 @@
 
 .rst-char-pending.open .rst-char-pending-body {
     display: block;
-}
-
-/* --- Rollback Confirmation Dialog --- */
-.rst-rollback-dialog {
-    background: var(--rst-bg);
-    border: 0.5px solid var(--rst-danger);
-    border-radius: 12px;
-    padding: 16px;
-    width: 100%;
-    max-width: 340px;
-}
-
-.rst-rollback-warning {
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--rst-danger);
-    margin-bottom: 10px;
-}
-
-.rst-rollback-detail {
-    font-size: 12px;
-    color: var(--rst-text-muted);
-    line-height: 1.5;
-    margin-bottom: 12px;
-}
-
-.rst-rollback-detail ul {
-    margin: 6px 0 0 16px;
-    padding: 0;
-}
-
-.rst-rollback-detail li {
-    margin-bottom: 2px;
 }
 
 /* --- Message Action Buttons (Scene Start/End) --- */

@@ -1,34 +1,32 @@
 /**
- * connections.js — Pull connection profiles from ST
+ * connections.js — ST connection profile integration
  * Provides access to ST's connection manager profiles for LLM calls
+ * Uses ConnectionManagerRequestService for per-profile API calls without
+ * switching the global active profile.
  */
+
+import { getContext } from "../../../../extensions.js";
+import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 
 // ─── Connection Profile Access ────────────────────────────
 
 /**
- * Get the SillyTavern context object.
- * @returns {object}
- */
-function getSTContext() {
-    return typeof getContext === "function" ? getContext() : null;
-}
-
-/**
- * Get all available connection profile names from ST.
+ * Get all available connection profiles from ST's connection manager.
  * @returns {Array<{name: string, id: string}>}
  */
 export function getConnectionProfiles() {
-    const ctx = getSTContext();
-    if (!ctx) return [];
+    try {
+        const ctx = getContext();
+        const cm = ctx.extensionSettings?.connectionManager;
+        if (!cm?.profiles) return [];
 
-    // Connection Manager stores profiles in extensionSettings
-    const cm = ctx.extensionSettings?.connectionManager;
-    if (!cm || !cm.profiles) return [];
-
-    return cm.profiles.map((p) => ({
-        name: p.name || "Unnamed",
-        id: p.id || p.name,
-    }));
+        return cm.profiles.map((p) => ({
+            name: p.name || "Unnamed",
+            id: p.id || p.name,
+        }));
+    } catch {
+        return [];
+    }
 }
 
 /**
@@ -39,93 +37,57 @@ export function getConnectionProfiles() {
 export function getConnectionProfile(profileName) {
     if (!profileName) return null;
 
-    const ctx = getSTContext();
-    if (!ctx) return null;
+    try {
+        const ctx = getContext();
+        const cm = ctx.extensionSettings?.connectionManager;
+        if (!cm?.profiles) return null;
 
-    const cm = ctx.extensionSettings?.connectionManager;
-    if (!cm || !cm.profiles) return null;
-
-    return cm.profiles.find((p) => p.name === profileName) || null;
+        return cm.profiles.find((p) => p.name === profileName || p.id === profileName) || null;
+    } catch {
+        return null;
+    }
 }
 
+// ─── LLM Request API ──────────────────────────────────────
+
 /**
- * Switch ST to use a specific connection profile.
- * @param {string} profileName
- * @returns {boolean} True if switched successfully
+ * Make an LLM request using a specific connection profile.
+ * Uses ST's ConnectionManagerRequestService.sendRequest() to route the request
+ * through the selected profile without changing the global active profile.
+ *
+ * @param {string} profileId - The profile ID to use for the request
+ * @param {string} prompt - The full prompt text (system + user)
+ * @param {number} [maxTokens=500] - Maximum response tokens
+ * @returns {Promise<string|null>} The response text, or null on failure
  */
-export async function switchToProfile(profileName) {
-    if (!profileName) return false;
-
-    const profile = getConnectionProfile(profileName);
-    if (!profile) {
-        console.warn(`[RST] Connection profile "${profileName}" not found`);
-        return false;
+export async function makeRequest(profileId, prompt, maxTokens = 500) {
+    if (!profileId) {
+        console.warn("[RST] No connection profile specified for LLM request");
+        toastr?.warning?.("No connection profile selected. Check Settings > Connection profiles.");
+        return null;
     }
-
-    const ctx = getSTContext();
-    if (!ctx) return false;
 
     try {
-        // Apply the profile settings to ST's main connection
-        const cm = ctx.extensionSettings?.connectionManager;
-        if (cm && typeof cm.applyProfile === "function") {
-            await cm.applyProfile(profile.id || profile.name);
-            return true;
-        }
-
-        // Fallback: directly set the active profile
-        if (cm) {
-            cm.activeProfile = profile.id || profile.name;
-            return true;
-        }
-
-        return false;
-    } catch (err) {
-        console.error("[RST] Failed to switch connection profile:", err);
-        return false;
-    }
-}
-
-/**
- * Get the currently active connection profile name.
- * @returns {string}
- */
-export function getActiveProfileName() {
-    const ctx = getSTContext();
-    if (!ctx) return "";
-
-    const cm = ctx.extensionSettings?.connectionManager;
-    if (!cm) return "";
-
-    // Try to find the active profile
-    if (cm.activeProfile) {
-        const profile = cm.profiles?.find(
-            (p) => p.id === cm.activeProfile || p.name === cm.activeProfile
+        const response = await ConnectionManagerRequestService.sendRequest(
+            profileId,
+            prompt,
+            maxTokens,
         );
-        return profile ? profile.name : cm.activeProfile;
+
+        if (typeof response === "string") {
+            return response;
+        }
+
+        // sendRequest may return an object with a 'response' field
+        if (response && typeof response === "object" && response.response) {
+            return response.response;
+        }
+
+        console.warn("[RST] Unexpected response format from ConnectionManagerRequestService:", response);
+        return null;
+    } catch (err) {
+        console.error(`[RST] LLM request failed for profile "${profileId}":`, err);
+        toastr?.error?.(`LLM request failed. Check your connection settings for "${profileId}".`);
+        return null;
     }
-
-    return "Default";
-}
-
-/**
- * Save the current connection state and switch to a specific profile.
- * Returns a restore function that switches back.
- * @param {string} profileName
- * @returns {Promise<{restore: Function}>}
- */
-export async function withProfile(profileName) {
-    const previousProfile = getActiveProfileName();
-
-    if (profileName && profileName !== previousProfile) {
-        await switchToProfile(profileName);
-    }
-
-    return {
-        restore: async () => {
-            if (profileName && profileName !== previousProfile) {
-                await switchToProfile(previousProfile);
-            }
-        },
-    };
 }

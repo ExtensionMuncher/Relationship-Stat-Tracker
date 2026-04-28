@@ -1,6 +1,7 @@
 /**
  * panel.js — Builds/manages the 4-tab extension panel
- * Creates the main RST panel and appends it to ST's extension settings area
+ * Creates the main RST panel using ST's extension_container + inline-drawer pattern
+ * and appends it to ST's extension settings area
  */
 
 import { isEnabled, toggleEnabled } from "../settings.js";
@@ -17,11 +18,26 @@ const TABS = [
 // ─── Panel Creation ───────────────────────────────────────
 
 /**
- * Create the main RST panel and append it to ST's extension settings.
+ * Create the main RST panel using ST's extension_container + inline-drawer pattern.
  * @returns {jQuery} The panel element
  */
 export function createPanel() {
-    const $panel = $('<div class="rst-shell"></div>');
+    // ST's extension_container + inline-drawer pattern
+    const $container = $(`
+        <div id="rst_container" class="extension_container">
+            <div class="inline-drawer">
+                <div class="inline-drawer-toggle inline-drawer-header">
+                    <b>Relationship State Tracker</b>
+                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+                    <div class="rst-shell"></div>
+                </div>
+            </div>
+        </div>
+    `);
+
+    const $shell = $container.find(".rst-shell");
 
     // Tabs
     const $tabs = $('<div class="rst-tabs"></div>');
@@ -30,18 +46,18 @@ export function createPanel() {
         $tab.on("click", () => switchTab(tab.id));
         $tabs.append($tab);
     });
-    $panel.append($tabs);
+    $shell.append($tabs);
 
     // Panes
     TABS.forEach((tab, i) => {
         const $pane = $(`<div id="rst-p-${tab.id}" class="rst-pane${i === 0 ? " on" : ""}"></div>`);
-        $panel.append($pane);
+        $shell.append($pane);
     });
 
     // Append to ST's extension settings area
-    $("#extensions_settings").append($panel);
+    $("#extensions_settings").append($container);
 
-    return $panel;
+    return $shell;
 }
 
 /**
@@ -87,14 +103,18 @@ export function getActiveTab() {
 
 /**
  * Render the Home tab header with enable toggle.
+ * Replaces any existing header to avoid duplicates on re-render.
  * @param {jQuery} $pane
  */
 export function renderHomeHeader($pane) {
     const enabled = isEnabled();
     const statusText = enabled ? "Extension enabled" : "Extension disabled";
 
+    // Remove existing header to prevent duplicates
+    $pane.find("#rst-header-wrap").remove();
+
     const $header = $(`
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <div id="rst-header-wrap" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
             <div>
                 <div style="font-size:14px;font-weight:500">Relationship state tracker</div>
                 <div id="rst-ext-lbl" style="font-size:11px;color:var(--rst-text-muted)">${statusText}</div>
@@ -113,6 +133,12 @@ export function renderHomeHeader($pane) {
         $(document).trigger("rst:toggle", [newState]);
     });
 
-    $pane.append($header);
-    $pane.append('<hr class="rst-div">');
+    $pane.prepend($header);
+    // Ensure divider follows the header
+    const $divider = $pane.find("> hr.rst-div");
+    if ($divider.length) {
+        $divider.insertAfter($header);
+    } else {
+        $pane.find("#rst-header-wrap").after('<hr class="rst-div">');
+    }
 }

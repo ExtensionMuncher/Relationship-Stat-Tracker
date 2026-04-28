@@ -4,8 +4,8 @@
  * narrative summaries, AND scene summaries (single LLM call)
  */
 
-import { generateQuietPrompt, chat } from "../../../../../script.js";
-import { withProfile } from "./connections.js";
+import { chat } from "../../../../../script.js";
+import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getCharacterProfile, cloneStats, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries } from "../data/scenes.js";
@@ -44,16 +44,13 @@ export async function generateStatUpdate(sceneId, guidance = "") {
     try {
         toastr?.info?.("Generating stat updates...");
 
-        const { restore } = await withProfile(profileName);
-        let result;
-        try {
-            result = await generateQuietPrompt({
-                quietPrompt: systemPrompt + "\n\n" + requestPrompt,
-                responseLength: 2000,
-            });
-        } finally {
-            await restore();
-        }
+        const result = await makeRequest(
+            profileName,
+            systemPrompt + "\n\n" + requestPrompt,
+            2000,
+        );
+
+        if (!result) throw new Error("No response from LLM");
 
         const parsed = parseStatUpdateResponse(result, characters);
         return {

@@ -15,11 +15,11 @@ const PROMPT_ID = "rst-stat-block";
 const ROLE_SYSTEM = 0;
 
 // Placement mapping to ST's injection depth
+// Only ST-standard positions: top(0), above character card(1), below character card(2)
 const PLACEMENT_MAP = {
     above_card: 1,
     below_card: 2,
     top: 0,
-    bottom: 100,
 };
 
 // ─── Main Injection Function ──────────────────────────────

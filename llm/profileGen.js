@@ -3,8 +3,8 @@
  * Generates character descriptions, notes, and initial stats from scene context
  */
 
-import { generateQuietPrompt, chat } from "../../../../../script.js";
-import { withProfile } from "./connections.js";
+import { chat } from "../../../../../script.js";
+import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getAllSceneSummaries } from "../data/scenes.js";
 import { STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
@@ -28,16 +28,13 @@ export async function generateProfile(characterName, prompt = "", fromScene = fa
     try {
         toastr?.info?.("Generating character profile...");
 
-        const { restore } = await withProfile(profileName);
-        let result;
-        try {
-            result = await generateQuietPrompt({
-                quietPrompt: systemPrompt + "\n\n" + requestPrompt,
-                responseLength: 1000,
-            });
-        } finally {
-            await restore();
-        }
+        const result = await makeRequest(
+            profileName,
+            systemPrompt + "\n\n" + requestPrompt,
+            1000,
+        );
+
+        if (!result) throw new Error("No response from LLM");
 
         const parsed = parseProfileResponse(result);
         return {

@@ -20,6 +20,7 @@ import {
 } from "../data/characters.js";
 import { generateProfile } from "../llm/profileGen.js";
 import { formatTimeAgo } from "../data/scenes.js";
+import { Popup, POPUP_RESULT, POPUP_TYPE } from "../../../../../scripts/popup.js";
 
 // ─── State ────────────────────────────────────────────────
 
@@ -70,7 +71,7 @@ export function renderLibraryTab($pane) {
         $pane.append('<div style="font-size:12px;color:var(--rst-text-muted)">Select a character above to view details.</div>');
     }
 
-    // Hidden modals
+    // Hidden wraps for inline panels
     $pane.append('<div id="rst-wand-wrap" style="display:none;margin-top:8px"></div>');
     $pane.append('<div id="rst-log-wrap" style="display:none;margin-top:4px"></div>');
     $pane.append('<div id="rst-newchar-wrap" style="display:none;margin-top:8px"></div>');
@@ -325,111 +326,93 @@ function renderLogEntry(entry, profile) {
 // ─── Rollback Confirmation ────────────────────────────────
 
 /**
- * Show the rollback confirmation dialog.
+ * Show the rollback confirmation dialog via ST Popup.
  * @param {object} profile
  * @param {object} entry
  */
-function showRollbackConfirmation(profile, entry) {
-    const $overlay = $(`
-        <div class="rst-overlay" style="position:fixed;inset:0;z-index:10000">
-            <div class="rst-rollback-dialog">
-                <div class="rst-rollback-warning">⚠ WARNING: Rollbacks cannot be reversed.</div>
-                <div class="rst-rollback-detail">
-                    Are you sure you want to proceed?<br><br>
-                    Rolling back will restore:
-                    <ul>
-                        <li>All 12 stats to their previous values</li>
-                        <li>Dynamic title to: "${entry.dynamicTitleBefore || "None"}"</li>
-                        <li>Narrative summary to previous version</li>
-                    </ul>
-                </div>
-                <div class="rst-btn-row">
-                    <button class="rst-btn rst-cancel-rollback">Cancel</button>
-                    <button class="rst-btn-danger rst-confirm-rollback">Confirm Rollback</button>
-                </div>
-            </div>
-        </div>
-    `);
+async function showRollbackConfirmation(profile, entry) {
+    const detailLines = [
+        "Are you sure you want to proceed? Rollbacks cannot be reversed.\n",
+        "Rolling back will restore:",
+        "• All 12 stats to their previous values",
+        `• Dynamic title to: "${entry.dynamicTitleBefore || "None"}"`,
+        "• Narrative summary to previous version",
+    ];
 
-    $overlay.find(".rst-cancel-rollback").on("click", () => {
-        $overlay.remove();
-    });
+    const result = await Popup.show.confirm(
+        "⚠ Rollback warning",
+        detailLines.join("\n"),
+    );
 
-    $overlay.find(".rst-confirm-rollback").on("click", async () => {
-        try {
-            // Restore stats
-            updateCharacterStats(profile.id, entry.statsBefore);
+    if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
-            // Restore dynamic title and narrative
-            updateCharacterProfile(profile.id, {
-                dynamicTitle: entry.dynamicTitleBefore,
-                narrativeSummary: entry.narrativeSummary || profile.narrativeSummary,
-            });
+    try {
+        // Restore stats
+        updateCharacterStats(profile.id, entry.statsBefore);
 
-            // Remove this log entry
-            removeUpdateLogEntry(profile.id, entry.sceneId);
+        // Restore dynamic title and narrative
+        updateCharacterProfile(profile.id, {
+            dynamicTitle: entry.dynamicTitleBefore,
+            narrativeSummary: entry.narrativeSummary || profile.narrativeSummary,
+        });
 
-            $overlay.remove();
-            toastr?.success?.(`Rollback complete. ${profile.name} stats restored to pre-${entry.sceneId} state.`);
+        // Remove this log entry
+        removeUpdateLogEntry(profile.id, entry.sceneId);
 
-            const $pane = $("#rst-p-lib");
-            renderLibraryTab($pane);
+        toastr?.success?.(`Rollback complete. ${profile.name} stats restored to pre-${entry.sceneId} state.`);
 
-            // Update injection
-            const { updateInjection } = await import("../inject/promptInjector.js");
-            updateInjection();
-        } catch (err) {
-            console.error("[RST] Rollback failed:", err);
-            toastr?.error?.("Rollback failed. Please try again.");
-            $overlay.remove();
-        }
-    });
+        const $pane = $("#rst-p-lib");
+        renderLibraryTab($pane);
 
-    $("body").append($overlay);
+        // Update injection
+        const { updateInjection } = await import("../inject/promptInjector.js");
+        updateInjection();
+    } catch (err) {
+        console.error("[RST] Rollback failed:", err);
+        toastr?.error?.("Rollback failed. Please try again.");
+    }
 }
 
 // ─── Wand Modal (Profile Generation) ─────────────────────
 
 /**
- * Show the magic wand profile generation modal.
+ * Show the magic wand profile generation dialog via ST Popup.
  * @param {object} profile
  */
-function showWandModal(profile) {
-    const $wrap = $("#rst-wand-wrap");
-    $wrap.empty();
+async function showWandModal(profile) {
+    const html = `
+        <h3>Generate profile</h3>
+        <p style="margin-bottom:10px;font-size:12px;color:var(--SmartThemeBodyColor,#999)">
+            Add an optional prompt or leave blank to generate from scene context alone.
+        </p>
+        <textarea id="rst-wand-input" rows="3" style="width:100%" placeholder="e.g. Focus on his psychology and emotional contradictions..."></textarea>
+    `;
 
-    const $modal = $(`
-        <div class="rst-overlay">
-            <div class="rst-modal">
-                <div style="font-size:14px;font-weight:500;margin-bottom:5px">Generate profile</div>
-                <div style="font-size:12px;color:var(--rst-text-muted);margin-bottom:10px">Add an optional prompt or leave blank to generate from scene context alone.</div>
-                <textarea rows="3" style="margin-bottom:10px" placeholder="e.g. Focus on his psychology and emotional contradictions..."></textarea>
-                <div class="rst-btn-row" style="margin-bottom:8px">
-                    <button class="rst-btn" style="flex:1" id="rst-wand-prompt">Generate from prompt</button>
-                    <button class="rst-btn" style="flex:1" id="rst-wand-scene">Generate from scene</button>
-                </div>
-                <button class="rst-btn" style="width:100%;color:var(--rst-text-muted)" id="rst-wand-cancel">Cancel</button>
-            </div>
-        </div>
-    `);
-
-    $modal.find("#rst-wand-prompt").on("click", async () => {
-        const prompt = $modal.find("textarea").val().trim();
-        await runProfileGen(profile.name, prompt, false);
-        $wrap.hide();
+    const popup = new Popup(html, POPUP_TYPE.TEXT, "", {
+        customButtons: [
+            {
+                text: "Generate from prompt",
+                result: 2,
+                action: async () => {
+                    const textarea = document.getElementById("rst-wand-input");
+                    const prompt = textarea?.value?.trim() || "";
+                    await runProfileGen(profile.name, prompt, false);
+                    popup.complete(2);
+                },
+            },
+            {
+                text: "Generate from scene",
+                result: 3,
+                action: async () => {
+                    await runProfileGen(profile.name, "", true);
+                    popup.complete(3);
+                },
+            },
+        ],
+        okButton: "Cancel",
     });
 
-    $modal.find("#rst-wand-scene").on("click", async () => {
-        await runProfileGen(profile.name, "", true);
-        $wrap.hide();
-    });
-
-    $modal.find("#rst-wand-cancel").on("click", () => {
-        $wrap.hide();
-    });
-
-    $wrap.append($modal);
-    $wrap.show();
+    await popup.show();
 }
 
 /**
@@ -467,66 +450,51 @@ async function runProfileGen(name, prompt, fromScene) {
 // ─── New Character Dialog ─────────────────────────────────
 
 /**
- * Show the new character creation dialog.
+ * Show the new character creation dialog via ST Popup input.
  * @param {jQuery} $pane
  */
-function showNewCharacterDialog($pane) {
-    const name = prompt("Enter character name:");
+async function showNewCharacterDialog($pane) {
+    const name = await Popup.show.input("New character", "Enter character name:");
     if (!name || !name.trim()) return;
 
     createCharacter(name.trim());
-    selectedCharId = null; // Will be set after re-render
+    selectedCharId = null;
     toastr?.success?.(`New character profile created for ${name.trim()}.`);
     renderLibraryTab($pane);
 }
 
 /**
- * Show the "new character detected" modal.
+ * Show the "new character detected" dialog via ST Popup confirm.
  * @param {string} name
  */
-export function showNewCharacterDetected(name) {
-    const $wrap = $("#rst-newchar-wrap");
-    if ($wrap.length === 0) return;
+export async function showNewCharacterDetected(name) {
+    const result = await Popup.show.confirm(
+        "New character detected",
+        `${name} was found in the current context. Create a blank profile entry?`,
+        { okButton: "Create entry", cancelButton: "Ignore" },
+    );
 
-    $wrap.empty();
+    if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
-    const $modal = $(`
-        <div class="rst-overlay">
-            <div class="rst-modal">
-                <div style="font-size:14px;font-weight:500;margin-bottom:5px">New character detected</div>
-                <div style="font-size:12px;color:var(--rst-text-muted);margin-bottom:12px">${name} was found in the current context. Create a blank profile entry?</div>
-                <div class="rst-btn-row">
-                    <button class="rst-btn-approve" style="flex:1" id="rst-newchar-create">Create entry</button>
-                    <button class="rst-btn" style="flex:1" id="rst-newchar-ignore">Ignore</button>
-                </div>
-            </div>
-        </div>
-    `);
-
-    $modal.find("#rst-newchar-create").on("click", () => {
-        createCharacter(name);
-        toastr?.success?.(`New character profile created for ${name}.`);
-        $wrap.hide();
-        const $pane = $("#rst-p-lib");
-        renderLibraryTab($pane);
-    });
-
-    $modal.find("#rst-newchar-ignore").on("click", () => {
-        $wrap.hide();
-    });
-
-    $wrap.append($modal);
-    $wrap.show();
+    createCharacter(name);
+    toastr?.success?.(`New character profile created for ${name}.`);
+    const $pane = $("#rst-p-lib");
+    renderLibraryTab($pane);
 }
 
 // ─── Delete Character ─────────────────────────────────────
 
 /**
- * Confirm and delete a character.
+ * Confirm and delete a character via ST Popup confirm.
  * @param {object} profile
  */
-function confirmDeleteCharacter(profile) {
-    if (!confirm(`Are you sure you want to delete ${profile.name}? This cannot be undone.`)) return;
+async function confirmDeleteCharacter(profile) {
+    const result = await Popup.show.confirm(
+        "Delete character",
+        `Are you sure you want to delete ${profile.name}? This cannot be undone.`,
+    );
+
+    if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
     deleteCharacter(profile.id);
     if (selectedCharId === profile.id) selectedCharId = null;

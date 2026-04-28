@@ -3,8 +3,8 @@
  * Calls a lightweight LLM to detect character names in recent messages
  */
 
-import { generateQuietPrompt, chat, name1 } from "../../../../../script.js";
-import { withProfile } from "./connections.js";
+import { generateQuietPrompt, chat } from "../../../../../script.js";
+import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getAllCharacters } from "../data/characters.js";
 
@@ -31,17 +31,13 @@ export async function detectCharacters(messageCount = 10) {
     const requestPrompt = buildSidecarRequestPrompt(messages);
 
     try {
-        const { restore } = await withProfile(profileName);
+        const result = await makeRequest(
+            profileName,
+            systemPrompt + "\n\n" + requestPrompt,
+            200,
+        );
 
-        let result;
-        try {
-            result = await generateQuietPrompt({
-                quietPrompt: systemPrompt + "\n\n" + requestPrompt,
-                responseLength: 200,
-            });
-        } finally {
-            await restore();
-        }
+        if (!result) return { detected: [], unknown: [] };
 
         const detectedNames = parseDetectedNames(result);
         return categorizeNames(detectedNames, knownNames);

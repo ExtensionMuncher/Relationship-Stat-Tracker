@@ -1,6 +1,7 @@
 {
 	"display_name": "Relationship State Tracker",
 	"loading_order": 2,
+	"default_state": "enabled",
 	"requires": [],
 	"optional": [],
 	"js": "index.js",
