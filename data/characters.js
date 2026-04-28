@@ -1,6 +1,6 @@
 /**
  * characters.js — Character profile CRUD + stat storage
- * All character profiles are stored globally in extension_settings.rst.characters
+ * All character profiles are stored per-chat in chat_metadata.rst.characters
  */
 
 import {

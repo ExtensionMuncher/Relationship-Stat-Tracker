@@ -23,6 +23,7 @@ import {
 import { generateProfile } from "../llm/profileGen.js";
 import { formatTimeAgo } from "../data/scenes.js";
 import { Popup, POPUP_RESULT, POPUP_TYPE } from "../../../../../scripts/popup.js";
+import { showPanelLoading, hidePanelLoading } from "./panel.js";
 
 // ─── State ────────────────────────────────────────────────
 
@@ -133,8 +134,7 @@ function renderCharacterChips($pane) {
  */
 function renderCharacterCard($pane, profile) {
     const initials = getInitials(profile.name);
-    const sourceLabel = profile.source === "character_card" ? "From character card" :
-                        profile.source === "auto_generated" ? "Auto-generated" : "Manual entry";
+    const sourceLabel = profile.source === "character_card" ? "From character card" : "Manual entry";
 
     const $card = $(`<div class="rst-card"></div>`);
 
@@ -163,8 +163,10 @@ function renderCharacterCard($pane, profile) {
     $card.append($header);
 
     // Profile textareas
-    $card.append('<div class="rst-lbl">Profile</div>');
+    $card.append('<div class="rst-lbl">Personality</div>');
     const $desc = $(`<textarea rows="2" style="margin-bottom:8px">${profile.description || ""}</textarea>`);
+    $card.append($desc);
+    $card.append('<div class="rst-lbl" style="margin-top:8px">Character Notes</div>');
     const $notes = $(`<textarea rows="2">${profile.notes ? "Notes: " + profile.notes : ""}</textarea>`);
 
     $desc.on("change", function () {
@@ -174,7 +176,6 @@ function renderCharacterCard($pane, profile) {
         updateCharacterProfile(profile.id, { notes: $(this).val() });
     });
 
-    $card.append($desc);
     $card.append($notes);
     $card.append('<hr class="rst-div">');
 
@@ -210,6 +211,23 @@ function renderCharacterCard($pane, profile) {
  * @param {object} profile
  * @returns {jQuery}
  */
+/**
+ * Find the most recent non-empty commentary for a stat across all log entries.
+ * Falls back through log entries so deleting the newest entry doesn't blank commentaries.
+ * @param {object} profile
+ * @param {string} cat
+ * @param {string} stat
+ * @returns {string}
+ */
+function findLatestCommentary(profile, cat, stat) {
+    if (!profile.updateLog) return "";
+    for (const entry of profile.updateLog) {
+        const c = entry.commentary?.[cat]?.[stat];
+        if (c && typeof c === "string" && c.trim()) return c.trim();
+    }
+    return "";
+}
+
 function renderStatCategoryForLibrary(cat, profile) {
     const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
     const $cat = $(`<div class="rst-stat-cat"></div>`);
@@ -218,7 +236,7 @@ function renderStatCategoryForLibrary(cat, profile) {
     for (const stat of STAT_NAMES) {
         const val = profile.stats[cat][stat];
         const cls = val > 0 ? "p" : val < 0 ? "n" : "z";
-        const commentary = profile.updateLog?.[0]?.commentary?.[cat]?.[stat] || "";
+        const commentary = findLatestCommentary(profile, cat, stat);
 
         $cat.append(`
             <div class="rst-sr">
@@ -395,7 +413,7 @@ async function showEditStatsModal(profile) {
         fieldsHtml += `<div style="font-weight:600;margin:10px 0 4px;font-size:13px;color:var(--SmartThemeBodyColor,#ccc)">── ${catTitle(cat)} ──</div>`;
         for (const stat of STAT_NAMES) {
             const val = profile.stats[cat][stat];
-            const commentary = profile.updateLog?.[0]?.commentary?.[cat]?.[stat] || "";
+            const commentary = findLatestCommentary(profile, cat, stat);
             fieldsHtml += `
                 <div style="margin-bottom:8px">
                     <div style="font-size:12px;font-weight:500;margin-bottom:2px">${statLabel(stat)}</div>
@@ -522,6 +540,7 @@ async function showWandModal(profile) {
  * @param {boolean} fromScene
  */
 async function runProfileGen(name, prompt, fromScene) {
+    showPanelLoading(`Generating profile for ${name}...`);
     try {
         const result = await generateProfile(name, prompt, fromScene);
 
@@ -544,6 +563,8 @@ async function runProfileGen(name, prompt, fromScene) {
         }
     } catch (err) {
         console.error("[RST] Profile generation failed:", err);
+    } finally {
+        hidePanelLoading();
     }
 }
 

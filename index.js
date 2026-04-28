@@ -16,11 +16,11 @@ import { extension_settings } from "../../../../scripts/extensions.js";
 import { initSettings, isEnabled, getSetting } from "./settings.js";
 import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter, savePendingUpdates } from "./data/storage.js";
 import { createCharacter, findCharacterByName } from "./data/characters.js";
-import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary } from "./data/scenes.js";
+import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary, updateSceneTitle } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
 import { generateStatUpdate } from "./llm/statUpdate.js";
 import { updateInjection, removeInjection } from "./inject/promptInjector.js";
-import { createPanel, renderHomeHeader, getPane, switchTab } from "./ui/panel.js";
+import { createPanel, renderHomeHeader, getPane, switchTab, showPanelLoading, hidePanelLoading } from "./ui/panel.js";
 import { renderHomeTab } from "./ui/home.js";
 import { renderLibraryTab, selectCharacter, showNewCharacterDetected } from "./ui/library.js";
 import { renderScenesTab } from "./ui/scenes.js";
@@ -151,15 +151,20 @@ async function onMessageReceived(mesId) {
         try {
             const result = await detectCharacters();
 
+            // Filter out {{user}} from detected and unknown names
+            const EXCLUDED_NAMES = new Set(["{{user}}", "user", "User"]);
+            const filteredDetected = result.detected.filter((name) => !EXCLUDED_NAMES.has(name));
+            const filteredUnknown = result.unknown.filter((name) => !EXCLUDED_NAMES.has(name));
+
             // Update present characters
-            const allDetected = [...result.detected, ...result.unknown.map((name) => {
+            const allDetected = [...filteredDetected, ...filteredUnknown.map((name) => {
                 // Find or create character for unknown names
                 const existing = findCharacterByName(name);
                 return existing ? existing.id : null;
             })].filter(Boolean);
 
             // Handle unknown characters
-            for (const unknownName of result.unknown) {
+            for (const unknownName of filteredUnknown) {
                 const existing = findCharacterByName(unknownName);
                 if (!existing && settings.newCharPopup) {
                     showNewCharacterDetected(unknownName);
@@ -191,6 +196,11 @@ async function onMessageReceived(mesId) {
 function onChatChanged() {
     initSceneCounter();
 
+    // Migrate any old global characters to per-chat storage
+    // (characters were moved from extension_settings.rst to chat_metadata.rst
+    //  in a previous update; this ensures existing user data is not lost)
+    migrateGlobalCharacters();
+
     // Re-render all tabs
     const $homePane = getPane("home");
     renderHomeTab($homePane);
@@ -209,6 +219,29 @@ function onChatChanged() {
                 addSceneButtons(parseInt(mesId, 10));
             }
         });
+    }
+}
+
+/**
+ * Migrate characters from old global extension_settings storage to per-chat chat_metadata.
+ * This handles the transition for users who had characters before the migration.
+ */
+function migrateGlobalCharacters() {
+    const NAMESPACE = "rst";
+    const globalChars = extension_settings[NAMESPACE]?.characters;
+    if (globalChars && Object.keys(globalChars).length > 0) {
+        // Only migrate if per-chat storage is empty (don't overwrite existing chat data)
+        const chatChars = chat_metadata[NAMESPACE]?.characters;
+        if (!chatChars || Object.keys(chatChars).length === 0) {
+            console.log("[RST] Migrating", Object.keys(globalChars).length, "character(s) from global to per-chat storage");
+            if (!chat_metadata[NAMESPACE]) {
+                chat_metadata[NAMESPACE] = {};
+            }
+            chat_metadata[NAMESPACE].characters = globalChars;
+            delete extension_settings[NAMESPACE].characters;
+            saveChatDebounced();
+            saveSettingsDebounced();
+        }
     }
 }
 
@@ -277,9 +310,19 @@ function addSceneButtons(mesId) {
 
         // Close the scene
         const closedScene = closeScene(openScene.id, mesId);
-        if (!closedScene) return;
+        if (!closedScene) {
+            console.error("[RST] closeScene returned null for scene:", openScene.id, "status:", openScene.status);
+            toastr?.error?.("Failed to close scene. The scene may have already been closed or the data is corrupted. Check the console for details.");
+            return;
+        }
 
-        toastr?.info?.("Scene closed. Generating stat updates...");
+        // Show processing indicator — disable button and show spinner
+        $endBtn.addClass("rst-scene-processing");
+        $endBtn.find("i").removeClass("fa-stop").addClass("fa-spinner fa-spin");
+        toastr?.info?.("Scene closed. Generating stat updates... (may take a moment)");
+
+        // Show persistent loading indicator in panel (survives tab switches)
+        showPanelLoading("Generating stat updates...");
 
         // Trigger stat update flow
         try {
@@ -287,6 +330,11 @@ function addSceneButtons(mesId) {
 
             // Store the scene summary
             updateSceneSummary(closedScene.id, result.sceneSummary);
+
+            // Store the scene title (if generated)
+            if (result.sceneTitle) {
+                updateSceneTitle(closedScene.id, result.sceneTitle);
+            }
 
             // Store pending updates
             savePendingUpdates(result);
@@ -300,6 +348,13 @@ function addSceneButtons(mesId) {
         } catch (err) {
             console.error("[RST] Stat update failed after scene close:", err);
             toastr?.error?.("Stat update generation failed. Please try again from the Home tab.");
+        } finally {
+            // Hide persistent loading indicator
+            hidePanelLoading();
+
+            // Restore button state
+            $endBtn.removeClass("rst-scene-processing");
+            $endBtn.find("i").removeClass("fa-spinner fa-spin").addClass("fa-stop");
         }
 
         $startBtn.removeClass("rst-scene-active");

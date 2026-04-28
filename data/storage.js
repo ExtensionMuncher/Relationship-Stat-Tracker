@@ -17,12 +17,8 @@ const NAMESPACE = "rst";
 function ensureSettingsNamespace() {
     if (!extension_settings[NAMESPACE]) {
         extension_settings[NAMESPACE] = {
-            characters: {},
             settings: getDefaultSettings(),
         };
-    }
-    if (!extension_settings[NAMESPACE].characters) {
-        extension_settings[NAMESPACE].characters = {};
     }
     if (!extension_settings[NAMESPACE].settings) {
         extension_settings[NAMESPACE].settings = getDefaultSettings();
@@ -72,56 +68,64 @@ export function persistSettings() {
     saveSettingsDebounced();
 }
 
-// ─── Character Profiles (Global) ──────────────────────────
+// ─── Character Profiles (Per-Chat) ────────────────────────
 
 /**
- * Get all character profiles.
+ * Get all character profiles for the current chat.
  * @returns {object} Map of character ID → profile
  */
 export function getCharacters() {
-    ensureSettingsNamespace();
-    return extension_settings[NAMESPACE].characters;
+    ensureChatNamespace();
+    if (!chat_metadata[NAMESPACE].characters) {
+        chat_metadata[NAMESPACE].characters = {};
+    }
+    return chat_metadata[NAMESPACE].characters;
 }
 
 /**
- * Get a single character profile by ID.
+ * Get a single character profile by ID for the current chat.
  * @param {string} charId
  * @returns {object|null}
  */
 export function getCharacter(charId) {
-    ensureSettingsNamespace();
-    return extension_settings[NAMESPACE].characters[charId] || null;
+    ensureChatNamespace();
+    return chat_metadata[NAMESPACE].characters?.[charId] || null;
 }
 
 /**
- * Save a character profile.
+ * Save a character profile to the current chat.
  * @param {string} charId
  * @param {object} profile
  */
 export function saveCharacter(charId, profile) {
-    ensureSettingsNamespace();
-    extension_settings[NAMESPACE].characters[charId] = profile;
-    saveSettingsDebounced();
+    ensureChatNamespace();
+    if (!chat_metadata[NAMESPACE].characters) {
+        chat_metadata[NAMESPACE].characters = {};
+    }
+    chat_metadata[NAMESPACE].characters[charId] = profile;
+    saveChatDebounced();
 }
 
 /**
- * Delete a character profile.
+ * Delete a character profile from the current chat.
  * @param {string} charId
  */
 export function deleteCharacterData(charId) {
-    ensureSettingsNamespace();
-    delete extension_settings[NAMESPACE].characters[charId];
-    saveSettingsDebounced();
+    ensureChatNamespace();
+    if (chat_metadata[NAMESPACE].characters) {
+        delete chat_metadata[NAMESPACE].characters[charId];
+        saveChatDebounced();
+    }
 }
 
 /**
- * Replace all character data.
+ * Replace all character data for the current chat.
  * @param {object} characters Map of charId → profile
  */
 export function saveAllCharacters(characters) {
-    ensureSettingsNamespace();
-    extension_settings[NAMESPACE].characters = characters;
-    saveSettingsDebounced();
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].characters = characters;
+    saveChatDebounced();
 }
 
 // ─── Per-Chat Data ────────────────────────────────────────
@@ -136,6 +140,7 @@ function ensureChatNamespace() {
             pendingUpdates: null,
             presentCharacters: [],
             messageCounter: 0,
+            characters: {},
         };
     }
 }

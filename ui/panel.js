@@ -34,6 +34,13 @@ export function createPanel() {
                     <div class="rst-shell"></div>
                 </div>
             </div>
+            <!-- Persistent loading overlay (non-blocking banner, survives tab switches) -->
+            <div id="rst-loading-overlay" class="rst-loading-overlay" style="display:none">
+                <div class="rst-loading-content">
+                    <i class="fa-solid fa-spinner fa-spin" style="font-size:13px;color:var(--rst-accent)"></i>
+                    <div id="rst-loading-text" style="margin-top:0;font-size:11px;color:var(--rst-text)">Processing...</div>
+                </div>
+            </div>
         </div>
     `);
 
@@ -58,6 +65,35 @@ export function createPanel() {
     $("#extensions_settings").append($container);
 
     return $shell;
+}
+
+// ─── Loading Indicator ────────────────────────────────────
+
+let loadingTimeout = null;
+
+/**
+ * Show a persistent loading overlay on the RST panel.
+ * The overlay survives tab switches and auto-hides after a timeout.
+ * @param {string} [message="Processing..."] - Status message to display
+ */
+export function showPanelLoading(message = "Processing...") {
+    clearTimeout(loadingTimeout);
+    const $overlay = $("#rst-loading-overlay");
+    if ($overlay.length) {
+        $("#rst-loading-text").text(message);
+        $overlay.fadeIn(150);
+    }
+}
+
+/**
+ * Hide the persistent loading overlay.
+ */
+export function hidePanelLoading() {
+    clearTimeout(loadingTimeout);
+    const $overlay = $("#rst-loading-overlay");
+    if ($overlay.length) {
+        $overlay.fadeOut(150);
+    }
 }
 
 /**

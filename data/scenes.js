@@ -36,11 +36,12 @@ export function initSceneCounter() {
  * @param {number} messageStart - The mesId where the scene begins
  * @returns {object} The new scene entry
  */
-export function createScene(messageStart) {
+export function createScene(messageStart, title = "") {
     sceneCounter++;
     const scene = {
         id: `scene_${sceneCounter}`,
         status: "open",
+        title: title || "",
         messageStart,
         messageEnd: null,
         charactersPresent: [...getPresentCharacters()],
@@ -137,6 +138,19 @@ export function updateSceneSummary(sceneId, summary) {
 }
 
 /**
+ * Update a scene's title.
+ * @param {string} sceneId
+ * @param {string} title
+ */
+export function updateSceneTitle(sceneId, title) {
+    const scenes = getScenes();
+    const scene = scenes.find((s) => s.id === sceneId);
+    if (!scene) return;
+    scene.title = title;
+    saveScenes(scenes);
+}
+
+/**
  * Update a scene's characters present list.
  * @param {string} sceneId
  * @param {Array<string>} charIds
@@ -162,6 +176,8 @@ export function deleteScene(sceneId) {
     if (index === -1) return false;
     scenes.splice(index, 1);
     saveScenes(scenes);
+    // Reset counter so next scene reuses the lowest available number
+    initSceneCounter();
     return true;
 }
 

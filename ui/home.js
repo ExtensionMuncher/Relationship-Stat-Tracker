@@ -3,11 +3,11 @@
  * Renders the Home tab with pending update cards and present character list
  */
 
-import { getPendingUpdates, savePendingUpdates, getPresentCharacters } from "../data/storage.js";
+import { getPendingUpdates, savePendingUpdates, getPresentCharacters, getSettings } from "../data/storage.js";
 import { getCharacterProfile, getInitials, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
-import { getOpenScene, getSceneById } from "../data/scenes.js";
+import { getOpenScene, getSceneById, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
 import { generateStatUpdate } from "../llm/statUpdate.js";
-import { switchTab } from "./panel.js";
+import { switchTab, showPanelLoading, hidePanelLoading } from "./panel.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -144,8 +144,11 @@ function renderSceneSummaryCard($container, pending) {
     });
 
     $btnRow.find(".rst-btn-approve").on("click", () => {
-        pending.sceneSummary = $textarea.val();
+        const summary = $textarea.val();
+        pending.sceneSummary = summary;
         savePendingUpdates(pending);
+        // Also persist to the scene data
+        updateSceneSummary(pending.sceneId, summary);
         toastr?.success?.("Scene summary approved.");
     });
 
@@ -230,8 +233,7 @@ function renderCharacterPending($container, charUpdate, sceneId) {
     });
 
     $btnRow.find(".rst-edit-btn").on("click", () => {
-        // TODO: Open inline editor for stat values
-        toastr?.info?.("Manual editing coming soon.");
+        showEditStatsModal(charUpdate, sceneId);
     });
 
     $body.append($btnRow);
@@ -406,10 +408,16 @@ async function approveCharacterUpdate(charUpdate) {
             narrativeSummary: charUpdate.narrativeSummary,
         });
 
+        // Get actual message range from the scene
+        const scene = charUpdate.sceneId ? getSceneById(charUpdate.sceneId) : null;
+        const messageRange = scene
+            ? { start: scene.messageStart, end: scene.messageEnd }
+            : null; // No scene available — skip message range in log entry
+
         // Create update log entry
         addUpdateLogEntry(charUpdate.characterId, {
             sceneId: charUpdate.sceneId || "",
-            messageRange: { start: 0, end: 0 }, // Filled from scene data
+            messageRange,
             timestamp: Date.now(),
             statsBefore: charUpdate.statsBefore,
             statsAfter: charUpdate.statsAfter,
@@ -480,6 +488,7 @@ function dismissAllPending() {
  * @param {string} guidance
  */
 async function regenerateSceneSummary(sceneId, guidance) {
+    showPanelLoading("Regenerating scene summary...");
     try {
         toastr?.info?.("Regenerating scene summary...");
         const result = await generateStatUpdate(sceneId, guidance);
@@ -496,6 +505,8 @@ async function regenerateSceneSummary(sceneId, guidance) {
         toastr?.success?.("Scene summary regenerated.");
     } catch (err) {
         console.error("[RST] Failed to regenerate summary:", err);
+    } finally {
+        hidePanelLoading();
     }
 }
 
@@ -506,6 +517,7 @@ async function regenerateSceneSummary(sceneId, guidance) {
  * @param {string} guidance
  */
 async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
+    showPanelLoading("Regenerating stat updates...");
     try {
         toastr?.info?.("Regenerating stat updates...");
         const result = await generateStatUpdate(sceneId, guidance);
@@ -528,6 +540,217 @@ async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
         toastr?.success?.("Stat updates regenerated.");
     } catch (err) {
         console.error("[RST] Failed to regenerate stats:", err);
+    } finally {
+        hidePanelLoading();
+    }
+}
+
+// ─── Edit Stats Modal ─────────────────────────────────────
+
+/**
+ * Open a modal for editing a character's pending stat update.
+ * Allows editing all 12 stat values, dynamic title, narrative summary, and commentary.
+ * @param {object} charUpdate - The character update object
+ * @param {string} sceneId - The scene ID
+ */
+async function showEditStatsModal(charUpdate, sceneId) {
+    const editedStats = JSON.parse(JSON.stringify(charUpdate.statsAfter || {}));
+    let html = `<div style="max-height:70vh;overflow-y:auto;padding-right:4px">`;
+
+    // Stat editors
+    for (const cat of STAT_CATEGORIES) {
+        const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
+        html += `<div style="margin-bottom:14px">
+            <div style="font-weight:500;font-size:13px;margin-bottom:6px;color:var(--rst-text)">${catTitle}</div>`;
+
+        for (const stat of STAT_NAMES) {
+            const statTitle = stat.charAt(0).toUpperCase() + stat.slice(1);
+            const beforeVal = charUpdate.statsBefore?.[cat]?.[stat] ?? 0;
+            const currentVal = editedStats[cat]?.[stat] ?? 0;
+            html += `
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                    <label style="width:80px;font-size:12px;color:var(--rst-text-muted);flex-shrink:0">${statTitle}</label>
+                    <span style="font-size:11px;color:var(--rst-text-muted);width:60px;text-align:right">(${formatPercent(beforeVal)} →)</span>
+                    <input type="number" class="rst-edit-stat" data-cat="${cat}" data-stat="${stat}"
+                        value="${currentVal}" min="-100" max="100"
+                        style="width:70px;padding:3px 6px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);text-align:center">
+                    <span style="font-size:11px;color:var(--rst-text-muted)">%</span>
+                </div>`;
+        }
+        html += `</div>`;
+    }
+
+    // Commentary editor
+    html += `<div style="margin-bottom:14px">
+        <div style="font-weight:500;font-size:13px;margin-bottom:6px;color:var(--rst-text)">Commentary (why stats changed)</div>`;
+
+    for (const cat of STAT_CATEGORIES) {
+        const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
+        html += `<div style="margin-bottom:8px">
+            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:3px">${catTitle}</div>`;
+
+        for (const stat of STAT_NAMES) {
+            const statTitle = stat.charAt(0).toUpperCase() + stat.slice(1);
+            const commentText = charUpdate.commentary?.[cat]?.[stat] || "";
+            html += `
+                <div style="margin-bottom:3px">
+                    <label style="font-size:11px;color:var(--rst-text-muted);width:70px;display:inline-block">${statTitle}</label>
+                    <input type="text" class="rst-edit-commentary" data-cat="${cat}" data-stat="${stat}"
+                        value="${commentText}"
+                        style="width:calc(100% - 80px);padding:3px 6px;font-size:11px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text)">
+                </div>`;
+        }
+        html += `</div>`;
+    }
+    html += `</div>`;
+
+    // Dynamic title
+    const editedTitle = charUpdate.dynamicTitleAfter || "";
+    html += `<div style="margin-bottom:10px">
+        <div style="font-weight:500;font-size:13px;margin-bottom:4px;color:var(--rst-text)">Dynamic Title</div>
+        <input type="text" id="rst-edit-title" value="${editedTitle}"
+            style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text)">
+    </div>`;
+
+    // Narrative summary
+    const editedNarrative = charUpdate.narrativeSummary || "";
+    html += `<div style="margin-bottom:10px">
+        <div style="font-weight:500;font-size:13px;margin-bottom:4px;color:var(--rst-text)">Narrative Summary</div>
+        <textarea id="rst-edit-narrative" rows="3"
+            style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${editedNarrative}</textarea>
+    </div>`;
+
+    html += `</div>`; // End scroll container
+
+    // Use ST's Popup system
+    try {
+        const { Popup, POPUP_TYPE } = globalThis;
+
+        const popup = new Popup(html, POPUP_TYPE.TEXT, "", {
+            okButton: "Save changes",
+            cancelButton: "Cancel",
+            customButtons: [
+                {
+                    text: "Reset to LLM values",
+                    action: () => {
+                        const originalAfter = charUpdate.statsAfter || {};
+                        $(popup.element).find(".rst-edit-stat").each(function () {
+                            const cat = $(this).data("cat");
+                            const stat = $(this).data("stat");
+                            $(this).val(originalAfter[cat]?.[stat] ?? 0);
+                        });
+                        $(popup.element).find("#rst-edit-title").val(charUpdate.dynamicTitleAfter || "");
+                        $(popup.element).find("#rst-edit-narrative").val(charUpdate.narrativeSummary || "");
+                        $(popup.element).find(".rst-edit-commentary").each(function () {
+                            const cat = $(this).data("cat");
+                            const stat = $(this).data("stat");
+                            $(this).val(charUpdate.commentary?.[cat]?.[stat] || "");
+                        });
+                        return false; // Don't close popup
+                    },
+                },
+            ],
+        });
+
+        popup.onCancelled(() => {
+            // Do nothing — discard edits
+        });
+
+        popup.onConfirmed(async () => {
+            // Read all edited values from the DOM
+            const newStats = JSON.parse(JSON.stringify(charUpdate.statsAfter || {}));
+            $(popup.element).find(".rst-edit-stat").each(function () {
+                const cat = $(this).data("cat");
+                const stat = $(this).data("stat");
+                const val = parseInt($(this).val(), 10);
+                if (!isNaN(val)) {
+                    if (!newStats[cat]) newStats[cat] = {};
+                    newStats[cat][stat] = Math.max(-100, Math.min(100, val));
+                }
+            });
+
+            const newCommentary = JSON.parse(JSON.stringify(charUpdate.commentary || {}));
+            $(popup.element).find(".rst-edit-commentary").each(function () {
+                const cat = $(this).data("cat");
+                const stat = $(this).data("stat");
+                if (!newCommentary[cat]) newCommentary[cat] = {};
+                newCommentary[cat][stat] = $(this).val() || "";
+            });
+
+            const newTitle = $(popup.element).find("#rst-edit-title").val() || "";
+            const newNarrative = $(popup.element).find("#rst-edit-narrative").val() || "";
+
+            // Apply to pending updates
+            const pending = getPendingUpdates();
+            if (pending && pending.characterUpdates) {
+                const update = pending.characterUpdates.find((u) => u.characterId === charUpdate.characterId);
+                if (update) {
+                    update.statsAfter = newStats;
+                    update.commentary = newCommentary;
+                    update.dynamicTitleAfter = newTitle;
+                    update.narrativeSummary = newNarrative;
+                    // Recalculate change count
+                    let changeCount = 0;
+                    for (const cat of STAT_CATEGORIES) {
+                        for (const stat of STAT_NAMES) {
+                            const before = update.statsBefore?.[cat]?.[stat] ?? 0;
+                            const after = newStats[cat]?.[stat] ?? 0;
+                            if (before !== after) changeCount++;
+                        }
+                    }
+                    update.changeCount = changeCount;
+                    savePendingUpdates(pending);
+
+                    // Refresh the UI
+                    const $pane = $("#rst-p-home");
+                    refreshPending($pane);
+                    toastr?.success?.(`${charUpdate.characterName} stats updated manually.`);
+                }
+            }
+        });
+    } catch (err) {
+        console.error("[RST] Failed to open edit modal:", err);
+
+        // Fallback: use ST Popup input instead of native prompt()
+        try {
+            const { Popup, POPUP_TYPE } = globalThis;
+            const fallbackHtml = `
+                <h3>Edit stats for ${charUpdate.characterName}</h3>
+                <p style="font-size:12px;color:var(--rst-text-muted);margin-bottom:8px">
+                    Paste the modified JSON stats object below:
+                </p>
+                <textarea id="rst-fallback-edit" rows="10" style="width:100%;font-family:monospace;font-size:11px">${JSON.stringify(charUpdate.statsAfter, null, 2)}</textarea>
+            `;
+            const fallbackPopup = new Popup(fallbackHtml, POPUP_TYPE.TEXT, "", {
+                okButton: "Save",
+                cancelButton: "Cancel",
+            });
+
+            fallbackPopup.onConfirmed(async () => {
+                const newVal = $(fallbackPopup.element).find("#rst-fallback-edit").val();
+                try {
+                    const parsed = JSON.parse(newVal);
+                    const pending = getPendingUpdates();
+                    if (pending && pending.characterUpdates) {
+                        const update = pending.characterUpdates.find((u) => u.characterId === charUpdate.characterId);
+                        if (update) {
+                            update.statsAfter = parsed;
+                            savePendingUpdates(pending);
+                            const $pane = $("#rst-p-home");
+                            refreshPending($pane);
+                            toastr?.success?.(charUpdate.characterName + " stats updated manually.");
+                        }
+                    }
+                } catch {
+                    toastr?.error?.("Invalid JSON. Changes discarded.");
+                }
+            });
+
+            await fallbackPopup.show();
+        } catch (fallbackErr) {
+            console.error("[RST] Fallback edit modal also failed:", fallbackErr);
+            toastr?.error?.("Could not open edit modal. Please try again.");
+        }
     }
 }
 
@@ -539,7 +762,7 @@ async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
  * @returns {string}
  */
 function formatPercent(val) {
-    return `${val >= 0 ? "" : ""}${val}%`;
+    return (val >= 0 ? "" : "") + val + "%";
 }
 
 /**

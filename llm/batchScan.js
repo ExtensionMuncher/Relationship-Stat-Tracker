@@ -10,8 +10,13 @@ import { chat } from "../../../../../script.js";
 import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getScenes, saveScenes } from "../data/storage.js";
-import { findCharacterByName, createCharacter, updateCharacterStats, getCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
-import { initSceneCounter, updateSceneSummary } from "../data/scenes.js";
+import { findCharacterByName, createCharacter, updateCharacterStats, getCharacterProfile, addUpdateLogEntry, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
+import { initSceneCounter, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
+import { showPanelLoading, hidePanelLoading } from "../ui/panel.js";
+
+// ─── Constants ─────────────────────────────────────────────
+
+const EXCLUDED_NAMES = new Set(["{{user}}", "user", "User"]);
 
 // ─── Main Entry Point ─────────────────────────────────────
 
@@ -47,6 +52,8 @@ export async function runBatchScan() {
         return { scenesCreated: 0, profilesCreated: [] };
     }
 
+    showPanelLoading("Batch scan: Analyzing chat for scene boundaries...");
+
     const allMessages = chat;
     const existingScenes = getScenes();
 
@@ -54,6 +61,7 @@ export async function runBatchScan() {
     const ranges = getUnprocessedRanges(existingScenes, allMessages.length);
     if (ranges.length === 0) {
         toastr?.info?.("All messages already covered by existing scenes. Nothing to scan.");
+        hidePanelLoading();
         return { scenesCreated: 0, profilesCreated: [] };
     }
 
@@ -63,14 +71,17 @@ export async function runBatchScan() {
     const detectedScenes = await detectScenes(allMessages, ranges, autoGenProfile, settings);
     if (!detectedScenes || detectedScenes.length === 0) {
         toastr?.warning?.("Batch scan: No scenes detected in the chat history.");
+        hidePanelLoading();
         return { scenesCreated: 0, profilesCreated: [] };
     }
 
-    // Phase 2: Create profiles for unknown characters
+    // Phase 2: Create profiles for unknown characters (filtering out {{user}})
     const profilesCreated = [];
     const allCharNames = new Set();
     for (const scene of detectedScenes) {
         for (const name of scene.characters) {
+            // Skip excluded names like {{user}}
+            if (EXCLUDED_NAMES.has(name)) continue;
             allCharNames.add(name);
         }
     }
@@ -118,6 +129,9 @@ export async function runBatchScan() {
         createdScenes.push(newScene);
     }
 
+    // Sync module-level scene counter so manual scene creation continues from the correct number
+    initSceneCounter();
+
     // Phase 4: Generate summaries + initial stat blocks
     let scenesProcessed = 0;
     for (const scene of createdScenes) {
@@ -140,11 +154,34 @@ export async function runBatchScan() {
                 updateSceneSummary(scene.id, result.sceneSummary);
             }
 
-            // Apply initial stats to character profiles
+            // Save scene title (if generated)
+            if (result.sceneTitle) {
+                updateSceneTitle(scene.id, result.sceneTitle);
+            }
+
+            // Apply initial stats + save commentary/log to character profiles
             for (const charUpdate of result.characterUpdates) {
                 const profile = getCharacterProfile(charUpdate.characterId);
                 if (profile) {
                     updateCharacterStats(charUpdate.characterId, charUpdate.statsAfter);
+
+                    // Save narrative summary and dynamic title
+                    if (charUpdate.narrativeSummary) {
+                        updateCharacterProfile(charUpdate.characterId, { narrativeSummary: charUpdate.narrativeSummary });
+                    }
+                    if (charUpdate.dynamicTitleAfter) {
+                        updateCharacterProfile(charUpdate.characterId, { dynamicTitle: charUpdate.dynamicTitleAfter });
+                    }
+
+                    // Log the update with commentary
+                    addUpdateLogEntry(charUpdate.characterId, {
+                        timestamp: Date.now(),
+                        statsBefore: charUpdate.statsBefore || {},
+                        statsAfter: charUpdate.statsAfter,
+                        commentary: charUpdate.commentary || {},
+                        sceneId: scene.id,
+                        source: "batch_scan",
+                    });
                 }
             }
 
@@ -154,6 +191,7 @@ export async function runBatchScan() {
         }
     }
 
+    hidePanelLoading();
     toastr?.success?.(`Batch scan complete: ${createdScenes.length} scenes created, ${profilesCreated.length} profiles generated.`);
 
     return {
@@ -215,13 +253,18 @@ function buildSceneDetectionSystemPrompt() {
     return `You are a scene analysis assistant. Your job is to analyze chat conversations and identify logical scene boundaries and character appearances.
 
 # SCENE DEFINITION:
-A "scene" is a narrative unit with a consistent setting, time period, and group of interacting characters. Scene boundaries occur when:
+A "scene" is a substantial narrative unit with a consistent setting, time period, and group of interacting characters. Scenes represent meaningful story segments where characters interact, develop, and drive the plot forward. Scene boundaries occur when:
 - The topic or activity changes significantly
 - Characters enter or leave
 - There's a notable time skip or location change
 
+# CRITICAL — MINIMUM SCENE SIZE:
+- Each scene MUST span at least 15 messages. Do not create scenes shorter than 15 messages.
+- If a group of messages is too short to form a proper scene, merge it with adjacent messages or leave it unmarked.
+- Only create scene boundaries where there's a clear, meaningful narrative shift.
+- Avoid fragmenting conversations into many tiny scenes — scenes should represent real story arcs.
+
 # RULES:
-- Each scene MUST have at least 2 messages
 - Scenes must not overlap
 - Scene boundaries should be clean message breaks (whole messages)
 - List character names exactly as they appear in the message sender labels
@@ -283,27 +326,37 @@ function parseSceneDetectionResponse(response, ranges) {
             try {
                 parsed = JSON.parse(match[0]);
             } catch {
-                console.error("[RST] Batch scan: Failed to parse scene detection response as JSON. finish_reason may be 'length' — try increasing max tokens.");
+                const msg = "[RST] Batch scan: Failed to parse scene detection response as JSON. finish_reason may be 'length' — try increasing max tokens.";
+                console.error(msg);
+                toastr?.error?.("Batch scan: Failed to parse scene detection response. The response may be truncated — try increasing max tokens.", "RST Batch Scan");
                 return [];
             }
         } else {
-            console.error("[RST] Batch scan: No JSON found in scene detection response. Response may be empty due to token limit.");
+            const msg = "[RST] Batch scan: No JSON found in scene detection response. Response may be empty due to token limit.";
+            console.error(msg);
+            toastr?.error?.("Batch scan: No scene data found in the LLM response. The model may have generated an empty response.", "RST Batch Scan");
             return [];
         }
     }
 
     if (!parsed.scenes || !Array.isArray(parsed.scenes)) {
         console.error("[RST] Batch scan: Invalid scene detection response format");
+        toastr?.error?.("Batch scan: LLM returned an unexpected response format. Check the connection profile settings.", "RST Batch Scan");
         return [];
     }
 
     // Validate and constrain scene boundaries to the requested ranges
+    const MIN_SCENE_SIZE = 15;
     const validScenes = [];
     for (const scene of parsed.scenes) {
         const start = parseInt(scene.messageStart, 10);
         const end = parseInt(scene.messageEnd, 10);
 
         if (isNaN(start) || isNaN(end) || start < 0 || end < start) continue;
+
+        // Enforce minimum scene size
+        const sceneSize = end - start + 1;
+        if (sceneSize < MIN_SCENE_SIZE) continue;
 
         // Ensure scene falls within at least one valid range
         const inRange = ranges.some((r) => start >= r.start && end <= r.end);
@@ -388,7 +441,7 @@ function getUnprocessedRanges(existingScenes, totalMessages) {
  * @param {Array} characters - Character profiles (with 0-initialized stats)
  * @param {string} profileName - statUpdateLLM profile
  * @param {object} settings
- * @returns {Promise<{sceneSummary: string, characterUpdates: Array}>}
+ * @returns {Promise<{sceneSummary: string, sceneTitle: string, characterUpdates: Array}>}
  */
 async function generateInitialStats(messages, characters, profileName, settings) {
     const systemPrompt = buildInitialStatSystemPrompt(settings);
@@ -397,7 +450,7 @@ async function generateInitialStats(messages, characters, profileName, settings)
     const maxTokens = settings.batchScan?.initialStatMaxTokens ?? 3000;
     const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
     if (!result) {
-        return { sceneSummary: "", characterUpdates: [] };
+        return { sceneSummary: "", sceneTitle: "", characterUpdates: [] };
     }
 
     return parseInitialStatResponse(result, characters);
@@ -413,7 +466,8 @@ function buildInitialStatSystemPrompt(settings) {
 
 Generate:
 1. A concise SCENE SUMMARY (factual, clinical — short paragraph)
-2. For each character, an INITIAL relationship stat assessment based on their behavior in the scene
+2. A SCENE TITLE (short, descriptive name for this scene)
+3. For each character, an INITIAL relationship stat assessment based on their behavior in the scene
 
 # PERSPECTIVE RULE (CRITICAL — DO NOT VIOLATE):
 - All stats represent how the DETECTED CHARACTER feels toward {{user}} — NOT the other way around!
@@ -441,6 +495,7 @@ Generate:
 
 RESPONSE FORMAT — return ONLY valid JSON:
 {
+  "sceneTitle": "Short descriptive title for this scene",
   "sceneSummary": "Concise summary of the scene...",
   "characters": {
     "[CHARACTER_NAME]": {
@@ -497,30 +552,21 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
  * Parse the initial stat response.
  * @param {string} response - LLM output
  * @param {Array} characters - Character profiles
- * @returns {{sceneSummary: string, characterUpdates: Array}}
+ * @returns {{sceneSummary: string, sceneTitle: string, characterUpdates: Array}}
  */
 function parseInitialStatResponse(response, characters) {
-    let parsed;
-    try {
-        parsed = JSON.parse(response.trim());
-    } catch {
+    // Try robust JSON extraction first (handles code fences, truncation)
+    const parsed = extractBatchStatJson(response);
+    if (!parsed) {
         const preview = (response || "").substring(0, 200);
-        console.debug("[RST] Batch scan: Initial stat raw response preview:", preview);
-        const match = response.match(/\{[\s\S]*\}/);
-        if (match) {
-            try {
-                parsed = JSON.parse(match[0]);
-            } catch {
-                console.error("[RST] Batch scan: Failed to parse initial stat response as JSON. finish_reason may be 'length' — try increasing max tokens.");
-                return { sceneSummary: "", characterUpdates: [] };
-            }
-        } else {
-            console.error("[RST] Batch scan: No JSON found in initial stat response. Response may be empty due to token limit.");
-            return { sceneSummary: "", characterUpdates: [] };
-        }
+        const msg = `[RST] Batch scan: Could not parse initial stat response. Preview: "${preview}"`;
+        console.warn(msg);
+        toastr?.error?.("Batch scan: Could not parse the stat generation response. The LLM may have returned malformed JSON.", "RST Batch Scan");
+        return { sceneSummary: "", sceneTitle: "", characterUpdates: [] };
     }
 
     const sceneSummary = parsed.sceneSummary || "";
+    const sceneTitle = parsed.sceneTitle || "";
     const characterUpdates = [];
 
     for (const char of characters) {
@@ -552,5 +598,34 @@ function parseInitialStatResponse(response, characters) {
         });
     }
 
-    return { sceneSummary, characterUpdates };
+    return { sceneSummary, sceneTitle, characterUpdates };
+}
+
+// ─── JSON Extraction Helper ─────────────────────────────────
+
+/**
+ * Strip markdown code fences and attempt to extract JSON from a batch scan LLM response.
+ * Handles ```json ... ```, ``` ... ```, and truncated responses.
+ * @param {string} text - Raw LLM response
+ * @returns {object|null} Parsed JSON or null if extraction failed
+ */
+function extractBatchStatJson(text) {
+    // Step 1: Strip code fences
+    let cleaned = text.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+
+    // Step 2: Try direct parse
+    try {
+        return JSON.parse(cleaned);
+    } catch {
+        // Step 3: Try regex extraction
+        const match = cleaned.match(/\{[\s\S]*\}/);
+        if (match) {
+            try {
+                return JSON.parse(match[0]);
+            } catch {
+                return null; // Regex-extracted JSON still failed (truncated)
+            }
+        }
+        return null; // No JSON found
+    }
 }

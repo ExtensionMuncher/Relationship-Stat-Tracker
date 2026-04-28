@@ -73,7 +73,7 @@ export function getConnectionProfile(profileName) {
  */
 export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens = 500) {
     if (!profileId) {
-        console.warn("[RST] No connection profile specified for LLM request");
+        console.warn("[RST] No connection profile specified for LLM request (profileId was:", JSON.stringify(profileId), ")");
         toastr?.warning?.("No connection profile selected. Check Settings > Connection profiles.");
         return null;
     }
@@ -113,15 +113,26 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
             overridePayload,      // 5. overridePayload
         );
 
-        // Extract content from response (ST returns { content: "..." })
-        // Pattern matches timeline-memory: result?.content || result || ''
+        // Extract content from response — handle multiple response formats
         if (typeof response === "string") {
             return response;
         }
 
         if (response && typeof response === "object") {
-            if (response.content) {
-                return response.content;
+            // ST ChatCompletion format: { choices: [{ message: { content, reasoning? } }] }
+            if (response.choices && Array.isArray(response.choices) && response.choices[0]?.message?.content !== undefined) {
+                const content = response.choices[0].message.content;
+                const reasoning = response.choices[0].message.reasoning;
+                // Reasoning models (e.g. deepseek-reasoner) may return empty content with reasoning field
+                if (content || !reasoning) {
+                    return content;
+                }
+                return reasoning;
+            }
+            // Simple { content: "..." } format (TextCompletion or some ST versions)
+            if (response.content !== undefined) {
+                // Reasoning models may return empty content with reasoning at top level
+                return response.content || response.reasoning || '';
             }
             // Some ST versions may use different field names
             if (response.response) {
