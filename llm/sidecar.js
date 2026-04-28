@@ -3,7 +3,7 @@
  * Calls a lightweight LLM to detect character names in recent messages
  */
 
-import { generateRaw, chat, name1 } from "../../../../../script.js";
+import { generateQuietPrompt, chat, name1 } from "../../../../../script.js";
 import { withProfile } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getAllCharacters } from "../data/characters.js";
@@ -35,14 +35,10 @@ export async function detectCharacters(messageCount = 10) {
 
         let result;
         try {
-            result = await generateRaw(
-                systemPrompt,
-                requestPrompt,
-                false,
-                false,
-                null,
-                200 // Short response — just a list of names
-            );
+            result = await generateQuietPrompt({
+                quietPrompt: systemPrompt + "\n\n" + requestPrompt,
+                responseLength: 200,
+            });
         } finally {
             await restore();
         }

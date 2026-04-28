@@ -3,7 +3,7 @@
  * Generates character descriptions, notes, and initial stats from scene context
  */
 
-import { generateRaw, chat } from "../../../../../script.js";
+import { generateQuietPrompt, chat } from "../../../../../script.js";
 import { withProfile } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getAllSceneSummaries } from "../data/scenes.js";
@@ -31,14 +31,10 @@ export async function generateProfile(characterName, prompt = "", fromScene = fa
         const { restore } = await withProfile(profileName);
         let result;
         try {
-            result = await generateRaw(
-                systemPrompt,
-                requestPrompt,
-                false,
-                false,
-                null,
-                1000
-            );
+            result = await generateQuietPrompt({
+                quietPrompt: systemPrompt + "\n\n" + requestPrompt,
+                responseLength: 1000,
+            });
         } finally {
             await restore();
         }

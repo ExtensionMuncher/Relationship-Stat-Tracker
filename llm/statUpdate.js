@@ -4,7 +4,7 @@
  * narrative summaries, AND scene summaries (single LLM call)
  */
 
-import { generateRaw, chat } from "../../../../../script.js";
+import { generateQuietPrompt, chat } from "../../../../../script.js";
 import { withProfile } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getCharacterProfile, cloneStats, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
@@ -47,14 +47,10 @@ export async function generateStatUpdate(sceneId, guidance = "") {
         const { restore } = await withProfile(profileName);
         let result;
         try {
-            result = await generateRaw(
-                systemPrompt,
-                requestPrompt,
-                false,
-                false,
-                null,
-                2000 // Longer response — detailed stat analysis
-            );
+            result = await generateQuietPrompt({
+                quietPrompt: systemPrompt + "\n\n" + requestPrompt,
+                responseLength: 2000,
+            });
         } finally {
             await restore();
         }

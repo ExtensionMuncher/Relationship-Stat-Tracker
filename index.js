@@ -16,7 +16,7 @@ import {
 import { initSettings, isEnabled, getSetting } from "./settings.js";
 import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter } from "./data/storage.js";
 import { createCharacter, findCharacterByName } from "./data/characters.js";
-import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes } from "./data/scenes.js";
+import { createScene, closeScene, getOpenScene, initSceneCounter } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
 import { generateStatUpdate } from "./llm/statUpdate.js";
 import { updateInjection, removeInjection } from "./inject/promptInjector.js";
