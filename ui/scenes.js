@@ -4,8 +4,8 @@
  */
 
 import { Popup } from "../../../../../scripts/popup.js";
-import { getCharacterProfile, getInitials } from "../data/characters.js";
-import { getAllScenes, getOpenScene, deleteScene, updateSceneSummary, updateSceneTitle, formatTimeAgo } from "../data/scenes.js";
+import { getCharacterProfile, getInitials, getAllCharacters } from "../data/characters.js";
+import { getAllScenes, getOpenScene, deleteScene, updateSceneSummary, updateSceneTitle, updateSceneCharacters, formatTimeAgo } from "../data/scenes.js";
 
 // ─── Bulk Selection State ─────────────────────────────────
 
@@ -177,34 +177,94 @@ function renderSceneEntry(scene, isOpen) {
     // Body
     const $body = $('<div class="rst-scene-body"></div>');
 
-    // Characters in this scene (always shown, for both open and closed)
-    if (charNames.length > 0) {
+    // Characters in this scene — editable (add/remove)
+    {
         const $charSection = $(`
             <div style="margin-bottom:10px">
                 <div class="rst-lbl" style="margin-bottom:6px">Characters in this scene</div>
-                <div class="rst-btn-row" style="flex-wrap:wrap;gap:6px"></div>
+                <div class="rst-btn-row" style="flex-wrap:wrap;gap:6px" id="rst-scene-chars-${scene.id}"></div>
+                <div style="display:flex;align-items:center;gap:6px;margin-top:6px">
+                    <select class="rst-scene-add-char" style="flex:1;font-size:12px;padding:4px 6px;border:0.5px solid var(--rst-border);border-radius:6px;background:transparent;color:inherit">
+                        <option value="">— Add character —</option>
+                    </select>
+                    <button class="rst-btn rst-scene-add-btn" style="font-size:11px;padding:3px 10px" disabled>+</button>
+                </div>
             </div>
         `);
 
         const $chipContainer = $charSection.find(".rst-btn-row");
-        for (let i = 0; i < charNames.length; i++) {
-            const charId = scene.charactersPresent[i];
-            const profile = getCharacterProfile(charId);
-            const initials = getInitials(charNames[i]);
-            const $chip = $(`
-                <div style="display:flex;align-items:center;gap:5px;padding:4px 8px;border:0.5px solid var(--rst-border);border-radius:6px;font-size:12px">
-                    <div class="rst-av" style="width:22px;height:22px;font-size:9px">${initials}</div>
-                    <span>${charNames[i]}</span>
-                </div>
-            `);
-            $chipContainer.append($chip);
+        const $addSelect = $charSection.find(".rst-scene-add-char");
+        const $addBtn = $charSection.find(".rst-scene-add-btn");
+
+        // Populate the add dropdown with characters NOT already in the scene
+        function populateAddDropdown() {
+            const currentIds = scene.charactersPresent || [];
+            const allChars = getAllCharacters();
+            const available = allChars.filter((c) => !currentIds.includes(c.id));
+            $addSelect.find("option:not([value=''])").remove();
+            for (const c of available) {
+                $addSelect.append(`<option value="${c.id}">${c.name}</option>`);
+            }
+            $addSelect.val("");
+            $addBtn.prop("disabled", true);
         }
 
+        // Enable/disable add button based on selection
+        $addSelect.on("change", function () {
+            $addBtn.prop("disabled", !$(this).val());
+        });
+
+        // Add character
+        $addBtn.on("click", () => {
+            const newId = $addSelect.val();
+            if (!newId) return;
+            const currentIds = scene.charactersPresent || [];
+            if (!currentIds.includes(newId)) {
+                const updatedIds = [...currentIds, newId];
+                updateSceneCharacters(scene.id, updatedIds);
+                scene.charactersPresent = updatedIds;
+                renderChips();
+                populateAddDropdown();
+            }
+        });
+
+        // Render character chips with remove buttons
+        function renderChips() {
+            $chipContainer.empty();
+            const ids = scene.charactersPresent || [];
+            if (ids.length === 0) {
+                $chipContainer.append('<span style="font-size:11px;color:var(--rst-text-muted)">No characters recorded for this scene.</span>');
+                return;
+            }
+            for (let i = 0; i < ids.length; i++) {
+                const charId = ids[i];
+                const profile = getCharacterProfile(charId);
+                const name = profile ? profile.name : charId;
+                const initials = getInitials(name);
+                const $chip = $(`
+                    <div style="display:flex;align-items:center;gap:5px;padding:4px 8px;border:0.5px solid var(--rst-border);border-radius:6px;font-size:12px">
+                        <div class="rst-av" style="width:22px;height:22px;font-size:9px">${initials}</div>
+                        <span>${name}</span>
+                        <span class="rst-scene-remove-char" data-char-id="${charId}" style="cursor:pointer;color:var(--rst-danger);margin-left:2px;font-size:13px;line-height:1" title="Remove from scene">✕</span>
+                    </div>
+                `);
+                $chip.find(".rst-scene-remove-char").on("click", (e) => {
+                    e.stopPropagation();
+                    const idToRemove = $(e.target).data("char-id");
+                    const filtered = (scene.charactersPresent || []).filter((id) => id !== idToRemove);
+                    updateSceneCharacters(scene.id, filtered);
+                    scene.charactersPresent = filtered;
+                    renderChips();
+                    populateAddDropdown();
+                });
+                $chipContainer.append($chip);
+            }
+        }
+
+        renderChips();
+        populateAddDropdown();
+
         $body.append($charSection);
-    } else {
-        $body.append(`
-            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:10px">No characters recorded for this scene.</div>
-        `);
     }
 
     // Scene title editing (shown for both open and closed)

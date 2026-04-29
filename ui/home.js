@@ -4,10 +4,11 @@
  */
 
 import { getPendingUpdates, savePendingUpdates, getPresentCharacters, getSettings } from "../data/storage.js";
-import { getCharacterProfile, getInitials, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
-import { getOpenScene, getSceneById, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
+import { getCharacterProfile, getInitials, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
+import { getOpenScene, getSceneById, deleteScene, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
 import { generateStatUpdate } from "../llm/statUpdate.js";
-import { switchTab, showPanelLoading, hidePanelLoading } from "./panel.js";
+import { renderScenesTab } from "./scenes.js";
+import { switchTab, getPane, showPanelLoading, hidePanelLoading } from "./panel.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -473,11 +474,24 @@ async function approveAllPending(pending) {
  * Dismiss all pending updates.
  */
 function dismissAllPending() {
-    savePendingUpdates(null);
-    toastr?.info?.("All pending stat changes dismissed.");
+    const pending = getPendingUpdates();
 
-    const $pane = $("#rst-p-home");
+    // If there's a scene associated with these pending updates, delete it
+    if (pending && pending.sceneId) {
+        deleteScene(pending.sceneId);
+    }
+
+    savePendingUpdates(null);
+    toastr?.info?.("All pending stat changes dismissed. Scene removed.");
+
+    const $pane = getPane("home");
     refreshPending($pane);
+
+    // Also refresh the Scenes tab to reflect the deletion
+    const $scenesPane = getPane("scenes");
+    if ($scenesPane) {
+        renderScenesTab($scenesPane);
+    }
 }
 
 // ─── Regeneration Actions ─────────────────────────────────
@@ -530,11 +544,20 @@ async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
                 pending.characterUpdates = pending.characterUpdates.map((u) =>
                     u.characterId === characterId ? newUpdate : u
                 );
-                savePendingUpdates(pending);
             }
+
+            // Append any LLM-discovered characters not already in pending
+            const pendingIds = new Set(pending.characterUpdates.map((u) => u.characterId));
+            for (const discovered of result.characterUpdates) {
+                if (discovered.source?.startsWith("llm_discovered") && !pendingIds.has(discovered.characterId)) {
+                    pending.characterUpdates.push(discovered);
+                }
+            }
+
+            savePendingUpdates(pending);
         }
 
-        const $pane = $("#rst-p-home");
+        const $pane = getPane("home");
         refreshPending($pane);
 
         toastr?.success?.("Stat updates regenerated.");
@@ -554,10 +577,39 @@ async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
  * @param {string} sceneId - The scene ID
  */
 async function showEditStatsModal(charUpdate, sceneId) {
+    // Load character profile for editable fields
+    const profile = getCharacterProfile(charUpdate.characterId) || {};
     const editedStats = JSON.parse(JSON.stringify(charUpdate.statsAfter || {}));
     let html = `<div style="max-height:70vh;overflow-y:auto;padding-right:4px">`;
 
-    // Stat editors
+    // ─── Character Profile Section ──────────────────────────────
+    const currentName = profile.name || charUpdate.characterName || "";
+    const currentDesc = profile.description || "";
+    const currentNotes = profile.notes || "";
+
+    html += `<div style="margin-bottom:14px">
+        <div style="font-weight:500;font-size:13px;margin-bottom:8px;color:var(--rst-text);border-bottom:1px solid var(--rst-border);padding-bottom:4px">Character Profile</div>
+
+        <div style="margin-bottom:8px">
+            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:3px">Name</div>
+            <input type="text" id="rst-edit-name" value="${currentName.replace(/"/g, '"')}"
+                style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text)">
+        </div>
+
+        <div style="margin-bottom:8px">
+            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:3px">Description</div>
+            <textarea id="rst-edit-description" rows="2"
+                style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${currentDesc.replace(/"/g, '"')}</textarea>
+        </div>
+
+        <div style="margin-bottom:8px">
+            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:3px">Notes</div>
+            <textarea id="rst-edit-notes" rows="2"
+                style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${currentNotes.replace(/"/g, '"')}</textarea>
+        </div>
+    </div>`;
+
+    // ─── Stat Editors ───────────────────────────────────────────
     for (const cat of STAT_CATEGORIES) {
         const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
         html += `<div style="margin-bottom:14px">
@@ -633,12 +685,18 @@ async function showEditStatsModal(charUpdate, sceneId) {
                 {
                     text: "Reset to LLM values",
                     action: () => {
+                        // Reset profile fields
+                        $(popup.element).find("#rst-edit-name").val(profile.name || charUpdate.characterName || "");
+                        $(popup.element).find("#rst-edit-description").val(profile.description || "");
+                        $(popup.element).find("#rst-edit-notes").val(profile.notes || "");
+                        // Reset stat fields
                         const originalAfter = charUpdate.statsAfter || {};
                         $(popup.element).find(".rst-edit-stat").each(function () {
                             const cat = $(this).data("cat");
                             const stat = $(this).data("stat");
                             $(this).val(originalAfter[cat]?.[stat] ?? 0);
                         });
+                        // Reset dynamic fields
                         $(popup.element).find("#rst-edit-title").val(charUpdate.dynamicTitleAfter || "");
                         $(popup.element).find("#rst-edit-narrative").val(charUpdate.narrativeSummary || "");
                         $(popup.element).find(".rst-edit-commentary").each(function () {
@@ -679,6 +737,18 @@ async function showEditStatsModal(charUpdate, sceneId) {
 
             const newTitle = $(popup.element).find("#rst-edit-title").val() || "";
             const newNarrative = $(popup.element).find("#rst-edit-narrative").val() || "";
+            const newName = $(popup.element).find("#rst-edit-name").val() || "";
+            const newDesc = $(popup.element).find("#rst-edit-description").val() || "";
+            const newNotes = $(popup.element).find("#rst-edit-notes").val() || "";
+
+            // Save profile changes to character database
+            const profileChanges = {};
+            if (newName !== (profile.name || charUpdate.characterName || "")) profileChanges.name = newName;
+            if (newDesc !== (profile.description || "")) profileChanges.description = newDesc;
+            if (newNotes !== (profile.notes || "")) profileChanges.notes = newNotes;
+            if (Object.keys(profileChanges).length > 0) {
+                updateCharacterProfile(charUpdate.characterId, profileChanges);
+            }
 
             // Apply to pending updates
             const pending = getPendingUpdates();
@@ -689,6 +759,9 @@ async function showEditStatsModal(charUpdate, sceneId) {
                     update.commentary = newCommentary;
                     update.dynamicTitleAfter = newTitle;
                     update.narrativeSummary = newNarrative;
+                    if (profileChanges.name) {
+                        update.characterName = newName;
+                    }
                     // Recalculate change count
                     let changeCount = 0;
                     for (const cat of STAT_CATEGORIES) {
@@ -704,7 +777,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
                     // Refresh the UI
                     const $pane = $("#rst-p-home");
                     refreshPending($pane);
-                    toastr?.success?.(`${charUpdate.characterName} stats updated manually.`);
+                    toastr?.success?.(`${newName} stats and profile updated manually.`);
                 }
             }
         });
@@ -762,7 +835,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
  * @returns {string}
  */
 function formatPercent(val) {
-    return (val >= 0 ? "" : "") + val + "%";
+    return (val >= 0 ? "+" : "") + val + "%";
 }
 
 /**

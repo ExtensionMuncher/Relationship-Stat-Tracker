@@ -71,7 +71,9 @@ export function getConnectionProfile(profileName) {
  * @param {number} [maxTokens=500] - Maximum response tokens
  * @returns {Promise<string|null>} The response text, or null on failure
  */
-export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens = 500) {
+export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens = 500, temperature = null) {
+    console.log("[RST] makeRequest called — profileId:", JSON.stringify(profileId), "hasSystemPrompt:", !!systemPrompt, "hasUserPrompt:", !!userPrompt, "maxTokens:", maxTokens, "temperature:", temperature);
+
     if (!profileId) {
         console.warn("[RST] No connection profile specified for LLM request (profileId was:", JSON.stringify(profileId), ")");
         toastr?.warning?.("No connection profile selected. Check Settings > Connection profiles.");
@@ -96,10 +98,13 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
             messages.push({ role: 'user', content: userPrompt });
         }
 
-        // Build override payload with max_tokens
+        // Build override payload with max_tokens and optional temperature override
         const overridePayload = {
             max_tokens: maxTokens,
         };
+        if (temperature !== null) {
+            overridePayload.temperature = temperature;
+        }
 
         const response = await ConnectionManagerRequestService.sendRequest(
             profileId,            // 1. profileId
@@ -123,7 +128,7 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
             if (response.choices && Array.isArray(response.choices) && response.choices[0]?.message?.content !== undefined) {
                 const content = response.choices[0].message.content;
                 const reasoning = response.choices[0].message.reasoning;
-                // Reasoning models (e.g. deepseek-reasoner) may return empty content with reasoning field
+                // Some providers (e.g. GLM/Ollama) return empty content with a reasoning field
                 if (content || !reasoning) {
                     return content;
                 }

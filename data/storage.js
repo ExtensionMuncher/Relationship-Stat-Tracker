@@ -272,7 +272,6 @@ export function getDefaultSettings() {
         batchScan: {
             sceneDetectionMaxTokens: 4000,
             initialStatMaxTokens: 3000,
-            chunkSize: 100,
         },
 
         injection: {

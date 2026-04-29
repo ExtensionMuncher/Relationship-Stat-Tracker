@@ -27,8 +27,10 @@ export async function detectCharacters(messageCount = 10) {
     const knownCharacters = getAllCharacters();
     const knownNames = knownCharacters.map((c) => c.name);
 
-    const systemPrompt = buildSidecarSystemPrompt(knownNames);
-    const requestPrompt = buildSidecarRequestPrompt(messages);
+    const systemPrompt = buildSidecarSystemPrompt();
+    const requestPrompt = buildSidecarRequestPrompt(messages, knownNames);
+
+    console.log("[RST] detectCharacters: using profile=" + profileName + ", messages=" + messages.length + ", knownNames=" + knownNames.length);
 
     try {
         const result = await makeRequest(
@@ -38,9 +40,12 @@ export async function detectCharacters(messageCount = 10) {
             200,
         );
 
+        console.log("[RST] detectCharacters: LLM response received, result=" + (result ? result.substring(0, 100) : "null"));
+
         if (!result) return { detected: [], unknown: [] };
 
         const detectedNames = parseDetectedNames(result);
+        console.log("[RST] detectCharacters: parsed names:", JSON.stringify(detectedNames));
         return categorizeNames(detectedNames, knownNames);
     } catch (err) {
         console.error("[RST] Sidecar detection failed:", err);
@@ -56,18 +61,8 @@ export async function detectCharacters(messageCount = 10) {
  * @param {string[]} knownNames - Already-known character names
  * @returns {string}
  */
-function buildSidecarSystemPrompt(knownNames) {
-    return `You are a character name detection assistant. Your job is to identify all character names mentioned in the provided chat messages.
-
-RULES:
-1. Return ONLY a JSON array of character name strings. Example: ["Alice", "Bob"]
-2. Include ALL characters who appear or are referenced — not just the speaker.
-3. Do NOT include the user/player character name.
-4. Do NOT include generic titles (like "the man", "a woman").
-5. Each name should appear only once.
-${knownNames.length > 0 ? `6. Already-known characters (still include them if present): ${knownNames.join(", ")}` : ""}
-
-Respond with ONLY the JSON array, no other text.`;
+function buildSidecarSystemPrompt() {
+    return 'You are a character name detection assistant. Identify all character names mentioned in chat messages. Output ONLY a JSON array of name strings.';
 }
 
 /**
@@ -75,14 +70,29 @@ Respond with ONLY the JSON array, no other text.`;
  * @param {Array} messages
  * @returns {string}
  */
-function buildSidecarRequestPrompt(messages) {
+function buildSidecarRequestPrompt(messages, knownNames) {
     const lines = messages.map((m, i) => {
         const speaker = m.name || "Unknown";
-        const text = (m.mes || "").slice(0, 500); // Truncate long messages
+        const text = (m.mes || "").slice(0, 500);
         return `[${i}] ${speaker}: ${text}`;
     });
 
-    return `Detect all character names in these messages:\n\n${lines.join("\n")}`;
+    const parts = [
+        'Detect all character names in these messages:',
+        '- Include ALL characters who appear or are referenced, not just speakers.',
+        '- Exclude the user/player character name.',
+        '- Exclude generic titles (like "the man", "a woman").',
+        '- Each name should appear only once.',
+    ];
+
+    if (knownNames.length > 0) {
+        parts.push(`- Already-known characters (include if present): ${knownNames.join(", ")}`);
+    }
+
+    parts.push('');
+    parts.push(...lines);
+
+    return parts.join('\n');
 }
 
 // ─── Response Parsing ─────────────────────────────────────

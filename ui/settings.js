@@ -137,15 +137,6 @@ function renderBatchScan($pane) {
                     value="${bs.initialStatMaxTokens ?? 3000}"
                     id="rst-bs-stat-tokens" style="width:100px;flex-shrink:0">
             </div>
-            <div class="rst-setting-row">
-                <div>
-                    <div class="rst-setting-label">Chunk size (messages)</div>
-                    <div class="rst-setting-sub">Messages per chunk when scanning long chats. Larger chunks may hit token limits.</div>
-                </div>
-                <input type="number" min="20" max="500" step="10"
-                    value="${bs.chunkSize ?? 100}"
-                    id="rst-bs-chunk-size" style="width:100px;flex-shrink:0">
-            </div>
         </div>
     `);
 
@@ -192,9 +183,6 @@ function renderBatchScan($pane) {
     });
     $card.find("#rst-bs-stat-tokens").on("change", async function () {
         saveSetting("batchScan.initialStatMaxTokens", parseInt($(this).val(), 10));
-    });
-    $card.find("#rst-bs-chunk-size").on("change", async function () {
-        saveSetting("batchScan.chunkSize", parseInt($(this).val(), 10));
     });
 
     $pane.append($card);
@@ -435,7 +423,7 @@ function renderInjectionSettings($pane, settings) {
         <div class="rst-setting-row" style="border-top:1px solid var(--rst-border);padding-top:12px;margin-top:4px">
             <div>
                 <div class="rst-setting-label">Passive library reference</div>
-                <div class="rst-setting-sub">Inject library as freely-referenceable context — LLM can reference any tracked character's full relationship data when relevant (like timeline chapters)</div>
+                <div class="rst-setting-sub">Inject library as freely-referenceable context — LLM can reference any tracked character's full relationship data when relevant</div>
             </div>
             <label class="rst-toggle">
                 <input type="checkbox" id="rst-passive-ref" ${inj.passiveLibraryRef ? "checked" : ""}>

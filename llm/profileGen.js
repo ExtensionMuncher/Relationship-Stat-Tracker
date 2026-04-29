@@ -44,7 +44,8 @@ export async function generateProfile(characterName, prompt = "", fromScene = fa
             profileName,
             systemPrompt,
             requestPrompt,
-            1000,
+            2000,
+            0.3,  // Low temperature for reliable JSON-structured output
         );
 
         console.log("[RST] Profile gen raw response (first 500 chars):", result?.slice(0, 500));
@@ -76,25 +77,15 @@ export async function generateProfile(characterName, prompt = "", fromScene = fa
 function buildProfileGenSystemPrompt() {
     return [
         'You are a character profile generator.',
-        'Your response must be a single valid JSON object. Nothing else.',
+        'Output ONLY a JSON object.',
         '',
-        'Required fields:',
-        '- description: string — 2-3 sentences about personality, role, and key traits',
-        '- notes: string — practical observations about behavior and motivation',
-        '- stats: object with categories platonic, romantic, sexual.',
-        '  Each category has: trust, openness, support, affection as integers -100 to 100',
-        '- dynamicTitle: string — short title like "The Reluctant Ally"',
-        '- narrativeSummary: string — 1-2 sentences on relationship trajectory',
+        'Schema:',
+        '  {',
+        '    "description": "2-3 sentences about personality, role, and key traits"',
+        '    "notes": "Practical observations about behavior and motivation"',
+        '  }',
         '',
-        'CRITICAL PERSPECTIVE RULE:',
-        'All stats represent how [Character] feels toward {{user}}, NOT the other way around.',
-        '',
-        'RULES:',
-        '- Start your response with {',
-        '- End your response with }',
-        '- No markdown, no backticks, no code fences',
-        '- No analysis, explanation, or narration of your process',
-        '- If you include anything besides the JSON object, the response will be rejected',
+        'Return JSON only.',
     ].join('\n');
 }
 
@@ -108,18 +99,19 @@ function buildProfileGenSystemPrompt() {
 function buildProfileGenRequestPrompt(characterName, prompt, fromScene) {
     const parts = [];
 
-    parts.push(`Generate a profile for the character: "${characterName}"`);
+    parts.push(`Generate a character profile for: "${characterName}"`);
+    parts.push('The profile only needs "description" and "notes" fields.');
 
     if (prompt) {
         parts.push(`\nUSER GUIDANCE: ${prompt}`);
     }
 
     if (fromScene || !prompt) {
-        // Include recent chat context
-        const recentMessages = getRecentMessages(20);
+        // Include limited recent chat context (8 messages max to reduce cognitive load)
+        const recentMessages = getRecentMessages(8);
         if (recentMessages.length > 0) {
             const userName = getContext().name1 || "User";
-            parts.push(`\nRECENT CHAT MESSAGES ("${userName}" is the user/player, other named speakers are characters):`);
+            parts.push(`\nCONTEXT (recent messages, "${userName}" is user/player):`);
             recentMessages.forEach((m, i) => {
                 const speaker = m.name || "Unknown";
                 const text = (m.mes || "").slice(0, 300);
@@ -128,18 +120,19 @@ function buildProfileGenRequestPrompt(characterName, prompt, fromScene) {
             });
         }
 
-        // Include past scene summaries
+        // Include last 3 scene summaries only (to keep context focused)
         const summaries = getAllSceneSummaries();
-        if (summaries.length > 0) {
-            parts.push("\nPAST SCENE SUMMARIES:");
-            summaries.forEach((s) => {
+        const recentSummaries = summaries.slice(-3);
+        if (recentSummaries.length > 0) {
+            parts.push("\nSCENE SUMMARIES (latest):");
+            recentSummaries.forEach((s) => {
                 parts.push(`[${s.id}]: ${s.summary}`);
             });
         }
     }
 
-    // Forceful JSON output instruction at the very end (critical position)
-    parts.push('\n\n---\nRESPOND WITH ONLY A VALID JSON OBJECT.\nStart with {, end with }. No markdown, no explanation, no analysis, no backticks.\nYour entire response must be parseable as JSON.');
+    // Clean JSON-only reminder
+    parts.push('\n\nReturn JSON only: {"description": "...", "notes": "..."}');
 
     return parts.join("\n");
 }
@@ -215,7 +208,24 @@ function parseProfileResponse(response) {
         }
     }
 
-    // Strategy 6: Fallback — parse analysis text format (bullet-point stats, Description/Notes sections)
+    // Strategy 6: Handle truncated JSON — response starts with { but was cut off by token limit
+    if (text.startsWith('{') && !text.trim().endsWith('}')) {
+        try {
+            const desc = text.match(/"description"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+            const notesRaw = text.match(/"notes"\s*:\s*"((?:[^"\\]|\\.)*)/);
+            const description = desc ? desc[1] : '';
+            let notes = notesRaw ? notesRaw[1] : '';
+            if (notes) notes = notes.replace(/["\s,}]*$/, '');
+            if (description) {
+                console.log("[RST] Profile parse: strategy 6 (truncated JSON) succeeded");
+                return extractProfileFields({ description, notes });
+            }
+        } catch {
+            // continue to fallback
+        }
+    }
+
+    // Strategy 7: Fallback — parse analysis text format (backtick-wrapped fields, bullet-point stats)
     console.log("[RST] Profile parse: no JSON found, attempting analysis text fallback parser");
     const fallback = parseAnalysisTextFallback(text);
     if (fallback) {
@@ -223,7 +233,7 @@ function parseProfileResponse(response) {
         return fallback;
     }
 
-    console.error("[RST] Failed to parse profile response. First 500 chars:", text.slice(0, 500));
+    console.error("[RST] All parse strategies failed. First 500 chars:", text.slice(0, 500));
     console.error("[RST] Last 500 chars:", text.slice(-500));
     throw new Error("Failed to parse profile response as JSON");
 }
@@ -236,35 +246,65 @@ function parseProfileResponse(response) {
  */
 function parseAnalysisTextFallback(text) {
     try {
-        // Extract Description: looks for **Description:** followed by text
+        // The model typically outputs analysis sections like:
+        // 1. **Analyze the Request:** ...
+        // 2. **Analyze the Source Material:** ...
+        // 3. **Synthesize Character Profile:**
+        //     * `description`: text here
+        //     * `notes`: text here
+        //     * `dynamicTitle`: "title"
+        //     * `narrativeSummary`: summary
+        // 4. **Refining Stats (Character -> User):**
+        //     *   *Platonic:*
+        //         *   Trust: 45 (...)
+        //         *   Openness: 35 (...)
+
+        // Extract description: looks for * `description`: value
         let description = "";
-        const descMatch = text.match(/\*{1,2}Description\*{1,2}:\s*(.+?)(?:\n\s*\*|\n\s*\n|$)/i);
+        const descMatch = text.match(/`description`\s*:\s*(.+?)(?:\n\s*(?=`|$)|$)/i);
         if (descMatch) {
-            description = descMatch[1].trim();
+            description = descMatch[1].trim().replace(/^["']|["']$/g, '');
         }
 
-        // Extract Notes: looks for **Notes:** followed by text
+        // Extract notes: looks for * `notes`: value
         let notes = "";
-        const notesMatch = text.match(/\*{1,2}Notes\*{1,2}:\s*(.+?)(?:\n\s*\*|\n\s*\n|$)/i);
+        const notesMatch = text.match(/`notes`\s*:\s*(.+?)(?:\n\s*(?=`|$)|$)/i);
         if (notesMatch) {
-            notes = notesMatch[1].trim();
+            notes = notesMatch[1].trim().replace(/^["']|["']$/g, '');
         }
 
-        // Extract stats from bullet-point format:
-        // *   *Platonic:*
-        //     *   Trust: 65 (...)
-        //     *   Openness: 55 (...)
+        // Try alternative format: **Description:** text or *Description:* text
+        if (!description) {
+            const altDesc = text.match(/\*{1,2}Description\*{1,2}:\s*(.+?)(?:\n\s*\*|\n\s*\n|$)/i);
+            if (altDesc) description = altDesc[1].trim();
+        }
+        if (!notes) {
+            const altNotes = text.match(/\*{1,2}Notes\*{1,2}:\s*(.+?)(?:\n\s*\*|\n\s*\n|$)/i);
+            if (altNotes) notes = altNotes[1].trim();
+        }
+
+        // Try plain format: Description: text (no asterisks, common in GLM "Revised Draft" sections)
+        if (!description) {
+            const plainDesc = text.match(/(?:^|\n)\s*Description:\s*(.+?)(?:\n\s*(?:Notes|$))/i);
+            if (plainDesc) description = plainDesc[1].trim();
+        }
+        if (!notes) {
+            const plainNotes = text.match(/(?:^|\n)\s*Notes:\s*(.+?)(?:\n\s*\n|$)/i);
+            if (plainNotes) notes = plainNotes[1].trim();
+        }
+
+        // Extract stats from bullet-point format
+        // Headers can be: **Stats:** or **Refining Stats (Name -> Name):** or 3. **Stats:**
         const stats = createZeroStats();
         const categories = ['platonic', 'romantic', 'sexual'];
         const statNames = ['trust', 'openness', 'support', 'affection'];
 
         for (const cat of categories) {
-            // Find the category section
+            // Find category section — matches *   *Platonic:* or *Platonic:
             const catRegex = new RegExp('\\*{1,2}\\s*' + cat + '\\s*\\*{1,2}\\s*:', 'i');
             const catMatch = text.match(catRegex);
             if (!catMatch) continue;
 
-            // Get text from this category to the next category (or end)
             const catIndex = catMatch.index;
             const nextCatStart = (() => {
                 let nextIdx = text.length;
@@ -280,7 +320,6 @@ function parseAnalysisTextFallback(text) {
             })();
             const catSection = text.substring(catIndex, nextCatStart);
 
-            // Extract stat values from this section
             for (const stat of statNames) {
                 const statRegex = new RegExp('\\*\\s*' + stat + '\\s*:\\s*(-?\\d+)', 'i');
                 const statMatch = catSection.match(statRegex);
@@ -291,13 +330,8 @@ function parseAnalysisTextFallback(text) {
             }
         }
 
-        // Check if we got anything useful
-        const hasAnyStats = Object.values(stats).some(cat =>
-            Object.values(cat).some(v => v !== 0)
-        );
         const hasDesc = description.length > 0;
-
-        if (hasAnyStats || hasDesc) {
+        if (hasDesc) {
             return {
                 description,
                 notes,

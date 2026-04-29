@@ -30,6 +30,10 @@ import { renderSettingsTab } from "./ui/settings.js";
 
 const EXTENSION_NAME = "rst";
 
+// ─── Re-entrancy guard ───────────────────────────────────
+// Prevents overlapping sidecar detection calls that could cause connection profile churn
+let _sidecarRunning = false;
+
 // ─── jQuery Extension init ────────────────────────────────
 
 /**
@@ -148,17 +152,28 @@ async function onMessageReceived(mesId) {
     const frequency = settings.scanFrequency || 5;
 
     if (counter % frequency === 0) {
+        // Re-entrancy guard — skip if a sidecar detection is already in progress
+        if (_sidecarRunning) {
+            console.warn("[RST] Sidecar detection already in progress, skipping duplicate call (counter=" + counter + ")");
+            return;
+        }
+
+        _sidecarRunning = true;
+        const profileName = settings.connections?.sidecarLLM || "(none)";
+        console.log("[RST] Sidecar detection start (counter=" + counter + ", frequency=" + frequency + ", profile=" + profileName + ")");
+
         try {
             const result = await detectCharacters();
+
+            console.log("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length);
 
             // Filter out {{user}} from detected and unknown names
             const EXCLUDED_NAMES = new Set(["{{user}}", "user", "User"]);
             const filteredDetected = result.detected.filter((name) => !EXCLUDED_NAMES.has(name));
             const filteredUnknown = result.unknown.filter((name) => !EXCLUDED_NAMES.has(name));
 
-            // Update present characters
-            const allDetected = [...filteredDetected, ...filteredUnknown.map((name) => {
-                // Find or create character for unknown names
+            // Build detected character IDs
+            const newDetected = [...filteredDetected, ...filteredUnknown.map((name) => {
                 const existing = findCharacterByName(name);
                 return existing ? existing.id : null;
             })].filter(Boolean);
@@ -171,13 +186,20 @@ async function onMessageReceived(mesId) {
                 }
             }
 
-            // Update present characters list
-            if (allDetected.length > 0) {
-                savePresentCharacters(allDetected);
-            }
+            // Only update present characters + injection if the list actually changed
+            const currentPresent = getPresentCharacters();
+            const changed = newDetected.length !== currentPresent.length ||
+                !newDetected.every((id) => currentPresent.includes(id));
 
-            // Update injection
-            updateInjection();
+            if (changed) {
+                console.log("[RST] Present characters changed — old:", currentPresent.length, "new:", newDetected.length, ". Updating.");
+                if (newDetected.length > 0) {
+                    savePresentCharacters(newDetected);
+                }
+                updateInjection();
+            } else {
+                console.log("[RST] Present characters unchanged — skipping injection update.");
+            }
 
             // Refresh Home tab if visible
             const $homePane = getPane("home");
@@ -186,6 +208,9 @@ async function onMessageReceived(mesId) {
             }
         } catch (err) {
             console.error("[RST] Sidecar detection error:", err);
+        } finally {
+            _sidecarRunning = false;
+            console.log("[RST] Sidecar detection complete");
         }
     }
 }
@@ -328,10 +353,7 @@ function addSceneButtons(mesId) {
         try {
             const result = await generateStatUpdate(closedScene.id);
 
-            // Store the scene summary
-            updateSceneSummary(closedScene.id, result.sceneSummary);
-
-            // Store the scene title (if generated)
+            // Store the scene title (if generated) — scene summary is saved only on user approval from Home tab
             if (result.sceneTitle) {
                 updateSceneTitle(closedScene.id, result.sceneTitle);
             }

@@ -53,26 +53,8 @@ export function renderLibraryTab($pane) {
 
     $pane.append($btnRow);
 
-    // Character chips
+    // Character chips — each with an inline collapsible card underneath
     renderCharacterChips($pane);
-
-    // Divider
-    $pane.append('<hr class="rst-div">');
-
-    // Character display
-    $pane.append('<div class="rst-lbl">Character display</div>');
-
-    if (selectedCharId) {
-        const profile = getCharacterProfile(selectedCharId);
-        if (profile) {
-            renderCharacterCard($pane, profile);
-        } else {
-            selectedCharId = null;
-            $pane.append('<div style="font-size:12px;color:var(--rst-text-muted)">Select a character above to view details.</div>');
-        }
-    } else {
-        $pane.append('<div style="font-size:12px;color:var(--rst-text-muted)">Select a character above to view details.</div>');
-    }
 
     // Hidden wraps for inline panels
     $pane.append('<div id="rst-wand-wrap" style="display:none;margin-top:8px"></div>');
@@ -105,6 +87,8 @@ function renderCharacterChips($pane) {
         const isPresent = presentIds.includes(char.id);
         const isSelected = char.id === selectedCharId;
 
+        const $wrap = $(`<div class="rst-chip-wrap"></div>`);
+
         const $chip = $(`
             <div class="rst-chip${isSelected ? " on" : ""}">
                 <div class="rst-av">${initials}</div>
@@ -116,12 +100,47 @@ function renderCharacterChips($pane) {
             </div>
         `);
 
+        const $cardWrap = $(`<div class="rst-card-wrap" style="display:${isSelected ? "block" : "none"}"></div>`);
+
         $chip.on("click", () => {
+            // Clicking the already-selected chip collapses the card
+            if (selectedCharId === char.id) {
+                selectedCharId = null;
+                $chip.removeClass("on");
+                $cardWrap.slideUp(200);
+                return;
+            }
+
+            // Close any other open card
+            $pane.find(".rst-chip.on").removeClass("on");
+            $pane.find(".rst-card-wrap:visible").slideUp(200);
+
+            // Select this chip
             selectedCharId = char.id;
-            renderLibraryTab($pane);
+            $chip.addClass("on");
+
+            // Render card content if not already rendered
+            if ($cardWrap.is(":empty")) {
+                const profile = getCharacterProfile(char.id);
+                if (profile) {
+                    renderCharacterCard($cardWrap, profile);
+                }
+            }
+
+            $cardWrap.slideDown(200);
         });
 
-        $pane.append($chip);
+        $wrap.append($chip);
+        $wrap.append($cardWrap);
+        $pane.append($wrap);
+
+        // If this character was previously selected, ensure the card is rendered
+        if (isSelected) {
+            const profile = getCharacterProfile(char.id);
+            if (profile) {
+                renderCharacterCard($cardWrap, profile);
+            }
+        }
     }
 }
 
@@ -134,7 +153,6 @@ function renderCharacterChips($pane) {
  */
 function renderCharacterCard($pane, profile) {
     const initials = getInitials(profile.name);
-    const sourceLabel = profile.source === "character_card" ? "From character card" : "Manual entry";
 
     const $card = $(`<div class="rst-card"></div>`);
 
@@ -142,9 +160,9 @@ function renderCharacterCard($pane, profile) {
     const $header = $(`
         <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
             <div class="rst-av" style="width:40px;height:40px;font-size:14px">${initials}</div>
-            <div>
-                <div style="font-size:15px;font-weight:500">${profile.name}</div>
-                <div style="font-size:11px;color:var(--rst-text-muted)">${sourceLabel}</div>
+            <div style="flex:1">
+                <input type="text" class="rst-char-name" value="${profile.name}"
+                    style="font-size:15px;font-weight:500;width:100%;padding:2px 4px">
             </div>
             <div style="margin-left:auto;display:flex;gap:6px">
                 <button class="rst-icon-btn rst-wand-btn" title="Generate profile">✦</button>
@@ -159,6 +177,20 @@ function renderCharacterCard($pane, profile) {
     $header.find(".rst-edit-btn").on("click", () => showEditStatsModal(profile));
     $header.find(".rst-log-btn").on("click", () => toggleLogPanel(profile));
     $header.find(".rst-delete-btn").on("click", () => confirmDeleteCharacter(profile));
+
+    // Editable character name
+    const $nameInput = $header.find(".rst-char-name");
+    $nameInput.on("change", function () {
+        const newName = $(this).val().trim();
+        if (newName && newName !== profile.name) {
+            updateCharacterProfile(profile.id, { name: newName });
+            profile.name = newName;
+            const $pane = $("#rst-p-lib");
+            renderLibraryTab($pane);
+        } else if (!newName) {
+            $(this).val(profile.name);
+        }
+    });
 
     $card.append($header);
 
@@ -420,7 +452,7 @@ async function showEditStatsModal(profile) {
                     <div style="display:flex;gap:6px;align-items:center">
                         <input type="number" min="-100" max="100" value="${val}"
                             data-cat="${cat}" data-stat="${stat}"
-                            class="rst-edit-val" style="width:80px;flex-shrink:0">
+                            class="rst-edit-val" style="width:80px;flex-shrink:0;background:transparent;color:inherit">
                         <span style="font-size:11px;color:var(--SmartThemeBodyColor,#666)">%</span>
                     </div>
                     <textarea rows="2" data-cat="${cat}" data-stat="${stat}"
@@ -431,13 +463,28 @@ async function showEditStatsModal(profile) {
         }
     }
 
+    // Dynamic title & narrative summary from profile
+    const currentTitle = profile.dynamicTitle || "";
+    const currentNarrative = profile.narrativeSummary || "";
+
     const html = `
         <h3>Edit Stats — ${profile.name}</h3>
         <p style="margin-bottom:6px;font-size:12px;color:var(--SmartThemeBodyColor,#999)">
-            Edit stat values (−100 to +100) and their associated commentary. Old values will be saved in the update log.
+            Edit stat values (−100 to +100) and their associated commentary.
+            Old values will be saved in the update log.
         </p>
         <div style="max-height:60vh;overflow-y:auto;padding-right:4px">
             ${fieldsHtml}
+
+            <div style="border-top:1px solid var(--SmartThemeBorderColor,#333);margin:12px 0 10px;padding-top:10px">
+                <div style="font-weight:600;margin-bottom:4px;font-size:13px;color:var(--SmartThemeBodyColor,#ccc)">── Dynamic Title ──</div>
+                <input type="text" id="rst-lib-edit-title" value="${currentTitle}"
+                    style="width:100%;padding:5px 8px;font-size:12px;background:transparent;color:inherit">
+
+                <div style="font-weight:600;margin:10px 0 4px;font-size:13px;color:var(--SmartThemeBodyColor,#ccc)">── Narrative Summary ──</div>
+                <textarea id="rst-lib-edit-narrative" rows="3"
+                    style="width:100%;padding:5px 8px;font-size:12px;resize:vertical">${currentNarrative}</textarea>
+            </div>
         </div>
     `;
 
@@ -447,7 +494,7 @@ async function showEditStatsModal(profile) {
                 text: "Save Changes",
                 result: 1,
                 action: async () => {
-                    // Collect values
+                    // Collect stat values
                     const newStats = {};
                     const newCommentary = {};
                     for (const cat of STAT_CATEGORIES) {
@@ -461,11 +508,23 @@ async function showEditStatsModal(profile) {
                         }
                     }
 
+                    // Collect dynamic title & narrative summary
+                    const titleInput = document.getElementById("rst-lib-edit-title");
+                    const narrativeInput = document.getElementById("rst-lib-edit-narrative");
+                    const newTitle = titleInput?.value || "";
+                    const newNarrative = narrativeInput?.value || "";
+
                     // Clone old stats before overwriting
                     const oldStats = cloneStats(profile.stats);
 
                     // Update current stats
                     updateCharacterStats(profile.id, newStats);
+
+                    // Update dynamic title & narrative summary
+                    updateCharacterProfile(profile.id, {
+                        dynamicTitle: newTitle,
+                        narrativeSummary: newNarrative,
+                    });
 
                     // Add update log entry with old stats, new stats, and edited commentary
                     addUpdateLogEntry(profile.id, {
@@ -555,7 +614,6 @@ async function runProfileGen(name, prompt, fromScene) {
                 narrativeSummary: result.narrativeSummary,
                 source: "auto_generated",
             });
-            updateCharacterStats(char.id, result.stats);
 
             toastr?.success?.(`${name} profile generated successfully.`);
             const $pane = $("#rst-p-lib");
