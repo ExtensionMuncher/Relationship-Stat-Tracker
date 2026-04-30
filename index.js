@@ -14,7 +14,7 @@ import { eventSource, event_types } from "../../../../scripts/events.js";
 import { extension_settings } from "../../../../scripts/extensions.js";
 
 import { initSettings, isEnabled, getSetting } from "./settings.js";
-import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter, savePendingUpdates } from "./data/storage.js";
+import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter, getPendingUpdates, savePendingUpdates } from "./data/storage.js";
 import { createCharacter, findCharacterByName } from "./data/characters.js";
 import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary, updateSceneTitle } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
@@ -72,6 +72,20 @@ jQuery(async () => {
         if (isEnabled()) {
             updateInjection();
         }
+
+        // 9. Listen for APP_READY — ST emits this after full initialization,
+        //    after all extensions have loaded and messages are rendered.
+        //    CHAT_CHANGED may fire before the extension registers its handler,
+        //    so we use APP_READY as the reliable trigger to re-add buttons.
+        eventSource.once(event_types.APP_READY, () => {
+            if (!isEnabled()) return;
+            $(".mes").each(function () {
+                const mesId = $(this).attr("mesid");
+                if (mesId !== undefined) {
+                    addSceneButtons(parseInt(mesId, 10));
+                }
+            });
+        });
 
         // 9. Listen for tab switches to refresh content
         $(document).on("rst:tab-switched", (_e, tabId) => {
@@ -131,6 +145,26 @@ function registerEventHandlers() {
     // Chat changed — re-render everything
     eventSource.on(event_types.CHAT_CHANGED, () => {
         onChatChanged();
+    });
+
+    // Scenes deleted / chat data changed — re-add scene buttons to all messages
+    // ST may re-render messages when chat_metadata is saved, destroying injected buttons.
+    // Using a short delay to let any pending async saves complete first.
+    $(document).on("rst:refresh-message-buttons", () => {
+        setTimeout(() => {
+            let added = 0;
+            $(".mes").each(function () {
+                const mesId = $(this).attr("mesid");
+                if (mesId === undefined) return;
+                const mesIdNum = parseInt(mesId, 10);
+                const $msgBar = $(`.mes[mesid="${mesIdNum}"] .extraMesButtons`);
+                if ($msgBar.length === 0) return;
+                if ($msgBar.find(".rst-scene-btn").length > 0) return;
+                addSceneButtons(mesIdNum);
+                added++;
+            });
+            if (added > 0) console.log(`[RST] Added scene buttons to ${added} message(s)`);
+        }, 300);
     });
 }
 
@@ -217,8 +251,30 @@ async function onMessageReceived(mesId) {
 
 /**
  * Handle chat change — re-initialize everything.
+ * Warns if there are pending updates from the previous chat.
  */
 function onChatChanged() {
+    // Warn about pending updates in the previous chat
+    // (pending updates are stored per-chat and persist across switches)
+    const pending = getPendingUpdates();
+    if (pending) {
+        const pendingScenes = Object.keys(pending);
+        if (pendingScenes.length > 0) {
+            let totalUpdates = 0;
+            for (const sceneId of pendingScenes) {
+                const scene = pending[sceneId];
+                if (scene.summary) totalUpdates++;
+                if (scene.characters) totalUpdates += Object.keys(scene.characters).length;
+            }
+            console.log(`[RST] Chat switched with ${totalUpdates} pending update(s) across ${pendingScenes.length} scene(s).`);
+            toastr?.warning?.(
+                `This chat has ${totalUpdates} unapproved stat update(s) in ${pendingScenes.length} scene(s). Switch to the Home tab to review them.`,
+                "Pending Updates",
+                { timeOut: 8000 }
+            );
+        }
+    }
+
     initSceneCounter();
 
     // Migrate any old global characters to per-chat storage
