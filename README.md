@@ -1,4 +1,4 @@
-# Relationship State Tracker (RST)
+# Relationship Stat Tracker (RST)
 
 A SillyTavern extension that tracks relationship stats between characters across roleplay sessions. RST uses a lightweight sidecar LLM to detect which characters are present in your chat, and a main LLM to review closed scenes and generate nuanced stat updates — all without interrupting your primary AI or burning unnecessary tokens.
 
