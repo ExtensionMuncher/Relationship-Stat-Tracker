@@ -195,6 +195,22 @@ Batch scan runs once and does not compound — running it again on a chat that a
 
 ---
 
+### Rate Limiting
+ 
+Batch scan has built-in rate limiting and retry handling to avoid overwhelming your API provider during large scans. All values are configurable in Settings under the batch scan options:
+ 
+| Setting | Description | Default |
+|---|---|---|
+| Requests per minute | Maximum LLM calls per minute during the scan | 10 |
+| Max retries | How many times to retry a failed request before giving up | 3 |
+| Base retry delay | Starting delay in milliseconds before the first retry (doubles on each subsequent attempt) | 1000ms |
+| Per-scene delay | Additional pause between scene processing steps | 0ms |
+| Inter-phase delay | Pause between major scan phases (detection → stat generation) | 0ms |
+ 
+If you are on a provider with strict rate limits or a slower tier, increase the requests per minute limit downward and raise the base retry delay to give your provider more breathing room. If you are hitting 429 errors during a scan, lowering requests per minute is the first thing to adjust.
+
+---
+
 ## Stat Structure Reference
 
 Every character tracked by RST has exactly 12 stats across three fixed categories:
