@@ -1,5 +1,5 @@
 {
-	"display_name": "Relationship State Tracker",
+	"display_name": "Relationship Stat Tracker",
 	"loading_order": 2,
 	"default_state": "enabled",
 	"requires": [],

@@ -7,16 +7,37 @@
  */
 
 import { chat } from "../../../../../script.js";
-import { makeRequest } from "./connections.js";
+import { getContext } from "../../../../extensions.js";
+import { makeRequest, reportProgress, updateRateLimiterSettings } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getScenes, saveScenes } from "../data/storage.js";
-import { findCharacterByName, createCharacter, updateCharacterStats, getCharacterProfile, addUpdateLogEntry, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
+import { findCharacterByName, findCharacterByFuzzyName, createCharacter, updateCharacterStats, getCharacterProfile, addUpdateLogEntry, updateCharacterProfile, getAllCharacters, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { initSceneCounter, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
 import { showPanelLoading, hidePanelLoading } from "../ui/panel.js";
 
 // ─── Constants ─────────────────────────────────────────────
 
 const EXCLUDED_NAMES = new Set(["{{user}}", "user", "User"]);
+
+/**
+ * Normalize a name for comparison by stripping parenthetical annotations,
+ * normalizing diacritics (ō -> o, ū -> u, etc.), and lowercasing.
+ * This allows LLM-returned names like "Satoru Gojō" or "Ryōmen Sukuna (referenced)"
+ * to match chat speaker names like "Satoru Gojo" or "Ryomen Sukuna".
+ * @param {string} name
+ * @returns {string} Normalized name, or empty string if name is invalid.
+ */
+function normalizeNameForComparison(name) {
+    if (!name) return "";
+    let cleaned = name
+        // Strip parenthetical annotations: "(referenced)", "(Sukuna)", etc.
+        .replace(/\s*\([^)]*\)\s*/g, "")
+        .trim();
+    if (!cleaned) return "";
+    // Normalize Unicode diacritics: decompose (NFD) then strip combining marks
+    cleaned = cleaned.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    return cleaned.toLowerCase().trim();
+}
 
 // ─── Main Entry Point ─────────────────────────────────────
 
@@ -37,6 +58,12 @@ export async function runBatchScan() {
     const autoGenProfile = settings.connections.autoGenLLM;
     const statUpdateProfile = settings.connections.statUpdateLLM;
 
+    // Sync rate limiter settings before starting
+    updateRateLimiterSettings(settings.batchScan || {});
+
+    const scanStartTime = Date.now();
+    const bsSettings = settings.batchScan || {};
+
     if (!autoGenProfile) {
         toastr?.warning?.("Batch scan requires an Auto-Gen LLM profile. Configure one in Settings > Connection profiles.");
         return { scenesCreated: 0, profilesCreated: [] };
@@ -52,13 +79,40 @@ export async function runBatchScan() {
         return { scenesCreated: 0, profilesCreated: [] };
     }
 
+    // ─── Existing-stats guard ─────────────────────────────
+    // Prevent batch scan from overwriting existing character stats with absolute values.
+    // Batch scan generates absolute stat values (-100 to 100) which would obliterate any
+    // existing scene-derived deltas. If any character has non-zero stats, warn and abort.
+    const allProfiles = getAllCharacters();
+    const hasExistingStats = Object.values(allProfiles).some((profile) =>
+        profile?.stats && Object.values(profile.stats).some((catStats) =>
+            catStats && Object.values(catStats).some((val) => val !== 0)
+        )
+    );
+    if (hasExistingStats) {
+        toastr?.warning?.(
+            "Batch scan cannot run on characters with existing relationship stats. " +
+            "Batch scan generates absolute values that would overwrite incremental changes from scene updates. " +
+            "Use individual scene processing for ongoing roleplays.",
+            "RST Batch Scan",
+            { timeOut: 0, extendedTimeOut: 0, closeButton: true, preventDuplicates: true }
+        );
+        hidePanelLoading();
+        return { scenesCreated: 0, profilesCreated: [] };
+    }
+
     showPanelLoading("Batch scan: Analyzing chat for scene boundaries...");
 
-    const allMessages = chat;
     const existingScenes = getScenes();
 
-    // Non-compounding: determine unprocessed message ranges
-    const ranges = getUnprocessedRanges(existingScenes, allMessages.length);
+    // Respect ST's message hiding: only process visible (non-system) messages.
+    // ST marks hidden messages with is_system=true, mirroring how ST's Generate()
+    // builds coreChat = chat.filter(x => !x.is_system ...) for the context window.
+    const allMessages = chat.filter(m => !m.is_system);
+    console.log(`[RST] Processing ${allMessages.length} visible messages out of ${chat.length} total (${chat.length - allMessages.length} hidden)`);
+
+    // Non-compounding: determine unprocessed message ranges (only within visible messages)
+    const ranges = getUnprocessedRanges(existingScenes, allMessages.length, 0);
     if (ranges.length === 0) {
         toastr?.info?.("All messages already covered by existing scenes. Nothing to scan.");
         hidePanelLoading();
@@ -67,8 +121,33 @@ export async function runBatchScan() {
 
     toastr?.info?.("Batch scan: Analyzing chat for scene boundaries...");
 
-    // Phase 1: Detect scenes via LLM
-    const detectedScenes = await detectScenes(allMessages, ranges, autoGenProfile, settings);
+    // Calculate expected API calls for progress tracking
+    // If combineRanges is enabled, Phase 1 makes 1 call (all ranges merged).
+    // Otherwise, it makes 1 call per range (may be more if ranges are chunked >500).
+    const combineRanges = bsSettings.combineRanges !== false;
+    const expectedPhase1Calls = combineRanges ? 1 : ranges.length;
+    let totalApiCalls = expectedPhase1Calls; // Will be updated after Phase 3 when we know Phase 4 count
+    let completedApiCalls = 0;
+
+    reportProgress({
+        phase: 1, totalPhases: 4,
+        label: "Detecting scenes",
+        current: 0, total: totalApiCalls,
+        detail: `Analyzing ${ranges.length} message range(s) for scene boundaries...`,
+        elapsed: 0,
+    });
+
+    // Phase 1: Detect scenes via LLM (pass combineRanges flag)
+    const detectedScenes = await detectScenes(allMessages, ranges, autoGenProfile, settings, combineRanges);
+    completedApiCalls += 1; // Phase 1 counts as one progress step
+
+    reportProgress({
+        phase: 1, totalPhases: 4,
+        label: "Scene detection complete",
+        current: completedApiCalls, total: totalApiCalls,
+        detail: `Detected ${detectedScenes.length} scenes across ${ranges.length} range(s)`,
+        elapsed: Date.now() - scanStartTime,
+    });
     console.log("[RST-DEBUG] Phase 1 complete. Detected scenes:", JSON.stringify(detectedScenes, null, 2));
     // Log unique character names found across all scenes
     const charNamesFromLLM = new Set();
@@ -81,24 +160,79 @@ export async function runBatchScan() {
         return { scenesCreated: 0, profilesCreated: [] };
     }
 
-    // Phase 2: Create profiles for unknown characters (filtering out {{user}} and resolved user name)
+    // Phase 2: Create profiles for unknown characters (filtering out {{user}} and resolved names)
     // Detect the user's persona name from chat messages
     const userNameFromChat = allMessages.find(m => m.is_user)?.name || "";
-    const userNamesToExclude = new Set([...EXCLUDED_NAMES, userNameFromChat]);
+    const blacklistNames = (settings.nameBlacklist || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+    const userNamesToExclude = new Set([...EXCLUDED_NAMES, userNameFromChat, ...blacklistNames]);
     const profilesCreated = [];
     const allCharNames = new Set();
+
+    // Build a set of all actual speaker names from the chat messages (normalized).
+    const chatSpeakerNames = new Set();
+    for (const msg of allMessages) {
+        if (msg.name && !msg.is_user) {
+            chatSpeakerNames.add(normalizeNameForComparison(msg.name));
+        }
+    }
+    console.log("[RST-DEBUG] chatSpeakerNames:", [...chatSpeakerNames]);
+
+    // --- Multi-character RP detection ---
+    // In multi-character roleplay, a single {{char}} card generates ALL character dialogue,
+    // so every assistant message has msg.name = the character card's display name
+    // (e.g., "JJK High School AU RPG"). Individual character names like "Sukuna", "Gojō"
+    // never appear as sender names in message metadata.
+    //
+    // We detect this scenario: if there's only 1 unique non-user speaker name but the LLM
+    // detected multiple distinct character names, we're in a multi-character RP.
+    // In that case, we trust the LLM's character detection (it reads message *content*)
+    // rather than filtering against speaker names.
+    const uniqueSpeakers = chatSpeakerNames.size;
+    const llmDetectedCharCount = new Set();
     for (const scene of detectedScenes) {
-        for (const name of scene.characters) {
-            // Skip excluded names like {{user}} or the resolved user persona name
-            if (userNamesToExclude.has(name)) continue;
-            if (userNamesToExclude.has(name.toLowerCase())) continue;
-            allCharNames.add(name);
+        for (const n of scene.characters) {
+            const clean = normalizeNameForComparison(n);
+            if (clean) llmDetectedCharCount.add(clean);
+        }
+    }
+    const isMultiCharRP = uniqueSpeakers <= 1 && llmDetectedCharCount.size > 1;
+    console.log(`[RST-DEBUG] Multi-character RP detection: uniqueSpeakers=${uniqueSpeakers}, llmDetectedNames=${llmDetectedCharCount.size}, isMultiCharRP=${isMultiCharRP}`);
+
+    if (isMultiCharRP) {
+        // Multi-character RP: trust the LLM's character detection from message content.
+        // The LLM scene detection prompt already excludes {{user}}, so just filter excluded names.
+        console.log("[RST-DEBUG] Multi-character RP detected — trusting LLM character names, bypassing speaker-name filter.");
+        for (const scene of detectedScenes) {
+            for (const name of scene.characters) {
+                if (userNamesToExclude.has(name)) continue;
+                if (userNamesToExclude.has(name.toLowerCase())) continue;
+                const cleanName = normalizeNameForComparison(name);
+                if (!cleanName) continue;
+                console.log(`[RST-DEBUG] Phase2 (multi-char): accepting name="${name}" -> clean="${cleanName}"`);
+                allCharNames.add(name);
+            }
+        }
+    } else {
+        // Single-character RP (or ambiguous): use speaker-name verification filter.
+        // This prevents descriptive {{char}} titles (e.g., "Fantasy AU RPG") from being
+        // treated as character names, while preserving legitimate character names like
+        // "Gojo Satoru" that DO appear as message senders.
+        for (const scene of detectedScenes) {
+            for (const name of scene.characters) {
+                if (userNamesToExclude.has(name)) continue;
+                if (userNamesToExclude.has(name.toLowerCase())) continue;
+                const cleanName = normalizeNameForComparison(name);
+                const found = chatSpeakerNames.has(cleanName);
+                console.log(`[RST-DEBUG] Phase2 check: name="${name}" -> clean="${cleanName}" -> found=${found}`);
+                if (!cleanName || !found) continue;
+                allCharNames.add(name);
+            }
         }
     }
     console.log("[RST-DEBUG] Phase 2: Character names to create profiles for:", [...allCharNames]);
 
     for (const name of allCharNames) {
-        const existing = findCharacterByName(name);
+        const existing = findCharacterByFuzzyName(name) || findCharacterByName(name);
         if (!existing) {
             const newProfile = createCharacter(name, { source: "auto_generated" });
             profilesCreated.push(name);
@@ -116,7 +250,7 @@ export async function runBatchScan() {
     for (const detected of detectedScenes) {
         const charIds = detected.characters
             .map((name) => {
-                const profile = findCharacterByName(name);
+                const profile = findCharacterByFuzzyName(name) || findCharacterByName(name);
                 if (!profile) {
                     console.warn(`[RST-DEBUG] findCharacterByName returned null for "${name}"`);
                 }
@@ -161,14 +295,42 @@ export async function runBatchScan() {
     // Sync module-level scene counter so manual scene creation continues from the correct number
     initSceneCounter();
 
-    // Phase 4: Generate summaries + initial stat blocks
+    // ─── Phase 4: Generate summaries + initial stat blocks ──
+    // Update total API calls now that we know how many scenes need stat generation
+    const scenesNeedingStats = createdScenes.filter(s => s.hasUserInteraction);
+    const totalPhase4Calls = scenesNeedingStats.length;
+    totalApiCalls = expectedPhase1Calls + totalPhase4Calls;
+
+    reportProgress({
+        phase: 3, totalPhases: 4,
+        label: "Creating scenes",
+        current: completedApiCalls, total: totalApiCalls,
+        detail: `${createdScenes.length} scene objects created. ${totalPhase4Calls} scenes need stat generation.`,
+        elapsed: Date.now() - scanStartTime,
+    });
+
+    // Inter-phase delay between scene creation (Phase 3) and stat generation (Phase 4)
+    const interPhaseDelay = bsSettings.interPhaseDelay || 0;
+    if (interPhaseDelay > 0) {
+        console.log(`[RST] Inter-phase delay: waiting ${interPhaseDelay}ms before Phase 4...`);
+        reportProgress({
+            phase: 3, totalPhases: 4,
+            label: "Inter-phase cool-down",
+            current: completedApiCalls, total: totalApiCalls,
+            detail: `Waiting ${interPhaseDelay}ms before generating stats...`,
+            elapsed: Date.now() - scanStartTime,
+        });
+        await new Promise(r => setTimeout(r, interPhaseDelay));
+    }
+
+    const perSceneDelay = bsSettings.perSceneDelay || 0;
     let scenesProcessed = 0;
-    for (const scene of createdScenes) {
+    for (let sceneIdx = 0; sceneIdx < createdScenes.length; sceneIdx++) {
+        const scene = createdScenes[sceneIdx];
         try {
             toastr?.info?.(`Batch scan: Processing scene ${scene.id} (${scene.messageStart}-${scene.messageEnd})...`);
 
-            // Option 3: Skip stat generation for scenes without {{user}} interaction
-            // Profiles are still created in Phase 2, scenes are still saved — just no stats/summary generated
+            // Skip stat generation for scenes without {{user}} interaction
             if (!scene.hasUserInteraction) {
                 console.log(`[RST] Scene ${scene.id} (${scene.messageStart}-${scene.messageEnd}): No {{user}} interaction — saving scene as reference only, skipping stat generation.`);
                 updateSceneSummary(scene.id, "(Reference only — no direct {{user}} interaction in this scene)");
@@ -176,16 +338,37 @@ export async function runBatchScan() {
                 continue;
             }
 
-            const sceneMessages = allMessages.slice(scene.messageStart, scene.messageEnd + 1);
+            // Filter out hidden (is_system) messages from the scene data sent to the LLM
+            const sceneMessages = allMessages.slice(scene.messageStart, scene.messageEnd + 1).filter(m => !m.is_system);
             const characters = scene.charactersPresent
                 .map((id) => getCharacterProfile(id))
                 .filter(Boolean);
 
             if (sceneMessages.length === 0 || characters.length === 0) {
+                // Count as completed even though no API call was made (progress tracking consistency)
+                completedApiCalls++;
+                reportProgress({
+                    phase: 4, totalPhases: 4,
+                    label: "Generating stats",
+                    current: completedApiCalls, total: totalApiCalls,
+                    detail: `[${completedApiCalls - expectedPhase1Calls}/${totalPhase4Calls}] ${scene.id}: No data to process`,
+                    elapsed: Date.now() - scanStartTime,
+                });
+                scenesProcessed++;
                 continue;
             }
 
+            reportProgress({
+                phase: 4, totalPhases: 4,
+                label: "Generating stats",
+                current: completedApiCalls, total: totalApiCalls,
+                detail: `[${completedApiCalls - expectedPhase1Calls + 1}/${totalPhase4Calls}] Processing ${scene.id} (messages ${scene.messageStart}-${scene.messageEnd})...`,
+                elapsed: Date.now() - scanStartTime,
+            });
+
             const result = await generateInitialStats(sceneMessages, characters, statUpdateProfile, settings);
+
+            completedApiCalls++;
 
             // Save scene summary
             if (result.sceneSummary) {
@@ -223,7 +406,22 @@ export async function runBatchScan() {
                 }
             }
 
+            // Report progress after successful scene processing
+            reportProgress({
+                phase: 4, totalPhases: 4,
+                label: "Generating stats",
+                current: completedApiCalls, total: totalApiCalls,
+                detail: `[${completedApiCalls - expectedPhase1Calls}/${totalPhase4Calls}] ${scene.id}: Complete`,
+                elapsed: Date.now() - scanStartTime,
+            });
+
             scenesProcessed++;
+
+            // Per-scene delay (skip after the last scene)
+            if (perSceneDelay > 0 && sceneIdx < createdScenes.length - 1) {
+                console.log(`[RST] Per-scene delay: waiting ${perSceneDelay}ms before next scene...`);
+                await new Promise(r => setTimeout(r, perSceneDelay));
+            }
         } catch (err) {
             console.error(`[RST] Batch scan: Failed to process scene ${scene.id}:`, err);
         }
@@ -249,11 +447,33 @@ export async function runBatchScan() {
  * @param {object} settings - Full RST settings object
  * @returns {Promise<Array<{messageStart: number, messageEnd: number, characters: string[]}>>}
  */
-async function detectScenes(allMessages, ranges, profileName, settings) {
+async function detectScenes(allMessages, ranges, profileName, settings, combineRanges = false) {
     const systemPrompt = buildSceneDetectionSystemPrompt();
     const maxTokens = settings.batchScan?.sceneDetectionMaxTokens ?? 6000;
     const MAX_UNCHUNKED_SIZE = 500; // Safety guard: only chunk ranges > 500 messages
     const allScenes = [];
+
+    // When combineRanges is enabled, merge all small ranges into a single API call
+    // Build blacklist set for scene detection character filtering
+    const _blacklistNames = (settings.nameBlacklist || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+    const _sceneBlacklist = new Set(_blacklistNames);
+
+    if (combineRanges && ranges.length > 1) {
+        const totalMessages = ranges.reduce((sum, r) => sum + (r.end - r.start + 1), 0);
+        if (totalMessages <= MAX_UNCHUNKED_SIZE) {
+            console.log(`[RST] Combining ${ranges.length} ranges (${totalMessages} total messages) into single scene detection call.`);
+            const requestPrompt = buildSceneDetectionRequest(allMessages, ranges);
+            const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
+            if (result) {
+                console.log(`[RST-DEBUG] Scene detection LLM response (combined ${ranges.length} ranges):`, result.substring(0, 500));
+                const parsed = parseSceneDetectionResponse(result, ranges, _sceneBlacklist);
+                console.log(`[RST-DEBUG] Parsed scenes from combined ranges:`, JSON.stringify(parsed.map(s => ({ start: s.messageStart, end: s.messageEnd, chars: s.characters }))));
+                allScenes.push(...parsed);
+            }
+            return allScenes;
+        }
+        console.log(`[RST] Combined ranges skipped: ${totalMessages} total messages exceeds ${MAX_UNCHUNKED_SIZE}. Processing per-range.`);
+    }
 
     for (const range of ranges) {
         const messageCount = range.end - range.start + 1;
@@ -265,7 +485,7 @@ async function detectScenes(allMessages, ranges, profileName, settings) {
             const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
             if (result) {
                 console.log(`[RST-DEBUG] Scene detection LLM response (range ${range.start}-${range.end}):`, result.substring(0, 500));
-                const parsed = parseSceneDetectionResponse(result, [range]);
+                const parsed = parseSceneDetectionResponse(result, [range], _sceneBlacklist);
                 console.log(`[RST-DEBUG] Parsed scenes from range ${range.start}-${range.end}:`, JSON.stringify(parsed.map(s => ({start: s.messageStart, end: s.messageEnd, chars: s.characters}))));
                 allScenes.push(...parsed);
             }
@@ -281,7 +501,7 @@ async function detectScenes(allMessages, ranges, profileName, settings) {
                     console.log(`[RST-DEBUG] Scene detection LLM response (window ${cs}-${ce}):`, result.substring(0, 500));
                     // Only take scenes within the non-overlapping portion
                     const nonOverlapStart = cs + (cs > range.start ? OVERLAP : 0);
-                    const parsed = parseSceneDetectionResponse(result, [windowRange]);
+                    const parsed = parseSceneDetectionResponse(result, [windowRange], _sceneBlacklist);
                     console.log(`[RST-DEBUG] Parsed window scenes:`, JSON.stringify(parsed.map(s => ({start: s.messageStart, end: s.messageEnd, chars: s.characters}))));
                     const windowScenes = parsed.filter((s) => s.messageStart >= nonOverlapStart);
                     allScenes.push(...windowScenes);
@@ -298,30 +518,37 @@ async function detectScenes(allMessages, ranges, profileName, settings) {
  * @returns {string}
  */
 function buildSceneDetectionSystemPrompt() {
-    return [
-        'You are a scene boundary detector.',
-        'Output ONLY a JSON object.',
-        '',
-        'Schema:',
-        '  {',
-        '    "scenes": [',
-        '      {',
-        '        "messageStart": <int>,',
-        '        "messageEnd": <int>,',
-        '        "characters": ["CharacterName1", "CharacterName2"]',
-        '      }',
-        '    ]',
-        '  }',
-        '',
-        'Rules:',
-        '- A "scene" is a meaningful narrative unit with consistent setting, time, and interacting characters.',
-        '- Each scene MUST span at least 3 messages.',
-        '- Scenes must not overlap.',
-        '- Scene boundaries should be clean message breaks (whole messages).',
-        '- List character names exactly as they appear in message sender labels.',
-        '- Exclude "{{user}}" or "User" from the character list.',
-        '- List EVERY character who speaks. Do not omit NPCs or side characters.',
-    ].join('\n');
+    return `You are a scene analysis assistant. Your job is to analyze chat conversations and identify logical scene boundaries and character appearances.
+
+# SCENE DEFINITION:
+A "scene" is a substantial narrative unit with a consistent setting, time period, and group of interacting characters. Scenes represent meaningful story segments where characters interact, develop, and drive the plot forward. Scene boundaries occur when:
+- The topic or activity changes significantly
+- Characters enter or leave
+- There's a notable time skip or location change
+
+# CRITICAL — MINIMUM SCENE SIZE:
+- Each scene MUST span at least 15 messages. Do not create scenes shorter than 15 messages.
+- If a group of messages is too short to form a proper scene, merge it with adjacent messages or leave it unmarked.
+- Only create scene boundaries where there's a clear, meaningful narrative shift.
+- Avoid fragmenting conversations into many tiny scenes — scenes should represent real story arcs.
+
+# RULES:
+- Scenes must not overlap
+- Scene boundaries should be clean message breaks (whole messages)
+- Identify characters by reading the message CONTENT — list each distinct character who appears or is actively participating, regardless of the sender label. In multi-character roleplay, all messages may share the same sender label (the {{char}} card name), so you MUST infer characters from what is written.
+- Exclude "{{user}}" or "User" from the character list — only list non-user characters
+- Exclude descriptive titles or narrative descriptors (e.g., "the narrator", "storyteller") — only list actual character names
+
+# RESPONSE FORMAT — return ONLY valid JSON:
+{
+  "scenes": [
+    {
+      "messageStart": <int>,
+      "messageEnd": <int>,
+      "characters": ["Character1", "Character2"]
+    }
+  ]
+}`;
 }
 
 /**
@@ -340,6 +567,7 @@ function buildSceneDetectionRequest(allMessages, ranges) {
         parts.push(`--- MESSAGE RANGE ${range.start} to ${range.end} ---`);
         for (let i = range.start; i <= range.end && i < allMessages.length; i++) {
             const m = allMessages[i];
+            if (m.is_system) continue; // Skip hidden/context-excluded messages
             const speaker = m.name || "Unknown";
             const text = (m.mes || "");
             parts.push(`[${i}] ${speaker}: ${text}`);
@@ -360,9 +588,10 @@ function buildSceneDetectionRequest(allMessages, ranges) {
  * Uses multi-strategy cascade to handle various output formats.
  * @param {string} response
  * @param {Array<{start: number, end: number}>} ranges - Valid message ranges
+ * @param {Set<string>} [blacklistSet] - Optional set of blacklisted names to exclude
  * @returns {Array<{messageStart: number, messageEnd: number, characters: string[]}>}
  */
-function parseSceneDetectionResponse(response, ranges) {
+function parseSceneDetectionResponse(response, ranges, blacklistSet = new Set()) {
     const parsed = extractSceneDetectionJson(response);
     if (!parsed || !parsed.scenes || !Array.isArray(parsed.scenes)) {
         // If JSON extraction failed, try analysis-text fallback
@@ -380,7 +609,7 @@ function parseSceneDetectionResponse(response, ranges) {
     }
 
     // Validate and constrain scene boundaries to the requested ranges
-    const MIN_SCENE_SIZE = 3;
+    const MIN_SCENE_SIZE = 15;
     const validScenes = [];
     for (const scene of parsed.scenes) {
         const start = parseInt(scene.messageStart, 10);
@@ -396,10 +625,13 @@ function parseSceneDetectionResponse(response, ranges) {
         const inRange = ranges.some((r) => start >= r.start && end <= r.end);
         if (!inRange) continue;
 
-        // Filter EXCLUDED_NAMES from characters (case-insensitive)
+        // Filter EXCLUDED_NAMES + blacklist from characters (case-insensitive)
         // Keep original characters reference for downstream {{user}} presence checks
         const characters = (Array.isArray(scene.characters) ? scene.characters : [])
-            .filter((name) => !EXCLUDED_NAMES.has(name) && !EXCLUDED_NAMES.has(name.toLowerCase()));
+            .filter((name) => {
+                const n = name.toLowerCase().trim();
+                return !EXCLUDED_NAMES.has(name) && !EXCLUDED_NAMES.has(name.toLowerCase()) && !blacklistSet.has(n);
+            });
 
         validScenes.push({
             messageStart: start,
@@ -570,13 +802,17 @@ function parseSceneDetectionAnalysisText(text, ranges) {
  * @param {number} totalMessages - Total number of chat messages
  * @returns {Array<{start: number, end: number}>} Unprocessed ranges
  */
-function getUnprocessedRanges(existingScenes, totalMessages) {
+function getUnprocessedRanges(existingScenes, totalMessages, startIdx = 0) {
     if (existingScenes.length === 0) {
-        return [{ start: 0, end: totalMessages - 1 }];
+        return [{ start: startIdx, end: totalMessages - 1 }];
     }
 
     // Collect all covered message indices
+    // Messages before startIdx are treated as covered (not visible in context window)
     const covered = new Set();
+    for (let i = 0; i < startIdx; i++) {
+        covered.add(i);
+    }
     for (const scene of existingScenes) {
         if (scene.messageStart !== null && scene.messageEnd !== null) {
             for (let i = scene.messageStart; i <= scene.messageEnd; i++) {
@@ -641,38 +877,58 @@ async function generateInitialStats(messages, characters, profileName, settings)
  * @returns {string}
  */
 function buildInitialStatSystemPrompt(settings) {
-    return [
-        'You are a relationship stat generator.',
-        'Output ONLY a JSON object.',
-        '',
-        'Schema:',
-        '  {',
-        '    "sceneTitle": "...",',
-        '    "sceneSummary": "...",',
-        '    "characters": {',
-        '      "[NAME]": {',
-        '        "stats": {',
-        '          "platonic": {"trust":-100-100,"openness":-100-100,"support":-100-100,"affection":-100-100},',
-        '          "romantic": {"trust":-100-100,"openness":-100-100,"support":-100-100,"affection":-100-100},',
-        '          "sexual": {"trust":-100-100,"openness":-100-100,"support":-100-100,"affection":-100-100}',
-        '        },',
-        '        "commentary": {',
-        '          "platonic": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"},',
-        '          "romantic": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"},',
-        '          "sexual": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"}',
-        '        },',
-        '        "dynamicTitle": "...",',
-        '        "narrativeSummary": "..."',
-        '      }',
-        '    }',
-        '  }',
-        '',
-        'Rules:',
-        '- Stats represent character\'s feelings toward {{user}}, not reverse.',
-        '- Range: -100 to 100. 0 = neutral.',
-        '- Stats are NEW totals (initial impressions), not deltas.',
-        '- Commentary: explain each stat value based on scene events.',
-    ].join('\n');
+    return `You are a relationship analysis assistant. Your job is to assess initial character relationship states based on their first interactions in a scene.
+
+Generate:
+1. A concise SCENE SUMMARY (factual, clinical — short paragraph)
+2. A SCENE TITLE (short, descriptive name for this scene)
+3. For each character, an INITIAL relationship stat assessment based on their behavior in the scene
+
+# PERSPECTIVE RULE (CRITICAL — DO NOT VIOLATE):
+- All stats represent how the DETECTED CHARACTER feels toward {{user}} — NOT the other way around!
+- Example: "Alice's platonic.trust = 30%" means Alice trusts {{user}} at 30%, NOT that {{user}} trusts Alice at 30%
+- Stats are ALWAYS measured from that character's perspective toward {{user}}
+- Commentary should explain why the CHARACTER's feelings toward {{user}} manifested that way
+
+# RELATIONSHIP ATTRACTION TYPES:
+- Platonic: A deep, non-romantic desire for connection, characterized by emotional closeness, shared values, and a strong friendship bond.
+- Romantic: A longing for emotional intimacy and affectionate connection, accompanied by a desire for commitment or partnership.
+- Sexual: A physical and intimate desire driven by attraction to body, features, or presence.
+
+# RELATIONSHIP ELEMENTS:
+- Trust: Foundation of any relationship, built on honesty, reliability, and consistency.
+- Openness: Willingness to share thoughts, feelings, desires, and vulnerabilities.
+- Support: Being there emotionally, mentally, and sometimes physically.
+- Affection: Expressing love and care through words, actions, or physical touch.
+
+# INITIAL STAT RULES:
+- Each stat is a percentage from -100% to 100%
+- A stat of 0% means neutral/undeveloped
+- Initial values should reflect first impressions and early interactions
+- Values can range more broadly than scene-to-scene changes (this is an initial assessment)
+- A dynamic title should capture the character's starting relationship role/attitude toward {{user}}
+
+RESPONSE FORMAT — return ONLY valid JSON:
+{
+  "sceneTitle": "Short descriptive title for this scene",
+  "sceneSummary": "Concise summary of the scene...",
+  "characters": {
+    "[CHARACTER_NAME]": {
+      "stats": {
+        "platonic": { "trust": X, "openness": X, "support": X, "affection": X },
+        "romantic": { "trust": X, "openness": X, "support": X, "affection": X },
+        "sexual": { "trust": X, "openness": X, "support": X, "affection": X }
+      },
+      "commentary": {
+        "platonic": { "trust": "reason", "openness": "reason", "support": "reason", "affection": "reason" },
+        "romantic": { "trust": "reason", "openness": "reason", "support": "reason", "affection": "reason" },
+        "sexual": { "trust": "reason", "openness": "reason", "support": "reason", "affection": "reason" }
+      },
+      "dynamicTitle": "The [Adjective] [Noun]",
+      "narrativeSummary": "2-3 sentence relationship trajectory assessment"
+    }
+  }
+}`;
 }
 
 /**

@@ -6,6 +6,7 @@
 import {
     chat,
     chat_metadata,
+    name1,
     saveSettingsDebounced,
     saveChatDebounced,
 } from "../../../../script.js";
@@ -15,7 +16,7 @@ import { extension_settings } from "../../../../scripts/extensions.js";
 
 import { initSettings, isEnabled, getSetting } from "./settings.js";
 import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter, getPendingUpdates, savePendingUpdates } from "./data/storage.js";
-import { createCharacter, findCharacterByName } from "./data/characters.js";
+import { createCharacter, findCharacterByName, findCharacterByFuzzyName } from "./data/characters.js";
 import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary, updateSceneTitle } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
 import { generateStatUpdate } from "./llm/statUpdate.js";
@@ -33,6 +34,11 @@ const EXTENSION_NAME = "rst";
 // ─── Re-entrancy guard ───────────────────────────────────
 // Prevents overlapping sidecar detection calls that could cause connection profile churn
 let _sidecarRunning = false;
+
+// ─── Rejected names (in-memory, session-only) ────────────
+// Names the user clicked "Ignore" on in the new-character popup.
+// Prevents repeated popups for the same name within a session.
+const _rejectedNames = new Set();
 
 // ─── jQuery Extension init ────────────────────────────────
 
@@ -115,8 +121,19 @@ jQuery(async () => {
         $(document).on("rst:toggle", (_e, enabled) => {
             if (enabled) {
                 updateInjection();
+                $(".rst-scene-btn").show();
+                $(".rst-scene-btn").prop("disabled", false);
+                $("body").removeClass("rst-disabled");
+                $("#rst_container").css({ opacity: "", pointerEvents: "", userSelect: "" });
             } else {
                 removeInjection();
+                $(".rst-scene-btn").hide();
+                $(".rst-scene-btn").prop("disabled", true);
+                $("body").addClass("rst-disabled");
+                $("#rst_container").css({ opacity: "0.45", pointerEvents: "none", userSelect: "none" });
+                // Keep the toggle switch itself clickable
+                $("#rst_container .rst-toggle").css({ pointerEvents: "auto", cursor: "pointer" });
+                $("#rst_container .rst-toggle *").css({ pointerEvents: "auto" });
             }
         });
 
@@ -201,22 +218,60 @@ async function onMessageReceived(mesId) {
 
             console.log("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length);
 
-            // Filter out {{user}} from detected and unknown names
-            const EXCLUDED_NAMES = new Set(["{{user}}", "user", "User"]);
-            const filteredDetected = result.detected.filter((name) => !EXCLUDED_NAMES.has(name));
-            const filteredUnknown = result.unknown.filter((name) => !EXCLUDED_NAMES.has(name));
+            // Build exclusion set from ST user persona name + hardcoded placeholders + settings blacklist
+            const personaName = (name1 || "").toLowerCase().trim();
+            const blacklist = (settings.nameBlacklist || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+            const EXCLUDED_NAMES = new Set([
+                "{{user}}",
+                "user",
+                "User",
+                personaName,
+                ...blacklist,
+            ]);
 
-            // Build detected character IDs
-            const newDetected = [...filteredDetected, ...filteredUnknown.map((name) => {
-                const existing = findCharacterByName(name);
+            // Filter out excluded and previously-rejected names
+            const filteredDetected = result.detected.filter((name) => {
+                const n = name.toLowerCase().trim();
+                return !EXCLUDED_NAMES.has(n) && !_rejectedNames.has(n);
+            });
+            const filteredUnknown = result.unknown.filter((name) => {
+                const n = name.toLowerCase().trim();
+                return !EXCLUDED_NAMES.has(n) && !_rejectedNames.has(n);
+            });
+
+            // Build detected character IDs — use fuzzy matching so library entries
+            // with full names (e.g. "Satoru Gojo") match short-form LLM output (e.g. "Gojo")
+            // BUGFIX: Map BOTH detected (names from categorizeNames) and unknown (names from LLM)
+            // to character IDs. Previously, filteredDetected contained raw name strings while
+            // filteredUnknown was mapped to IDs, creating a mixed array that caused
+            // getCharacterProfile() to fail on name entries (characters are keyed by ID, not name).
+            const allNames = [...filteredDetected, ...filteredUnknown];
+            const newDetected = allNames.map((name) => {
+                const existing = findCharacterByFuzzyName(name) || findCharacterByName(name);
                 return existing ? existing.id : null;
-            })].filter(Boolean);
+            }).filter(Boolean);
 
-            // Handle unknown characters
+            // Handle unknown characters — with rejection tracking to prevent repeat popups.
+            // When a character is created (or already exists in the library), add its ID to
+            // newDetected so it gets registered as "present" immediately.
             for (const unknownName of filteredUnknown) {
-                const existing = findCharacterByName(unknownName);
-                if (!existing && settings.newCharPopup) {
-                    showNewCharacterDetected(unknownName);
+                const existing = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
+                if (existing) {
+                    // Character already exists in library — include as present
+                    newDetected.push(existing.id);
+                } else if (settings.newCharPopup) {
+                    const created = await showNewCharacterDetected(unknownName);
+                    if (created) {
+                        // Character was created — re-find and include as present
+                        const newChar = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
+                        if (newChar) {
+                            newDetected.push(newChar.id);
+                        }
+                    } else {
+                        // User clicked "Ignore" — track to prevent repeat popups this session
+                        _rejectedNames.add(unknownName.toLowerCase().trim());
+                        console.log("[RST] Name rejected by user, added to session rejection set:", unknownName);
+                    }
                 }
             }
 
@@ -227,18 +282,21 @@ async function onMessageReceived(mesId) {
 
             if (changed) {
                 console.log("[RST] Present characters changed — old:", currentPresent.length, "new:", newDetected.length, ". Updating.");
-                if (newDetected.length > 0) {
-                    savePresentCharacters(newDetected);
-                }
+                // Always save — if empty, clears the present list; if non-empty, updates it
+                savePresentCharacters(newDetected);
                 updateInjection();
             } else {
                 console.log("[RST] Present characters unchanged — skipping injection update.");
             }
 
-            // Refresh Home tab if visible
+            // Refresh both Home and Library tabs if visible so present-indicator UI stays in sync
             const $homePane = getPane("home");
             if ($homePane.hasClass("on")) {
                 renderHomeTab($homePane);
+            }
+            const $libPane = getPane("lib");
+            if ($libPane.hasClass("on")) {
+                renderLibraryTab($libPane);
             }
         } catch (err) {
             console.error("[RST] Sidecar detection error:", err);
@@ -333,6 +391,8 @@ function migrateGlobalCharacters() {
  * @param {number} mesId
  */
 function addSceneButtons(mesId) {
+    if (!isEnabled()) return;
+
     const $messageBar = $(`.mes[mesid="${mesId}"] .extraMesButtons`);
     if ($messageBar.length === 0) return;
 
@@ -371,6 +431,13 @@ function addSceneButtons(mesId) {
         const alreadyStartsScene = allScenes.some((s) => s.messageStart === mesId);
         if (alreadyStartsScene) {
             toastr?.warning?.(`Message ${mesId} already starts a scene.`);
+            return;
+        }
+
+        // Prevent starting a scene on a message that's already part of a closed scene
+        const alreadyInScene = allScenes.some((s) => s.status === "closed" && isMessageInScene(s, mesId));
+        if (alreadyInScene) {
+            toastr?.warning?.("This message is already part of a closed scene.");
             return;
         }
 

@@ -37,16 +37,29 @@ export function createBlankStats() {
 
 /**
  * Create a new character profile.
+ * Checks for name collisions (same words in different order) and warns.
  * @param {string} name - Character display name
  * @param {object} [options] - Optional overrides
  * @returns {object} The new profile
  */
 export function createCharacter(name, options = {}) {
+    // Check for name collisions (same words, different order)
+    const similar = findCharacterBySimilarName(name);
+    if (similar) {
+        console.warn(`[RST] Name collision detected: "${name}" is similar to existing character "${similar.name}" (id=${similar.id})`);
+        toastr?.warning?.(
+            `A character with a similar name already exists: "${similar.name}". Consider using that profile instead of creating a duplicate.`,
+            "RST Name Collision",
+            { timeOut: 8000, closeButton: true }
+        );
+    }
+
     const id = generateCharacterId(name);
 
     const profile = {
         id,
         name,
+        nameAliases: options.nameAliases || [],
         description: options.description || "",
         notes: options.notes || "",
         source: options.source || "manual", // "manual" | "character_card" | "auto_generated"
@@ -115,14 +128,134 @@ export function getAllCharacters() {
 }
 
 /**
- * Find a character by exact name (case-insensitive).
+ * Find a character by exact name (case-insensitive), then aliases, then fuzzy.
+ * Falls through progressively: exact match → alias match → word-set match → substring match.
  * @param {string} name
  * @returns {object|null}
  */
 export function findCharacterByName(name) {
     const all = getAllCharacters();
     const lowerName = name.toLowerCase().trim();
-    return all.find((c) => c.name.toLowerCase().trim() === lowerName) || null;
+    if (!lowerName) return null;
+
+    // 1. Exact match on main name
+    const exact = all.find((c) => c.name.toLowerCase().trim() === lowerName);
+    if (exact) return exact;
+
+    // 2. Exact match on any alias
+    for (const c of all) {
+        if (c.nameAliases && Array.isArray(c.nameAliases)) {
+            const aliasMatch = c.nameAliases.some((a) => a.toLowerCase().trim() === lowerName);
+            if (aliasMatch) return c;
+        }
+    }
+
+    // 3. Word-set match (e.g., "Satoru Gojo" ↔ "Gojo Satoru")
+    const nameWords = lowerName.split(/\s+/).filter(Boolean).sort().join(" ");
+    for (const c of all) {
+        const cWords = c.name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
+        if (cWords === nameWords) return c;
+        // Also check aliases with word-set matching
+        if (c.nameAliases && Array.isArray(c.nameAliases)) {
+            for (const alias of c.nameAliases) {
+                const aliasWords = alias.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
+                if (aliasWords === nameWords) return c;
+            }
+        }
+    }
+
+    // 4. Substring match (e.g., "Gojo" matches inside "Satoru Gojo")
+    for (const c of all) {
+        // Check if the name is a substring of the character's main name, or vice versa
+        const cNameLower = c.name.toLowerCase().trim();
+        if (cNameLower.includes(lowerName) || lowerName.includes(cNameLower)) return c;
+        // Also check aliases
+        if (c.nameAliases && Array.isArray(c.nameAliases)) {
+            for (const alias of c.nameAliases) {
+                const aliasLower = alias.toLowerCase().trim();
+                if (aliasLower.includes(lowerName) || lowerName.includes(aliasLower)) return c;
+            }
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Find a character by fuzzy name matching only (skips exact match).
+ * Useful when comparing detected names against known names.
+ * Uses word-set + substring matching + alias expansion.
+ * @param {string} name
+ * @returns {object|null}
+ */
+export function findCharacterByFuzzyName(name) {
+    const all = getAllCharacters();
+    const lowerName = name.toLowerCase().trim();
+    if (!lowerName) return null;
+
+    // 1. Word-set match
+    const nameWords = lowerName.split(/\s+/).filter(Boolean).sort().join(" ");
+    for (const c of all) {
+        const cWords = c.name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
+        if (cWords === nameWords) return c;
+        if (c.nameAliases && Array.isArray(c.nameAliases)) {
+            for (const alias of c.nameAliases) {
+                const aliasWords = alias.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
+                if (aliasWords === nameWords) return c;
+            }
+        }
+    }
+
+    // 2. Substring match
+    for (const c of all) {
+        const cNameLower = c.name.toLowerCase().trim();
+        if (cNameLower.includes(lowerName) || lowerName.includes(cNameLower)) return c;
+        if (c.nameAliases && Array.isArray(c.nameAliases)) {
+            for (const alias of c.nameAliases) {
+                const aliasLower = alias.toLowerCase().trim();
+                if (aliasLower.includes(lowerName) || lowerName.includes(aliasLower)) return c;
+            }
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Get all unique name strings for a character profile (main name + aliases).
+ * Used for categorization and comparison.
+ * @param {object} profile
+ * @returns {string[]} Array of name strings (lowercased, trimmed)
+ */
+export function getCharacterNameVariants(profile) {
+    const names = [profile.name.toLowerCase().trim()];
+    if (profile.nameAliases && Array.isArray(profile.nameAliases)) {
+        for (const alias of profile.nameAliases) {
+            const a = alias.toLowerCase().trim();
+            if (a && !names.includes(a)) names.push(a);
+        }
+    }
+    return names;
+}
+
+/**
+ * Find a character by word-set similarity (same words, different order).
+ * Detects collisions like "Satoru Gojo" ↔ "Gojo Satoru".
+ * @param {string} name
+ * @returns {object|null}
+ */
+export function findCharacterBySimilarName(name) {
+    const all = getAllCharacters();
+    const normalizedWords = name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
+    if (!normalizedWords) return null;
+
+    for (const c of all) {
+        const cWords = c.name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
+        if (cWords === normalizedWords && c.name.toLowerCase().trim() !== name.toLowerCase().trim()) {
+            return c;
+        }
+    }
+    return null;
 }
 
 /**
@@ -190,7 +323,7 @@ export function updateCharacterProfile(charId, updates) {
     const profile = getStoredCharacter(charId);
     if (!profile) return;
 
-    const allowedFields = ["name", "description", "notes", "source", "dynamicTitle", "narrativeSummary"];
+    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary"];
     for (const field of allowedFields) {
         if (updates[field] !== undefined) {
             profile[field] = updates[field];
@@ -231,6 +364,19 @@ export function removeUpdateLogEntry(charId, sceneId) {
     saveCharacter(charId, profile);
 }
 
+/**
+ * Remove an update log entry by timestamp (for entries without sceneId, e.g. manual edits).
+ * @param {string} charId
+ * @param {number} timestamp
+ */
+export function removeUpdateLogEntryByTimestamp(charId, timestamp) {
+    const profile = getStoredCharacter(charId);
+    if (!profile || !timestamp) return;
+
+    profile.updateLog = profile.updateLog.filter((entry) => entry.timestamp !== timestamp);
+    saveCharacter(charId, profile);
+}
+
 // ─── Delete ───────────────────────────────────────────────
 
 /**
@@ -253,32 +399,117 @@ export function exportCharacters() {
 }
 
 /**
+ * Validate a single character profile against the expected schema.
+ * Returns an array of error messages (empty = valid).
+ * @param {object} profile
+ * @returns {string[]}
+ */
+function validateProfile(profile) {
+    const errors = [];
+
+    // Required: id must be a non-empty string
+    if (typeof profile.id !== "string" || !profile.id.trim()) {
+        errors.push("Missing or invalid 'id' (must be a non-empty string)");
+    }
+
+    // Required: name must be a non-empty string
+    if (typeof profile.name !== "string" || !profile.name.trim()) {
+        errors.push("Missing or invalid 'name' (must be a non-empty string)");
+    }
+
+    // Required: stats must be an object with all categories and numeric stat values
+    if (!profile.stats || typeof profile.stats !== "object") {
+        errors.push("Missing or invalid 'stats' (must be an object)");
+    } else {
+        for (const cat of STAT_CATEGORIES) {
+            if (!profile.stats[cat] || typeof profile.stats[cat] !== "object") {
+                errors.push(`Missing or invalid stats category: "${cat}"`);
+            } else {
+                for (const stat of STAT_NAMES) {
+                    const val = profile.stats[cat][stat];
+                    if (typeof val !== "number" || isNaN(val)) {
+                        errors.push(`Invalid stat value for "${cat}/${stat}" (must be a number, got ${typeof val})`);
+                    }
+                }
+            }
+        }
+    }
+
+    // Required: updateLog must be an array
+    if (!Array.isArray(profile.updateLog)) {
+        errors.push("Missing or invalid 'updateLog' (must be an array)");
+    }
+
+    // Optional fields: type checks
+    if (profile.description !== undefined && typeof profile.description !== "string") {
+        errors.push("Invalid type for 'description' (must be a string)");
+    }
+    if (profile.notes !== undefined && typeof profile.notes !== "string") {
+        errors.push("Invalid type for 'notes' (must be a string)");
+    }
+    if (profile.dynamicTitle !== undefined && typeof profile.dynamicTitle !== "string") {
+        errors.push("Invalid type for 'dynamicTitle' (must be a string)");
+    }
+    if (profile.narrativeSummary !== undefined && typeof profile.narrativeSummary !== "string") {
+        errors.push("Invalid type for 'narrativeSummary' (must be a string)");
+    }
+    if (profile.source !== undefined && typeof profile.source !== "string") {
+        errors.push("Invalid type for 'source' (must be a string)");
+    }
+
+    return errors;
+}
+
+/**
  * Import character data from a JSON string.
- * Merges with existing data (existing characters are overwritten if same ID).
+ * Validates each profile against the expected schema before importing.
+ * Skips invalid entries and reports errors.
  * @param {string} jsonString
- * @returns {number} Number of characters imported
+ * @returns {{ count: number, errors: string[] }} Number imported + validation errors
  */
 export function importCharacters(jsonString) {
     try {
         const imported = JSON.parse(jsonString);
         if (typeof imported !== "object" || imported === null) {
-            throw new Error("Invalid character data format");
+            return { count: -1, errors: ["Invalid character data: expected a JSON object"] };
         }
 
         const existing = getCharacters();
         let count = 0;
+        const errors = [];
+
         for (const [id, profile] of Object.entries(imported)) {
-            if (profile && profile.name) {
-                existing[id] = profile;
-                count++;
+            if (!profile || typeof profile !== "object") {
+                errors.push(`Entry "${id}": not a valid object, skipped`);
+                continue;
             }
+
+            // Validate schema
+            const validationErrors = validateProfile(profile);
+            if (validationErrors.length > 0) {
+                errors.push(`Entry "${profile.name || id}": ${validationErrors.join("; ")}`);
+                continue;
+            }
+
+            // Check for name collisions
+            const similar = findCharacterBySimilarName(profile.name);
+            if (similar && similar.id !== id) {
+                errors.push(`Entry "${profile.name}": name collision with existing character "${similar.name}" (id=${similar.id}) — skipped to avoid duplicate`);
+                continue;
+            }
+
+            existing[id] = profile;
+            count++;
         }
 
-        saveAllCharacters(existing);
-        return count;
+        if (count > 0) {
+            saveAllCharacters(existing);
+        }
+
+        return { count, errors };
     } catch (err) {
         console.error("[RST] Failed to import characters:", err);
-        return -1;
+        return { count: -1, errors: [err.message || "JSON parse failed"] };
     }
 }
 
@@ -290,6 +521,11 @@ export function importCharacters(jsonString) {
  * @returns {object} Clamped stats
  */
 function clampAllStats(stats) {
+    if (stats === null || stats === undefined) {
+        console.error("[RST-DEBUG] clampAllStats called with null/undefined stats! Stack:", new Error().stack);
+        // Return blank stats as safety net
+        return createBlankStats();
+    }
     const clamped = {};
     for (const cat of STAT_CATEGORIES) {
         clamped[cat] = {};

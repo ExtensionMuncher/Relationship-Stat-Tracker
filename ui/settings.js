@@ -108,6 +108,8 @@ function renderBatchScan($pane) {
     const bs = settings.batchScan || {};
 
     $pane.append('<div class="rst-lbl">Batch scan</div>');
+
+    // ─── Main Batch Scan Card (description + run button + progress bar + token settings) ───
     const $card = $(`
         <div class="rst-card">
             <div style="font-size:12px;color:var(--rst-text-muted);margin-bottom:10px;line-height:1.5">
@@ -115,7 +117,16 @@ function renderBatchScan($pane) {
                 scene summaries, and an initial stat block per character. Runs once — does not compound on existing data.
             </div>
             <button class="rst-btn" style="border-color:var(--rst-accent);color:var(--rst-avatar-text)" id="rst-batch-scan">Run batch scan</button>
-            <div id="rst-batch-progress" style="display:none;margin-top:8px;font-size:12px;color:var(--rst-text-muted)"></div>
+
+            <!-- Progress bar (hidden until scan starts) -->
+            <div id="rst-batch-progress" style="display:none;margin-top:10px">
+                <div class="rst-progress-bar-container">
+                    <div class="rst-progress-bar-fill" style="width:0%"></div>
+                </div>
+                <div class="rst-progress-phase">Phase 1/4: Initializing...</div>
+                <div class="rst-progress-detail">Starting batch scan...</div>
+                <div class="rst-progress-stats">Elapsed: 0s | API calls: 0/0</div>
+            </div>
 
             <hr class="rst-div" style="margin:12px 0">
 
@@ -140,20 +151,124 @@ function renderBatchScan($pane) {
         </div>
     `);
 
+    // ─── Rate Limiting Card ──────────────────────────────────
+    const $rateCard = $(`
+        <div class="rst-card">
+            <div class="rst-setting-label" style="margin-bottom:10px">Rate Limiting</div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Requests per minute</div>
+                    <div class="rst-setting-sub">Max LLM API calls per minute per connection profile.</div>
+                </div>
+                <input type="number" min="1" max="60" step="1"
+                    value="${bs.requestsPerMinute ?? 10}"
+                    id="rst-bs-rpm" style="width:80px;flex-shrink:0">
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Max retries</div>
+                    <div class="rst-setting-sub">Times to retry on rate limit (429) or server errors (502/503).</div>
+                </div>
+                <input type="number" min="0" max="10" step="1"
+                    value="${bs.maxRetries ?? 3}"
+                    id="rst-bs-retries" style="width:80px;flex-shrink:0">
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Base retry delay (ms)</div>
+                    <div class="rst-setting-sub">Initial wait before first retry (doubles each attempt, capped at 60s).</div>
+                </div>
+                <input type="number" min="500" max="30000" step="500"
+                    value="${bs.baseRetryDelay ?? 1000}"
+                    id="rst-bs-delay" style="width:80px;flex-shrink:0">
+            </div>
+        </div>
+    `);
+
+    // ─── Advanced Throttling Card ────────────────────────────
+    const $advCard = $(`
+        <div class="rst-card">
+            <div class="rst-setting-label" style="margin-bottom:10px">Advanced Throttling</div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Per-scene delay (ms)</div>
+                    <div class="rst-setting-sub">Delay between Phase 4 stat generation calls to let the API cool down.</div>
+                </div>
+                <input type="number" min="0" max="10000" step="100"
+                    value="${bs.perSceneDelay ?? 0}"
+                    id="rst-bs-scene-delay" style="width:80px;flex-shrink:0">
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Inter-phase delay (ms)</div>
+                    <div class="rst-setting-sub">Delay between scene detection (Phase 1) and stat generation (Phase 4).</div>
+                </div>
+                <input type="number" min="0" max="30000" step="500"
+                    value="${bs.interPhaseDelay ?? 0}"
+                    id="rst-bs-phase-delay" style="width:80px;flex-shrink:0">
+            </div>
+            <div class="rst-setting-row" style="border-bottom:none">
+                <div>
+                    <div class="rst-setting-label">Combine ranges in single call</div>
+                    <div class="rst-setting-sub">Send all unprocessed message ranges in one API call instead of one per range. Reduces overhead when messages fit in context window.</div>
+                </div>
+                <label class="rst-toggle">
+                    <input type="checkbox" id="rst-bs-combine" ${bs.combineRanges !== false ? 'checked' : ''}>
+                    <span class="rst-slider"></span>
+                </label>
+            </div>
+        </div>
+    `);
+
+    // ─── Click handler with progress bar wiring ───────────────
     $card.find("#rst-batch-scan").on("click", async function () {
         const $btn = $(this);
         const $progress = $card.find("#rst-batch-progress");
+        const $fill = $progress.find(".rst-progress-bar-fill");
+        const $phase = $progress.find(".rst-progress-phase");
+        const $detail = $progress.find(".rst-progress-detail");
+        const $stats = $progress.find(".rst-progress-stats");
 
         $btn.prop("disabled", true);
         $btn.text("Scanning...");
-        $progress.show().text("Analyzing chat history for scene boundaries...");
+        $progress.show();
+
+        // Reset progress display
+        $fill.css("width", "0%");
+        $phase.text("Phase 1/4: Initializing...");
+        $detail.text("Starting batch scan...");
+        $stats.text("Elapsed: 0s | API calls: 0/0");
+
+        // Wire up progress callback and apply rate limiter settings
+        const { setProgressCallback, updateRateLimiterSettings } = await import("../llm/connections.js");
+        const currentSettings = getSettings();
+        updateRateLimiterSettings(currentSettings.batchScan || {});
+
+        setProgressCallback((data) => {
+            const percent = data.total > 0 ? Math.round((data.current / data.total) * 100) : 0;
+            $fill.css("width", percent + "%");
+            $phase.text(`Phase ${data.phase}/${data.totalPhases}: ${data.label}`);
+            $detail.text(data.detail || "");
+
+            const elapsed = data.elapsed || 0;
+            const secs = Math.floor(elapsed / 1000);
+            const mins = Math.floor(secs / 60);
+            const timeStr = mins > 0 ? `${mins}m ${secs % 60}s` : `${secs}s`;
+            $stats.text(`Elapsed: ${timeStr} | API calls: ${data.current}/${data.total}`);
+        });
 
         try {
             const { runBatchScan } = await import("../llm/batchScan.js");
             const result = await runBatchScan();
 
+            // Clear the progress callback after completion
+            setProgressCallback(null);
+
             if (result.scenesCreated > 0 || result.profilesCreated.length > 0) {
-                $progress.text(`Done! ${result.scenesCreated} scenes created, ${result.profilesCreated.length} new profiles. Refreshing UI...`);
+                $fill.css("width", "100%");
+                $phase.text("Phase 4/4: Complete");
+                $detail.text(`Done! ${result.scenesCreated} scenes created, ${result.profilesCreated.length} new profiles.`);
+                $stats.text("Refreshing UI...");
 
                 // Re-render tabs to show new data
                 const { renderHomeTab } = await import("./home.js");
@@ -165,27 +280,61 @@ function renderBatchScan($pane) {
                 renderLibraryTab(getPane("lib"));
                 renderScenesTab(getPane("scenes"));
             } else {
-                $progress.text("No new scenes or profiles were created.");
+                $phase.text("Scan complete");
+                $detail.text("No new scenes or profiles were created.");
             }
         } catch (err) {
             console.error("[RST] Batch scan failed:", err);
-            $progress.text("Batch scan failed. Check console for details.");
+            const { setProgressCallback } = await import("../llm/connections.js");
+            setProgressCallback(null);
+            $detail.text("Batch scan failed. Check console for details.");
             toastr?.error?.("Batch scan failed. See console for details.");
         } finally {
+            // Re-add scene buttons to all messages in case scenes were partially created
+            // before an error occurred, which would have triggered ST re-render and destroyed buttons
+            $(document).trigger("rst:refresh-message-buttons");
+
             $btn.prop("disabled", false);
             $btn.text("Run batch scan");
         }
     });
 
-    // Batch scan settings listeners
+    // ─── Settings change listeners ────────────────────────────
     $card.find("#rst-bs-scene-tokens").on("change", async function () {
         saveSetting("batchScan.sceneDetectionMaxTokens", parseInt($(this).val(), 10));
     });
     $card.find("#rst-bs-stat-tokens").on("change", async function () {
         saveSetting("batchScan.initialStatMaxTokens", parseInt($(this).val(), 10));
     });
+    $rateCard.find("#rst-bs-rpm").on("change", async function () {
+        saveSetting("batchScan.requestsPerMinute", parseInt($(this).val(), 10));
+        // Also update the rate limiter in real-time
+        const { updateRateLimiterSettings } = await import("../llm/connections.js");
+        updateRateLimiterSettings(getSettings().batchScan || {});
+    });
+    $rateCard.find("#rst-bs-retries").on("change", async function () {
+        saveSetting("batchScan.maxRetries", parseInt($(this).val(), 10));
+        const { updateRateLimiterSettings } = await import("../llm/connections.js");
+        updateRateLimiterSettings(getSettings().batchScan || {});
+    });
+    $rateCard.find("#rst-bs-delay").on("change", async function () {
+        saveSetting("batchScan.baseRetryDelay", parseInt($(this).val(), 10));
+        const { updateRateLimiterSettings } = await import("../llm/connections.js");
+        updateRateLimiterSettings(getSettings().batchScan || {});
+    });
+    $advCard.find("#rst-bs-scene-delay").on("change", async function () {
+        saveSetting("batchScan.perSceneDelay", parseInt($(this).val(), 10));
+    });
+    $advCard.find("#rst-bs-phase-delay").on("change", async function () {
+        saveSetting("batchScan.interPhaseDelay", parseInt($(this).val(), 10));
+    });
+    $advCard.find("#rst-bs-combine").on("change", async function () {
+        saveSetting("batchScan.combineRanges", $(this).is(":checked"));
+    });
 
     $pane.append($card);
+    $pane.append($rateCard);
+    $pane.append($advCard);
 }
 
 // ─── Scene Summary Prompt ─────────────────────────────────
@@ -326,6 +475,21 @@ function renderDetectionSettings($pane, settings) {
         </div>
     `);
 
+    // Name blacklist
+    const blacklistStr = (settings.nameBlacklist || []).join(", ");
+    $card.append(`
+        <div class="rst-setting-row" style="border-bottom:none">
+            <div>
+                <div class="rst-setting-label">Name blacklist</div>
+                <div class="rst-setting-sub">Names to always exclude from sidecar detection (comma-separated). Also excludes your ST user persona name automatically.</div>
+            </div>
+        </div>
+        <div style="padding:0 0 4px">
+            <textarea id="rst-name-blacklist" rows="2" style="width:100%;font-size:12px"
+                placeholder="e.g. Narrator, Guide, System">${blacklistStr}</textarea>
+        </div>
+    `);
+
     $pane.append($card);
 
     // Listeners
@@ -335,6 +499,15 @@ function renderDetectionSettings($pane, settings) {
 
     $("#rst-new-char-popup").on("change", function () {
         saveSetting("newCharPopup", $(this).prop("checked"));
+    });
+
+    $("#rst-name-blacklist").on("change", function () {
+        const raw = $(this).val();
+        const list = raw
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+        saveSetting("nameBlacklist", list);
     });
 }
 

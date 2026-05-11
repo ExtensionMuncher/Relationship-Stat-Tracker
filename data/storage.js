@@ -265,6 +265,7 @@ export function getDefaultSettings() {
 
         scanFrequency: 5,
         newCharPopup: true,
+        nameBlacklist: [],
         statChangeRange: { min: -5, max: 5 },
         sceneSummaryPrompt:
             "Write a concise scene summary for internal reference. Include: key events, emotional turning points, characters present, and any significant relationship shifts. Keep it clinical and factual — this is a note for future analysis, not a narrative retelling.",
@@ -272,6 +273,12 @@ export function getDefaultSettings() {
         batchScan: {
             sceneDetectionMaxTokens: 4000,
             initialStatMaxTokens: 3000,
+            requestsPerMinute: 10,
+            maxRetries: 3,
+            baseRetryDelay: 1000,
+            perSceneDelay: 0,
+            interPhaseDelay: 0,
+            combineRanges: true,
         },
 
         injection: {

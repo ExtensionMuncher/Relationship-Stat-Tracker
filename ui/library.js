@@ -14,7 +14,9 @@ import {
     updateCharacterStats,
     addUpdateLogEntry,
     cloneStats,
+    createBlankStats,
     removeUpdateLogEntry,
+    removeUpdateLogEntryByTimestamp,
     exportCharacters,
     importCharacters,
     STAT_CATEGORIES,
@@ -28,6 +30,9 @@ import { showPanelLoading, hidePanelLoading } from "./panel.js";
 // ─── State ────────────────────────────────────────────────
 
 let selectedCharId = null;
+
+/** @type {Set<string>} Set of character IDs selected for bulk operations */
+const selectedCharIds = new Set();
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -52,6 +57,48 @@ export function renderLibraryTab($pane) {
     $btnRow.find("#rst-import-chars").on("click", () => triggerImport());
 
     $pane.append($btnRow);
+
+    // Bulk action toolbar (shown only when characters exist)
+    const chars = getAllCharacters();
+    if (chars.length > 0) {
+        const $bulkToolbar = $(`
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:6px 4px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg-secondary, rgba(0,0,0,0.05))">
+                <label style="display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer">
+                    <input type="checkbox" id="rst-select-all-chars" style="margin:0">
+                    Select all
+                </label>
+                <button id="rst-delete-selected-chars" class="rst-btn-danger" style="font-size:11px;padding:3px 10px;opacity:0.5;pointer-events:none" disabled>Delete selected (0)</button>
+            </div>
+        `);
+
+        // Select all toggle
+        $bulkToolbar.find("#rst-select-all-chars").on("change", function () {
+            const checked = $(this).prop("checked");
+            $pane.find(".rst-char-select").prop("checked", checked).trigger("change");
+        });
+
+        // Delete selected handler
+        $bulkToolbar.find("#rst-delete-selected-chars").on("click", async function () {
+            const count = selectedCharIds.size;
+            if (count === 0) return;
+            const confirmed = await Popup.show.confirm(
+                "Delete Characters",
+                `Delete ${count} selected character${count > 1 ? "s" : ""}? This cannot be undone.`
+            );
+            if (!confirmed) return;
+            for (const charId of selectedCharIds) {
+                deleteCharacter(charId);
+            }
+            selectedCharIds.clear();
+            if (selectedCharId && !chars.some(c => c.id === selectedCharId)) {
+                selectedCharId = null;
+            }
+            toastr?.info?.(`${count} character${count > 1 ? "s" : ""} deleted.`);
+            renderLibraryTab($pane);
+        });
+
+        $pane.append($bulkToolbar);
+    }
 
     // Character chips — each with an inline collapsible card underneath
     renderCharacterChips($pane);
@@ -91,6 +138,7 @@ function renderCharacterChips($pane) {
 
         const $chip = $(`
             <div class="rst-chip${isSelected ? " on" : ""}">
+                <input type="checkbox" class="rst-char-select" data-char-id="${char.id}" style="margin:0;cursor:pointer;flex-shrink:0" title="Select this character">
                 <div class="rst-av">${initials}</div>
                 <div>
                     <div style="font-weight:500">${char.name}</div>
@@ -102,7 +150,36 @@ function renderCharacterChips($pane) {
 
         const $cardWrap = $(`<div class="rst-card-wrap" style="display:${isSelected ? "block" : "none"}"></div>`);
 
-        $chip.on("click", () => {
+        // Wire up bulk selection checkbox
+        const $checkbox = $chip.find(".rst-char-select");
+        $checkbox.on("change", function () {
+            const checked = $(this).prop("checked");
+            const charId = $(this).data("char-id");
+            if (checked) {
+                selectedCharIds.add(charId);
+            } else {
+                selectedCharIds.delete(charId);
+            }
+            // Update bulk action toolbar state
+            const $toolbar = $pane.find("#rst-delete-selected-chars");
+            const count = selectedCharIds.size;
+            $toolbar.text(`Delete selected (${count})`);
+            if (count > 0) {
+                $toolbar.prop("disabled", false).css({ opacity: 1, pointerEvents: "auto" });
+            } else {
+                $toolbar.prop("disabled", true).css({ opacity: 0.5, pointerEvents: "none" });
+            }
+            // Uncheck "Select all" if not all selected
+            const totalCheckboxes = $pane.find(".rst-char-select").length;
+            const checkedCheckboxes = $pane.find(".rst-char-select:checked").length;
+            const $selectAll = $pane.find("#rst-select-all-chars");
+            $selectAll.prop("checked", totalCheckboxes > 0 && checkedCheckboxes === totalCheckboxes);
+        });
+
+        $chip.on("click", (e) => {
+            // Don't toggle card when clicking the checkbox
+            if ($(e.target).is("input[type=checkbox]")) return;
+
             // Clicking the already-selected chip collapses the card
             if (selectedCharId === char.id) {
                 selectedCharId = null;
@@ -194,12 +271,50 @@ function renderCharacterCard($pane, profile) {
 
     $card.append($header);
 
+    // Name aliases (comma-separated, for sidecar matching)
+    const aliasesStr = (profile.nameAliases && Array.isArray(profile.nameAliases))
+        ? profile.nameAliases.join(", ")
+        : "";
+    const $aliasesRow = $(`
+        <div style="margin-bottom:8px">
+            <div class="rst-lbl" style="margin-bottom:2px">Name aliases</div>
+            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:4px;line-height:1.4">
+                Alternative names this character is known by (comma-separated). Used by sidecar detection
+                to match LLM output (e.g. "Gojo") against your library entry (e.g. "Satoru Gojo").
+            </div>
+            <input type="text" class="rst-char-aliases" value="${aliasesStr}"
+                style="width:100%;padding:4px 6px;font-size:12px"
+                placeholder="e.g. Gojo, Satoru">
+        </div>
+    `);
+    const $aliasesInput = $aliasesRow.find(".rst-char-aliases");
+    $aliasesInput.on("change", function () {
+        const raw = $(this).val();
+        const aliases = raw
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+        updateCharacterProfile(profile.id, { nameAliases: aliases });
+        profile.nameAliases = aliases;
+    });
+    $card.append($aliasesRow);
+
     // Profile textareas
-    $card.append('<div class="rst-lbl">Personality</div>');
-    const $desc = $(`<textarea rows="2" style="margin-bottom:8px">${profile.description || ""}</textarea>`);
+    $card.append(`
+        <div style="display:flex;align-items:baseline;gap:6px">
+            <div class="rst-lbl">Personality</div>
+            <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-lib-personality-${profile.id}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i>
+        </div>
+    `);
+    const $desc = $(`<textarea id="rst-lib-personality-${profile.id}" rows="2" style="margin-bottom:8px">${profile.description || ""}</textarea>`);
     $card.append($desc);
-    $card.append('<div class="rst-lbl" style="margin-top:8px">Character Notes</div>');
-    const $notes = $(`<textarea rows="2">${profile.notes ? "Notes: " + profile.notes : ""}</textarea>`);
+    $card.append(`
+        <div style="display:flex;align-items:baseline;gap:6px;margin-top:8px">
+            <div class="rst-lbl">Character Notes</div>
+            <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-lib-notes-${profile.id}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i>
+        </div>
+    `);
+    const $notes = $(`<textarea id="rst-lib-notes-${profile.id}" rows="2">${profile.notes || ""}</textarea>`);
 
     $desc.on("change", function () {
         updateCharacterProfile(profile.id, { description: $(this).val() });
@@ -323,7 +438,7 @@ function toggleLogPanel(profile) {
 function renderLogEntry(entry, profile) {
     const sceneNum = entry.sceneId?.replace("scene_", "") || "?";
     const timeAgo = formatTimeAgo(entry.timestamp);
-    const msgRange = entry.messageRange ? `msgs ${entry.messageRange.start}–${entry.messageRange.end}` : "";
+    const msgRange = (entry.messageRange && typeof entry.messageRange.start === "number") ? `msgs ${entry.messageRange.start}–${entry.messageRange.end}` : "no msg range";
 
     const $entry = $(`
         <div class="rst-log-entry">
@@ -336,20 +451,37 @@ function renderLogEntry(entry, profile) {
         for (const stat of STAT_NAMES) {
             const before = entry.statsBefore?.[cat]?.[stat];
             const after = entry.statsAfter?.[cat]?.[stat];
-            if (before !== undefined && after !== undefined && before !== after) {
+            if (after === undefined) continue;
+
+            const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
+            const statTitle = stat.charAt(0).toUpperCase() + stat.slice(1);
+
+            if (before !== undefined && before !== after) {
+                // Change: show before → after
                 const cls = after > before ? "p" : "n";
-                const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
-                const statTitle = stat.charAt(0).toUpperCase() + stat.slice(1);
                 $entry.append(`
                     <div class="rst-sr">
                         <span>${catTitle} / ${statTitle}</span>
                         <span class="rst-sv ${cls}">${before}% → ${after}%</span>
                     </div>
                 `);
-                const commentary = entry.commentary?.[cat]?.[stat];
-                if (commentary) {
-                    $entry.append(`<div style="font-size:11px;color:var(--rst-text-muted);padding:3px 0;line-height:1.4">${commentary}</div>`);
-                }
+            } else if (before === undefined && after !== 0) {
+                // Initial stat: show as "set to X%"
+                const cls = after > 0 ? "p" : "n";
+                $entry.append(`
+                    <div class="rst-sr">
+                        <span>${catTitle} / ${statTitle}</span>
+                        <span class="rst-sv ${cls}">set to ${after}%</span>
+                    </div>
+                `);
+            } else {
+                // Unchanged stat or 0→0: skip
+                continue;
+            }
+
+            const commentary = entry.commentary?.[cat]?.[stat];
+            if (commentary) {
+                $entry.append(`<div style="font-size:11px;color:var(--rst-text-muted);padding:3px 0;line-height:1.4">${commentary}</div>`);
             }
         }
     }
@@ -367,7 +499,8 @@ function renderLogEntry(entry, profile) {
     });
 
     $btnRow.find(".rst-delete-log-btn").on("click", () => {
-        removeUpdateLogEntry(profile.id, entry.sceneId);
+        // Use timestamp (unique per entry) instead of sceneId (shared across entries in same scene)
+        removeUpdateLogEntryByTimestamp(profile.id, entry.timestamp);
         toastr?.success?.("Log entry deleted.");
         const $pane = $("#rst-p-lib");
         renderLibraryTab($pane);
@@ -385,35 +518,63 @@ function renderLogEntry(entry, profile) {
  * @param {object} entry
  */
 async function showRollbackConfirmation(profile, entry) {
+    const hasStatsBefore = !!entry.statsBefore;
+
     const detailLines = [
         "Are you sure you want to proceed? Rollbacks cannot be reversed.\n",
-        "Rolling back will restore:",
-        "• All 12 stats to their previous values",
-        `• Dynamic title to: "${entry.dynamicTitleBefore || "None"}"`,
-        "• Narrative summary to previous version",
     ];
 
+    if (hasStatsBefore) {
+        detailLines.push(
+            "Rolling back will restore:",
+            "• All 12 stats to their previous values",
+            `• Dynamic title to: "${entry.dynamicTitleBefore || "None"}"`,
+            "• Narrative summary to previous version",
+        );
+    } else {
+        detailLines.push(
+            "⚠ No previous stats recorded for this entry.",
+            "Rolling back will NOT change current stats — only the log entry will be removed.",
+            `• Dynamic title will revert to: "${entry.dynamicTitleBefore || "None"}"`,
+            "• Narrative summary will revert to previous version",
+        );
+    }
+
     const result = await Popup.show.confirm(
-        "⚠ Rollback warning",
+        hasStatsBefore ? "⚠ Rollback warning" : "⚠ Rollback — no previous stats recorded",
         detailLines.join("\n"),
     );
 
     if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
     try {
-        // Restore stats
-        updateCharacterStats(profile.id, entry.statsBefore);
+        // Only restore stats if we have previous values to restore
+        if (hasStatsBefore) {
+            updateCharacterStats(profile.id, entry.statsBefore);
+        }
 
-        // Restore dynamic title and narrative
-        updateCharacterProfile(profile.id, {
-            dynamicTitle: entry.dynamicTitleBefore,
-            narrativeSummary: entry.narrativeSummary || profile.narrativeSummary,
-        });
+        // Restore dynamic title — only if we have a meaningful value to restore
+        // (empty string from batch init means "no title change", don't clear existing)
+        const profileUpdates = {};
+        if (entry.dynamicTitleBefore) {
+            profileUpdates.dynamicTitle = entry.dynamicTitleBefore;
+        }
+        // Restore narrative summary to entry's version (even if empty string)
+        profileUpdates.narrativeSummary = entry.narrativeSummary ?? "";
+        updateCharacterProfile(profile.id, profileUpdates);
 
-        // Remove this log entry
-        removeUpdateLogEntry(profile.id, entry.sceneId);
+        // Determine a display-friendly reference for the toast
+        const sceneRef = entry.sceneId && entry.sceneId !== "" ? entry.sceneId : "manual edit";
+        const sourceRef = entry.source || sceneRef;
 
-        toastr?.success?.(`Rollback complete. ${profile.name} stats restored to pre-${entry.sceneId} state.`);
+        // Remove this log entry by unique timestamp
+        removeUpdateLogEntryByTimestamp(profile.id, entry.timestamp);
+
+        toastr?.success?.(
+            hasStatsBefore
+                ? `Rollback complete. ${profile.name} stats restored to pre-${sourceRef} state.`
+                : `Log entry removed. ${profile.name} stats left unchanged (no previous stats to restore).`
+        );
 
         const $pane = $("#rst-p-lib");
         renderLibraryTab($pane);
@@ -653,12 +814,15 @@ export async function showNewCharacterDetected(name) {
         { okButton: "Create entry", cancelButton: "Ignore" },
     );
 
-    if (result !== POPUP_RESULT.AFFIRMATIVE) return;
+    if (result !== POPUP_RESULT.AFFIRMATIVE) {
+        return false; // User clicked "Ignore"
+    }
 
     createCharacter(name);
     toastr?.success?.(`New character profile created for ${name}.`);
     const $pane = $("#rst-p-lib");
     renderLibraryTab($pane);
+    return true; // Character was created
 }
 
 // ─── Delete Character ─────────────────────────────────────
@@ -710,13 +874,16 @@ function triggerImport() {
         const file = e.target.files[0];
         if (!file) return;
         const text = await file.text();
-        const count = importCharacters(text);
+        const { count, errors } = importCharacters(text);
         if (count >= 0) {
             toastr?.success?.(`${count} characters imported.`);
+            if (errors.length > 0) {
+                toastr?.warning?.(`${errors.length} entries skipped:\n${errors.join("\n")}`, null, { timeOut: 10000 });
+            }
             const $pane = $("#rst-p-lib");
             renderLibraryTab($pane);
         } else {
-            toastr?.error?.("Failed to import character data.");
+            toastr?.error?.(`Failed to import character data.\n${errors.join("\n")}`);
         }
     };
     input.click();

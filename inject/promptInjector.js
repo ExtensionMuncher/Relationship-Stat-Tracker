@@ -1,11 +1,11 @@
 /**
  * promptInjector.js — System prompt injection/removal of stat blocks
- * Injects character relationship stats into the ST system prompt
- * Also manages passive library reference for ALL characters
- * injectionFilter pattern adapted from timeline-memory's updateTimelineInjection()
+ * Injects character relationship stats into the ST system prompt using markdown formatting.
+ * Also manages passive library reference (lightweight character name directory).
+ * injectionFilter pattern adapted from timeline-memory's updateTimelineInjection().
  */
-
-import { setExtensionPrompt, extension_prompt_roles } from "../../../../../script.js";
+ 
+import { setExtensionPrompt } from "../../../../../script.js";
 import { getSettings, getPresentCharacters } from "../data/storage.js";
 import { getCharacterProfile, getAllCharacters, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 
@@ -91,8 +91,10 @@ export function removeInjection() {
 // ─── Passive Library Reference ────────────────────────────
 
 /**
- * Inject a passive reference block containing ALL character stats
- * so the main LLM can access any character's relationship data.
+ * Inject a lightweight passive reference directory (character names only)
+ * so the main LLM knows which characters exist without burning tokens on
+ * full stat dumps for irrelevant characters. Active stat blocks for
+ * present characters already provide full data via buildStatBlock().
  * Pattern adapted from timeline-memory's updateTimelineInjection().
  */
 export function updatePassiveLibraryRef() {
@@ -108,7 +110,12 @@ export function updatePassiveLibraryRef() {
         return;
     }
 
-    const block = buildLibraryBlock(allChars, settings);
+    const block = buildLibraryBlock(allChars);
+    if (!block) {
+        setExtensionPrompt(LIBRARY_REF_KEY, "", 0, 0, false, ROLE_SYSTEM);
+        return;
+    }
+
     const depth = settings.injection.libraryRefDepth ?? 2;
 
     // Map role string from settings to ST role number
@@ -122,32 +129,38 @@ export function updatePassiveLibraryRef() {
 }
 
 /**
- * Build a passive reference block with ALL character profiles and stats.
- * Perspective-annotated to clarify character → {{user}} direction.
+ * Build a lightweight passive reference directory with character names only.
+ * This is intentionally minimal to avoid burning tokens on full stat dumps
+ * for characters not present in the current scene. The LLM can reference
+ * any character by name naturally as the conversation evolves.
  * @param {Array} allChars - All character profiles
- * @param {object} settings
  * @returns {string}
  */
-function buildLibraryBlock(allChars, settings) {
+function buildLibraryBlock(allChars) {
     const parts = [];
 
-    parts.push("=== RELATIONSHIP LIBRARY (Reference Directory) ===");
-    parts.push("Below is a reference directory of all tracked characters and their current relationship data toward {{user}}. This information is available for the LLM to reference freely when relevant — it is not mandatory context and should be used naturally as the conversation evolves.");
+    parts.push("--- Relationship Library (Reference) ---");
+    parts.push("The following characters have tracked relationship data. The LLM may reference any character by name when relevant to the conversation.");
     parts.push("");
 
     for (const profile of allChars) {
-        parts.push(buildCharacterBlock(profile, settings));
-        parts.push("");
+        if (!profile.name) continue;
+        const name = profile.name;
+        const desc = (typeof profile.description === "string" && profile.description)
+            ? ` — ${profile.description.substring(0, 120)}`
+            : "";
+        parts.push(`- ${name}${desc}`);
     }
 
-    parts.push("=== END RELATIONSHIP LIBRARY ===");
+    parts.push("");
+    parts.push("---");
     return parts.join("\n");
 }
 
 // ─── Stat Block Builder ───────────────────────────────────
 
 /**
- * Build the stat block text for injection.
+ * Build the stat block text for injection using markdown-friendly dividers.
  * @param {Array<string>} charIds - Present character IDs
  * @param {object} settings
  * @returns {string}
@@ -165,14 +178,16 @@ function buildStatBlock(charIds, settings) {
 
     if (blocks.length === 0) return "";
 
-    const header = "=== RELATIONSHIP STATE TRACKER ===";
-    const footer = "=== END RELATIONSHIP STATE ===";
+    const header = "--- Relationship Stats ---";
+    const footer = "---";
 
-    return `${header}\n${blocks.join("\n\n")}\n${footer}`;
+    return `${header}\n\n${blocks.join("\n\n")}\n\n${footer}`;
 }
 
 /**
- * Build a single character's stat block for injection.
+ * Build a single character's stat block for injection using markdown format.
+ * Markdown structure (# headers, ### subheaders) is always present regardless of settings.
+ * Content inside varies by format and injectProfile settings.
  * @param {object} profile
  * @param {object} settings
  * @returns {string}
@@ -180,43 +195,69 @@ function buildStatBlock(charIds, settings) {
 function buildCharacterBlock(profile, settings) {
     const parts = [];
 
-    // Character header
-    parts.push(`[${profile.name}]`);
+    // ── Header (always markdown) ──────────────────────────
+    parts.push(`# Relationship Stats: ${profile.name} → {{user}}`);
+    parts.push("");
 
-    // Optional profile injection
+    // ── Optional profile injection ────────────────────────
     if (settings.injection.injectProfile) {
         if (profile.description) {
-            parts.push(`Description: ${profile.description}`);
+            parts.push(`- **Description:** ${profile.description}`);
         }
         if (profile.notes) {
-            parts.push(`Notes: ${profile.notes}`);
+            parts.push(`- **Notes:** ${profile.notes}`);
+        }
+        if (profile.description || profile.notes) {
+            parts.push("");
         }
     }
 
-    // Stats
+    // ── Stats (always markdown subheaders) ────────────────
     const format = settings.injection.format || "stats_and_narrative";
+
+    // Get latest commentary from the most recent updateLog entry (if any)
+    const latestLog = profile.updateLog && profile.updateLog.length > 0
+        ? profile.updateLog[profile.updateLog.length - 1]
+        : null;
+    const commentary = latestLog?.commentary || {};
 
     for (const cat of STAT_CATEGORIES) {
         const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
-        const stats = profile.stats[cat];
-        const statLines = STAT_NAMES.map((stat) => {
-            const val = stats[stat];
+        const stats = profile.stats[cat] || {};
+        const catCommentary = commentary[cat] || {};
+
+        parts.push(`### ${catTitle}`);
+
+        for (const stat of STAT_NAMES) {
+            const val = stats[stat] ?? 0;
             const sign = val >= 0 ? "+" : "";
-            return `  ${stat}: ${sign}${val}%`;
-        });
-        parts.push(`${catTitle}:\n${statLines.join("\n")}`);
+            const displayVal = `${sign}${val}%`;
+
+            // Capitalize stat name for display
+            const statLabel = stat.charAt(0).toUpperCase() + stat.slice(1);
+
+            // Commentary available only when format is stats_and_narrative
+            const comm = catCommentary[stat];
+            if (format === "stats_and_narrative" && comm) {
+                parts.push(`- ${statLabel}: ${displayVal} — ${comm}`);
+            } else {
+                parts.push(`- ${statLabel}: ${displayVal}`);
+            }
+        }
+
+        parts.push("");
     }
 
-    // Narrative (if format includes it)
+    // ── Narrative (only when format includes it) ──────────
     if (format === "stats_and_narrative") {
         if (profile.dynamicTitle) {
-            parts.push(`Dynamic Title: ${profile.dynamicTitle}`);
+            parts.push(`- **Dynamic Title:** ${profile.dynamicTitle}`);
         }
         if (profile.narrativeSummary) {
-            parts.push(`Narrative: ${profile.narrativeSummary}`);
+            parts.push(`- **Narrative Summary:** ${profile.narrativeSummary}`);
         }
     }
 
-    return parts.join("\n");
+    return parts.join("\n").trim();
 }
 

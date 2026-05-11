@@ -4,9 +4,10 @@
  */
 
 import { chat } from "../../../../../script.js";
+import { getContext } from "../../../../extensions.js";
 import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
-import { getAllCharacters } from "../data/characters.js";
+import { getAllCharacters, getCharacterNameVariants, findCharacterByFuzzyName } from "../data/characters.js";
 
 // ─── Sidecar Detection ────────────────────────────────────
 
@@ -78,10 +79,13 @@ function buildSidecarRequestPrompt(messages, knownNames) {
     });
 
     const parts = [
-        'Detect all character names in these messages:',
-        '- Include ALL characters who appear or are referenced, not just speakers.',
+        'Identify ALL named characters who appear, speak, or interact in these messages — even briefly:',
+        '- INCLUDE characters who: speak dialogue, are addressed by name, perform actions described by another speaker, are described as interacting with someone in the scene, or are described as being physically present or doing an activity.',
+        '- For example: if a character says "I talked with [Name] yesterday" or "[Name] handed me the package," INCLUDE [Name].',
+        '- Only EXCLUDE characters who are merely mentioned in passing as a topic of conversation without being described as interacting or doing anything.',
         '- Exclude the user/player character name.',
         '- Exclude generic titles (like "the man", "a woman").',
+        '- CRITICAL: Ignore names mentioned as incorrect guesses, forgotten names, or wrong memories in internal thoughts.',
         '- Each name should appear only once.',
     ];
 
@@ -138,22 +142,61 @@ function parseDetectedNames(response) {
 
 /**
  * Categorize detected names into known and unknown.
+ * Filters out blacklisted names (from settings) and persona/user names.
  * @param {string[]} detectedNames
  * @param {string[]} knownNames
  * @returns {{detected: string[], unknown: string[]}}
  */
 function categorizeNames(detectedNames, knownNames) {
-    const knownLower = knownNames.map((n) => n.toLowerCase().trim());
+    const allCharacters = getAllCharacters();
+
+    // Build exclusion set: persona name + settings blacklist + hardcoded placeholders
+    const settings = getSettings();
+    const personaName = (getContext().name1 || "").toLowerCase().trim();
+    const blacklistNames = (settings.nameBlacklist || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+    const excludedNames = new Set(["{{user}}", "user", "User", personaName, ...blacklistNames]);
+
+    // Helper: check if a name should be excluded
+    function isExcluded(name) {
+        const n = (name || "").toLowerCase().trim();
+        return !n || excludedNames.has(n);
+    }
+
+    // Build a flat map: every known name variant → character profile
+    const knownVariants = new Map(); // lowercased variant name → character
+    for (const char of allCharacters) {
+        const variants = getCharacterNameVariants(char);
+        for (const v of variants) {
+            if (!knownVariants.has(v)) {
+                knownVariants.set(v, char);
+            }
+        }
+    }
+
     const detected = [];
     const unknown = [];
 
     for (const name of detectedNames) {
+        if (isExcluded(name)) continue;
         const nameLower = name.toLowerCase().trim();
-        if (knownLower.includes(nameLower)) {
-            detected.push(name);
-        } else {
-            unknown.push(name);
+        if (!nameLower) continue;
+
+        // 1. Exact match against any variant (main name or alias)
+        const exactChar = knownVariants.get(nameLower);
+        if (exactChar) {
+            detected.push(exactChar.name);
+            continue;
         }
+
+        // 2. Fuzzy match (word-set + substring) against all character profiles
+        const fuzzyChar = findCharacterByFuzzyName(name);
+        if (fuzzyChar) {
+            detected.push(fuzzyChar.name);
+            continue;
+        }
+
+        // 3. No match found — truly unknown
+        unknown.push(name);
     }
 
     return { detected, unknown };
@@ -168,5 +211,9 @@ function categorizeNames(detectedNames, knownNames) {
  */
 function getRecentMessages(count) {
     if (!chat || !Array.isArray(chat)) return [];
-    return chat.slice(-count);
+
+    // Filter out ST-hidden messages (is_system=true) to only scan visible chat,
+    // mirroring how ST's Generate() builds coreChat = chat.filter(x => !x.is_system ...)
+    const visibleMessages = chat.filter((m) => !m.is_system);
+    return visibleMessages.slice(-count);
 }
