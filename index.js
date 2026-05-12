@@ -15,7 +15,7 @@ import { eventSource, event_types } from "../../../../scripts/events.js";
 import { extension_settings } from "../../../../scripts/extensions.js";
 
 import { initSettings, isEnabled, getSetting } from "./settings.js";
-import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter, getPendingUpdates, savePendingUpdates } from "./data/storage.js";
+import { getSettings, getPresentCharacters, savePresentCharacters, getNameBlacklist, getMessageCounter, incrementMessageCounter, getPendingUpdates, savePendingUpdates } from "./data/storage.js";
 import { createCharacter, findCharacterByName, findCharacterByFuzzyName } from "./data/characters.js";
 import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary, updateSceneTitle } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
@@ -218,9 +218,9 @@ async function onMessageReceived(mesId) {
 
             console.log("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length);
 
-            // Build exclusion set from ST user persona name + hardcoded placeholders + settings blacklist
+            // Build exclusion set from ST user persona name + hardcoded placeholders + per-chat blacklist
             const personaName = (name1 || "").toLowerCase().trim();
-            const blacklist = (settings.nameBlacklist || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+            const blacklist = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
             const EXCLUDED_NAMES = new Set([
                 "{{user}}",
                 "user",

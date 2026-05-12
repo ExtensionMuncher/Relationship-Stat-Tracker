@@ -3,8 +3,8 @@
  * Renders the Home tab with pending update cards and present character list
  */
 
-import { getPendingUpdates, savePendingUpdates, getPresentCharacters, getSettings, deleteCharacterData } from "../data/storage.js";
-import { getCharacterProfile, getInitials, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
+import { getPendingUpdates, savePendingUpdates, getPresentCharacters, savePresentCharacters, getSettings, deleteCharacterData } from "../data/storage.js";
+import { getCharacterProfile, getInitials, getAllCharacters, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { getOpenScene, getSceneById, deleteScene, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
 import { generateStatUpdate } from "../llm/statUpdate.js";
 import { renderScenesTab } from "./scenes.js";
@@ -340,41 +340,106 @@ function renderRegenBox(id, onRegenerate) {
  * @param {jQuery} $pane
  */
 function renderPresentCharacters($pane) {
-    const presentIds = getPresentCharacters();
     const $section = $(`<div id="rst-present-section"></div>`);
     $section.append('<div class="rst-lbl">Characters currently present</div>');
 
-    if (presentIds.length === 0) {
-        $section.append(
-            '<div style="font-size:12px;color:var(--rst-text-muted);padding:6px 2px;margin-bottom:12px">No characters detected in current context.</div>'
-        );
-    } else {
+    // Chip container
+    const $chipContainer = $(`<div id="rst-present-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px"></div>`);
+    $section.append($chipContainer);
+
+    function renderChips() {
+        $chipContainer.empty();
+        const presentIds = getPresentCharacters();
+
+        if (presentIds.length === 0) {
+            $chipContainer.append(
+                '<div style="font-size:12px;color:var(--rst-text-muted);padding:6px 2px">No characters detected in current context.</div>'
+            );
+            return;
+        }
+
         for (const charId of presentIds) {
             const profile = getCharacterProfile(charId);
             if (!profile) continue;
 
             const initials = getInitials(profile.name);
             const $chip = $(`
-                <div class="rst-chip">
+                <div class="rst-chip" style="cursor:pointer">
                     <div class="rst-dot"></div>
                     <div class="rst-av">${initials}</div>
                     <span style="font-weight:500">${profile.name}</span>
-                    <span style="margin-left:auto;font-size:11px;color:var(--rst-text-muted)">view profile →</span>
+                    <span class="rst-present-remove" data-char-id="${charId}" style="cursor:pointer;color:var(--rst-danger);margin-left:4px;font-size:13px;line-height:1" title="Remove from presence">✕</span>
                 </div>
             `);
 
+            // Click on chip opens library tab
             $chip.on("click", () => {
                 switchTab("lib");
                 $(document).trigger("rst:select-character", [charId]);
             });
 
-            $section.append($chip);
-        }
+            // Click on remove button removes character from presence
+            $chip.find(".rst-present-remove").on("click", async (e) => {
+                e.stopPropagation();
+                const idToRemove = $(e.target).data("char-id");
+                const filtered = getPresentCharacters().filter((id) => id !== idToRemove);
+                savePresentCharacters(filtered);
+                const { updateInjection } = await import("../inject/promptInjector.js");
+                updateInjection();
+                renderChips();
+                populateAddDropdown();
+            });
 
-        $section.append(
-            '<div style="font-size:12px;color:var(--rst-text-muted);padding:6px 2px;margin-bottom:12px">No other characters detected in current context.</div>'
-        );
+            $chipContainer.append($chip);
+        }
     }
+
+    // Add character row — same pattern as Scenes tab
+    const $addRow = $(`
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+            <select id="rst-present-add-select" style="flex:1;font-size:12px;padding:4px 6px;border:0.5px solid var(--rst-border);border-radius:6px;background:transparent;color:inherit">
+                <option value="">— Add character —</option>
+            </select>
+            <button id="rst-present-add-btn" class="rst-btn" style="font-size:11px;padding:3px 10px" disabled>+</button>
+        </div>
+    `);
+    const $addSelect = $addRow.find("#rst-present-add-select");
+    const $addBtn = $addRow.find("#rst-present-add-btn");
+
+    function populateAddDropdown() {
+        const currentIds = getPresentCharacters();
+        const allChars = getAllCharacters();
+        const available = allChars.filter((c) => !currentIds.includes(c.id));
+        $addSelect.find("option:not([value=''])").remove();
+        for (const c of available) {
+            $addSelect.append(`<option value="${c.id}">${c.name}</option>`);
+        }
+        $addSelect.val("");
+        $addBtn.prop("disabled", true);
+    }
+
+    $addSelect.on("change", function () {
+        $addBtn.prop("disabled", !$(this).val());
+    });
+
+    $addBtn.on("click", async () => {
+        const newId = $addSelect.val();
+        if (!newId) return;
+        const currentIds = getPresentCharacters();
+        if (!currentIds.includes(newId)) {
+            const updatedIds = [...currentIds, newId];
+            savePresentCharacters(updatedIds);
+            const { updateInjection } = await import("../inject/promptInjector.js");
+            updateInjection();
+            renderChips();
+            populateAddDropdown();
+        }
+    });
+
+    renderChips();
+    populateAddDropdown();
+
+    $section.append($addRow);
 
     const $libBtn = $('<button class="rst-btn">Open character library</button>');
     $libBtn.on("click", () => switchTab("lib"));

@@ -9,7 +9,7 @@
 import { chat } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
 import { makeRequest, reportProgress, updateRateLimiterSettings } from "./connections.js";
-import { getSettings } from "../data/storage.js";
+import { getSettings, getNameBlacklist } from "../data/storage.js";
 import { getScenes, saveScenes } from "../data/storage.js";
 import { findCharacterByName, findCharacterByFuzzyName, createCharacter, updateCharacterStats, getCharacterProfile, addUpdateLogEntry, updateCharacterProfile, getAllCharacters, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { initSceneCounter, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
@@ -163,7 +163,7 @@ export async function runBatchScan() {
     // Phase 2: Create profiles for unknown characters (filtering out {{user}} and resolved names)
     // Detect the user's persona name from chat messages
     const userNameFromChat = allMessages.find(m => m.is_user)?.name || "";
-    const blacklistNames = (settings.nameBlacklist || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+    const blacklistNames = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
     const userNamesToExclude = new Set([...EXCLUDED_NAMES, userNameFromChat, ...blacklistNames]);
     const profilesCreated = [];
     const allCharNames = new Set();
@@ -455,7 +455,7 @@ async function detectScenes(allMessages, ranges, profileName, settings, combineR
 
     // When combineRanges is enabled, merge all small ranges into a single API call
     // Build blacklist set for scene detection character filtering
-    const _blacklistNames = (settings.nameBlacklist || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+    const _blacklistNames = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
     const _sceneBlacklist = new Set(_blacklistNames);
 
     if (combineRanges && ranges.length > 1) {

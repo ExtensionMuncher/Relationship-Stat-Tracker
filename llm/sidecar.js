@@ -6,7 +6,7 @@
 import { chat } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
 import { makeRequest } from "./connections.js";
-import { getSettings } from "../data/storage.js";
+import { getSettings, getNameBlacklist } from "../data/storage.js";
 import { getAllCharacters, getCharacterNameVariants, findCharacterByFuzzyName } from "../data/characters.js";
 
 // ─── Sidecar Detection ────────────────────────────────────
@@ -153,7 +153,7 @@ function categorizeNames(detectedNames, knownNames) {
     // Build exclusion set: persona name + settings blacklist + hardcoded placeholders
     const settings = getSettings();
     const personaName = (getContext().name1 || "").toLowerCase().trim();
-    const blacklistNames = (settings.nameBlacklist || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+    const blacklistNames = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
     const excludedNames = new Set(["{{user}}", "user", "User", personaName, ...blacklistNames]);
 
     // Helper: check if a name should be excluded

@@ -283,7 +283,7 @@ function renderCharacterCard($pane, profile) {
                 to match LLM output (e.g. "Gojo") against your library entry (e.g. "Satoru Gojo").
             </div>
             <input type="text" class="rst-char-aliases" value="${aliasesStr}"
-                style="width:100%;padding:4px 6px;font-size:12px"
+                style="width:100%;padding:4px 6px;font-size:12px;background:transparent;color:inherit"
                 placeholder="e.g. Gojo, Satoru">
         </div>
     `);

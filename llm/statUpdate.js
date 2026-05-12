@@ -7,7 +7,7 @@
 import { chat } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
 import { makeRequest } from "./connections.js";
-import { getSettings } from "../data/storage.js";
+import { getSettings, getNameBlacklist } from "../data/storage.js";
 import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneTitle } from "../data/scenes.js";
 
@@ -807,7 +807,7 @@ function getSceneCharacters(scene) {
     // Build exclusion set: persona name + settings blacklist
     const settings = getSettings();
     const personaName = (getContext().name1 || "").toLowerCase().trim();
-    const blacklistNames = (settings.nameBlacklist || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+    const blacklistNames = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
     const excludedNames = new Set(["{{user}}", "user", "User", personaName, ...blacklistNames]);
 
     // Helper: check if a name is excluded

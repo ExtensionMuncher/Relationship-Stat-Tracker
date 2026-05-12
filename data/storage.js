@@ -212,6 +212,25 @@ export function savePresentCharacters(charIds) {
 }
 
 /**
+ * Get the per-chat name blacklist.
+ * @returns {Array<string>}
+ */
+export function getNameBlacklist() {
+    ensureChatNamespace();
+    return chat_metadata[NAMESPACE].nameBlacklist || [];
+}
+
+/**
+ * Save the per-chat name blacklist.
+ * @param {Array<string>} names
+ */
+export function saveNameBlacklist(names) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].nameBlacklist = names;
+    saveChatDebounced();
+}
+
+/**
  * Get the message counter for sidecar scan frequency.
  * @returns {number}
  */
@@ -265,7 +284,6 @@ export function getDefaultSettings() {
 
         scanFrequency: 5,
         newCharPopup: true,
-        nameBlacklist: [],
         statChangeRange: { min: -5, max: 5 },
         sceneSummaryPrompt:
             "Write a concise scene summary for internal reference. Include: key events, emotional turning points, characters present, and any significant relationship shifts. Keep it clinical and factual — this is a note for future analysis, not a narrative retelling.",

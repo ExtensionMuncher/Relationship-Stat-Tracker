@@ -3,7 +3,7 @@
  * Renders the Settings tab with connection profiles, scan settings, injection settings, etc.
  */
 
-import { getSettings, saveSetting } from "../data/storage.js";
+import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist } from "../data/storage.js";
 import { setSetting, isEnabled, exportAllData, importAllData } from "../settings.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 
@@ -475,8 +475,8 @@ function renderDetectionSettings($pane, settings) {
         </div>
     `);
 
-    // Name blacklist
-    const blacklistStr = (settings.nameBlacklist || []).join(", ");
+    // Name blacklist (per-chat)
+    const blacklistStr = (getNameBlacklist() || []).join(", ");
     $card.append(`
         <div class="rst-setting-row" style="border-bottom:none">
             <div>
@@ -507,7 +507,7 @@ function renderDetectionSettings($pane, settings) {
             .split(",")
             .map((s) => s.trim())
             .filter(Boolean);
-        saveSetting("nameBlacklist", list);
+        saveNameBlacklist(list);
     });
 }
 
