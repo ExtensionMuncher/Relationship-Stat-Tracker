@@ -272,10 +272,32 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
                 const content = response.choices[0].message.content;
                 const reasoning = response.choices[0].message.reasoning;
                 // Some providers (e.g. GLM/Ollama) return empty content with a reasoning field
-                if (content || !reasoning) {
-                    return content;
+                if (!content && reasoning) {
+                    return reasoning;
                 }
-                return reasoning;
+                // Thinking/reasoning models (e.g. Gemma, DeepSeek-R1) may put
+                // chain-of-thought in `content` and the actual answer in `reasoning`.
+                // Detect this case: if both exist and content looks like prose/thinking
+                // rather than the requested structured output, prefer reasoning.
+                if (content && reasoning) {
+                    const trimmedContent = (content || "").trim();
+                    const trimmedReasoning = (reasoning || "").trim();
+                    // If content looks like thinking prose (doesn't start with JSON)
+                    // but reasoning starts with JSON, prefer reasoning.
+                    const contentLooksLikeJSON = /^\s*[\[{]/.test(trimmedContent);
+                    const reasoningLooksLikeJSON = /^\s*[\[{]/.test(trimmedReasoning);
+                    if (!contentLooksLikeJSON && reasoningLooksLikeJSON) {
+                        console.log("[RST] makeRequest: content appears to be thinking prose, preferring reasoning field as answer");
+                        return trimmedReasoning;
+                    }
+                    // If both are prose but reasoning is shorter (likely the answer),
+                    // still prefer reasoning as it's less likely to be the thinking trace.
+                    if (!contentLooksLikeJSON && !reasoningLooksLikeJSON && trimmedReasoning.length < trimmedContent.length) {
+                        console.log("[RST] makeRequest: both fields are prose, preferring shorter reasoning field as answer");
+                        return trimmedReasoning;
+                    }
+                }
+                return content;
             }
             // Simple { content: "..." } format (TextCompletion or some ST versions)
             if (response.content !== undefined) {

@@ -14,9 +14,22 @@ import { getCharacterProfile, getAllCharacters, STAT_CATEGORIES, STAT_NAMES } fr
 const PROMPT_ID = "rst-stat-block";
 const LIBRARY_REF_KEY = "rst-library-reference";
 
+/**
+ * Preview keys — ALWAYS injected at IN_PROMPT (position 0).
+ * ST's Prompt section inspect view only shows extension prompts that are
+ * in the system prompt collection (IN_PROMPT or BEFORE_PROMPT).  IN_CHAT
+ * prompts are excluded.  To make RST's content visible in the Prompt
+ * section preview (the same way Author's Note appears), we register
+ * second entries at IN_PROMPT.  This follows ST's own dual-registration
+ * pattern used by Author's Note.
+ */
+const PROMPT_PREVIEW_KEY = "rst-stat-block-preview";
+const LIBRARY_PREVIEW_KEY = "rst-library-reference-preview";
+
 // ST extension prompt roles
 const ROLE_SYSTEM = 0;
 const POSITION_IN_CHAT = 1;
+const POSITION_IN_PROMPT = 0;
 
 // Internal generation flag — prevents self-injection during RST's own API calls
 let _isRSTInternalGen = false;
@@ -76,6 +89,11 @@ export function updateInjection() {
     const position = PLACEMENT_MAP[settings.injection.placement] || 1;
     setExtensionPrompt(PROMPT_ID, content, position, 0, false, ROLE_SYSTEM);
 
+    // Preview key — always at IN_PROMPT so stat block content is visible
+    // in the Prompt section inspect view (under Main Prompt), the same way
+    // Author's Note appears there.
+    setExtensionPrompt(PROMPT_PREVIEW_KEY, content, POSITION_IN_PROMPT, 0, false, ROLE_SYSTEM);
+
     // Passive library reference for ALL characters
     updatePassiveLibraryRef();
 }
@@ -85,7 +103,9 @@ export function updateInjection() {
  */
 export function removeInjection() {
     setExtensionPrompt(PROMPT_ID, "", 0, 0, false, ROLE_SYSTEM);
+    setExtensionPrompt(PROMPT_PREVIEW_KEY, "", 0, 0, false, ROLE_SYSTEM);
     setExtensionPrompt(LIBRARY_REF_KEY, "", 0, 0, false, ROLE_SYSTEM);
+    setExtensionPrompt(LIBRARY_PREVIEW_KEY, "", 0, 0, false, ROLE_SYSTEM);
 }
 
 // ─── Passive Library Reference ────────────────────────────
@@ -101,18 +121,21 @@ export function updatePassiveLibraryRef() {
     const settings = getSettings();
     if (!settings.enabled || !settings.injection.passiveLibraryRef) {
         setExtensionPrompt(LIBRARY_REF_KEY, "", 0, 0, false, ROLE_SYSTEM);
+        setExtensionPrompt(LIBRARY_PREVIEW_KEY, "", 0, 0, false, ROLE_SYSTEM);
         return;
     }
 
     const allChars = getAllCharacters();
     if (allChars.length === 0) {
         setExtensionPrompt(LIBRARY_REF_KEY, "", 0, 0, false, ROLE_SYSTEM);
+        setExtensionPrompt(LIBRARY_PREVIEW_KEY, "", 0, 0, false, ROLE_SYSTEM);
         return;
     }
 
     const block = buildLibraryBlock(allChars);
     if (!block) {
         setExtensionPrompt(LIBRARY_REF_KEY, "", 0, 0, false, ROLE_SYSTEM);
+        setExtensionPrompt(LIBRARY_PREVIEW_KEY, "", 0, 0, false, ROLE_SYSTEM);
         return;
     }
 
@@ -126,6 +149,10 @@ export function updatePassiveLibraryRef() {
     // IN_CHAT position at configurable depth, configurable role, no WI scan, with injection filter
     // Filter prevents the library block from being injected during RST's own API calls
     setExtensionPrompt(LIBRARY_REF_KEY, block, POSITION_IN_CHAT, depth, false, role, libraryRefFilter);
+
+    // Preview key — always at IN_PROMPT so library reference content is visible
+    // in the Prompt section inspect view.
+    setExtensionPrompt(LIBRARY_PREVIEW_KEY, block, POSITION_IN_PROMPT, 0, false, ROLE_SYSTEM);
 }
 
 /**

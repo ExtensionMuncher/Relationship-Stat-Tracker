@@ -93,6 +93,9 @@ jQuery(async () => {
             });
         });
 
+        // 9a. Register the entry in ST's magic wand menu (chatbar dropdown)
+        registerMagicWandMenuEntry();
+
         // 9. Listen for tab switches to refresh content
         $(document).on("rst:tab-switched", (_e, tabId) => {
             const $pane = getPane(tabId);
@@ -239,33 +242,41 @@ async function onMessageReceived(mesId) {
                 return !EXCLUDED_NAMES.has(n) && !_rejectedNames.has(n);
             });
 
-            // Build detected character IDs — use fuzzy matching so library entries
-            // with full names (e.g. "Satoru Gojo") match short-form LLM output (e.g. "Gojo")
-            // BUGFIX: Map BOTH detected (names from categorizeNames) and unknown (names from LLM)
-            // to character IDs. Previously, filteredDetected contained raw name strings while
-            // filteredUnknown was mapped to IDs, creating a mixed array that caused
-            // getCharacterProfile() to fail on name entries (characters are keyed by ID, not name).
-            const allNames = [...filteredDetected, ...filteredUnknown];
-            const newDetected = allNames.map((name) => {
-                const existing = findCharacterByFuzzyName(name) || findCharacterByName(name);
-                return existing ? existing.id : null;
-            }).filter(Boolean);
-
-            // Handle unknown characters — with rejection tracking to prevent repeat popups.
-            // When a character is created (or already exists in the library), add its ID to
-            // newDetected so it gets registered as "present" immediately.
+            // Build detected character IDs:
+            // - filteredDetected: already canonical names from categorizeNames() — map directly
+            //   via exact name match (no need to re-fuzzy-match, that was already done in
+            //   categorizeNames() which does exact variant + fuzzy matching).
+            // - filteredUnknown: raw LLM names that didn't match any known character —
+            //   give them ONE pass of fuzzy matching as a second chance.
+            const detectedIds = new Set();
+            for (const name of filteredDetected) {
+                const existing = findCharacterByName(name);
+                if (existing) {
+                    detectedIds.add(existing.id);
+                }
+            }
             for (const unknownName of filteredUnknown) {
                 const existing = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
-                if (existing) {
-                    // Character already exists in library — include as present
-                    newDetected.push(existing.id);
-                } else if (settings.newCharPopup) {
+                if (existing && !detectedIds.has(existing.id)) {
+                    detectedIds.add(existing.id);
+                }
+            }
+
+            // Handle truly unknown characters — with rejection tracking to prevent repeat popups.
+            let newDetected = [...detectedIds];
+            for (const unknownName of filteredUnknown) {
+                // Skip names that already matched via fuzzy matching above
+                const alreadyMatched = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
+                if (alreadyMatched) continue;
+
+                if (settings.newCharPopup) {
                     const created = await showNewCharacterDetected(unknownName);
                     if (created) {
                         // Character was created — re-find and include as present
                         const newChar = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
-                        if (newChar) {
+                        if (newChar && !detectedIds.has(newChar.id)) {
                             newDetected.push(newChar.id);
+                            detectedIds.add(newChar.id);
                         }
                     } else {
                         // User clicked "Ignore" — track to prevent repeat popups this session
@@ -507,6 +518,171 @@ function addSceneButtons(mesId) {
 
     $messageBar.prepend($endBtn);
     $messageBar.prepend($startBtn);
+}
+
+// ─── Slash Commands ───────────────────────────────────────
+
+// ─── Magic Wand Menu Entry (Chat Bar Popout) ─────────────
+
+/**
+ * Reference to the popout visibility flag.
+ * @type {boolean}
+ */
+let rstPopoutVisible = false;
+
+/**
+ * Reference to the RST popout jQuery element.
+ * @type {jQuery|null}
+ */
+let $rstPopout = null;
+
+/**
+ * Adds an entry for RST in ST's magic wand dropdown (#extensionsMenu).
+ * Third-party extensions are NOT auto-discovered in the wand menu — each
+ * extension must self-register. This follows the same pattern used by
+ * TypefaceR, Extension-Notebook, and Narrative-World-State-Tracker.
+ *
+ * Clicking the wand entry toggles a standalone floating popup (TypefaceR
+ * pattern) — it does NOT open the sidebar extensions drawer.
+ */
+function registerMagicWandMenuEntry() {
+    const menu = document.getElementById('extensionsMenu');
+    if (!menu) {
+        console.log('[RST] Magic wand menu (#extensionsMenu) not found — cannot register wand entry.');
+        return;
+    }
+
+    // Prevent duplicate entries if init is somehow called again
+    if (document.getElementById('rst-wand-entry')) {
+        return;
+    }
+
+    const entry = document.createElement('div');
+    entry.id = 'rst-wand-entry';
+    entry.className = 'list-group-item flex-container flexGap5 interactable';
+    entry.title = 'Open Relationship Stat Tracker';
+    entry.tabIndex = 0;
+    entry.innerHTML = `
+        <i class="fa-solid fa-heart"></i>
+        <span>Relationship Stats</span>
+    `;
+
+    // NOTE: No e.stopPropagation() here — that would prevent the magic wand
+    // dropdown from closing. ST's extensions.js listens for clicks on $('html')
+    // to close the dropdown, and stopPropagation() blocks that handler.
+    entry.addEventListener('click', function () {
+        // Toggle the standalone floating popup — NOT the sidebar drawer
+        if (rstPopoutVisible) {
+            closeRstPopout();
+        } else {
+            openRstPopout();
+        }
+    });
+
+    menu.appendChild(entry);
+    console.log('[RST] Magic wand menu entry registered.');
+}
+
+/**
+ * Opens a standalone floating popup (like TypefaceR's popout) that contains
+ * the RST panel content. This is the pattern used by ALL third-party
+ * extensions in ST's magic wand menu — they open their own independent
+ * floating UI, NOT the sidebar extensions drawer.
+ *
+ * IMPORTANT: The drawer content is MOVED (not cloned) to the popout to avoid
+ * duplicate-ID issues. The `buildTab()` functions in ui/panel.js use
+ * document.getElementById() which only finds the FIRST element with that ID.
+ * Cloning creates duplicates — buildTab() would populate the hidden original
+ * instead of the visible clone. Moving avoids this entirely. When the popout
+ * closes, the content is moved back to the sidebar drawer.
+ *
+ * References:
+ *   - TypefaceR:  openPopout() clones drawer content into a draggable popup
+ *   - Notebook:   creates a panel in #movingDivs and toggles its visibility
+ */
+function openRstPopout() {
+    if (rstPopoutVisible) return;
+
+    const $drawerContent = $('#rst_container .inline-drawer-content');
+    if ($drawerContent.length === 0) {
+        console.log('[RST] Drawer content not found — cannot open popout.');
+        return;
+    }
+
+    // Create the floating popup container (matches TypefaceR pattern)
+    $rstPopout = $(`
+        <div id="rst-popout" class="draggable">
+            <div id="rst-popout-header" class="rst-popout-header">
+                <div class="rst-popout-title">
+                    <i class="fa-solid fa-heart"></i>
+                    <span>Relationship Stat Tracker</span>
+                </div>
+                <div class="rst-popout-close" title="Close">
+                    <i class="fa-solid fa-xmark"></i>
+                </div>
+            </div>
+            <div id="rst-popout-content"></div>
+        </div>
+    `);
+
+    // Append to body
+    $('body').append($rstPopout);
+
+    // ── MOVE the drawer content into the popout (do NOT clone) ──
+    // Cloning creates duplicate IDs, and buildTab() uses document.getElementById()
+    // which only finds the first (hidden) element. Moving ensures no duplicates.
+    const popoutContent = $rstPopout.find('#rst-popout-content')[0];
+    const drawerContentEl = $drawerContent[0];
+    // Detach from sidebar drawer and append to popout
+    popoutContent.appendChild(drawerContentEl);
+
+    // Close button handler
+    $rstPopout.find('.rst-popout-close').on('click', closeRstPopout);
+
+    // Close on Escape key
+    $(document).on('keydown.rst_popout', (e) => {
+        if (e.key === 'Escape') {
+            closeRstPopout();
+        }
+    });
+
+    // Make draggable using ST's built-in dragElement (from RossAscends-mods.js)
+    if (typeof window.dragElement === 'function') {
+        window.dragElement($rstPopout);
+    }
+
+    // Fade in
+    $rstPopout.fadeIn(200);
+    rstPopoutVisible = true;
+    console.log('[RST] Popout opened.');
+}
+
+function closeRstPopout() {
+    if (!rstPopoutVisible || !$rstPopout) return;
+
+    // ── Move the content back to the sidebar drawer ──
+    const popoutContent = document.getElementById('rst-popout-content');
+    const drawerContent = popoutContent?.firstElementChild; // .inline-drawer-content
+
+    $rstPopout.fadeOut(200, () => {
+        // Move content back inside the original .inline-drawer parent
+        // (NOT #rst_container — content was originally a child of .inline-drawer)
+        if (drawerContent) {
+            const $drawerParent = $('#rst_container .inline-drawer');
+            if ($drawerParent.length > 0) {
+                $drawerParent.append(drawerContent);
+            } else {
+                // Fallback: just append to #rst_container if .inline-drawer is gone
+                $('#rst_container').append(drawerContent);
+            }
+        }
+        $rstPopout.remove();
+        $rstPopout = null;
+    });
+
+    rstPopoutVisible = false;
+    $(document).off('keydown.rst_popout');
+    console.log('[RST] Popout closed.');
 }
 
 // ─── Slash Commands ───────────────────────────────────────
