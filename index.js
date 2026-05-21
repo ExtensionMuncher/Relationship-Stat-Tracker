@@ -6,6 +6,7 @@
 import {
     chat,
     chat_metadata,
+    name1,
     saveSettingsDebounced,
     saveChatDebounced,
 } from "../../../../script.js";
@@ -14,8 +15,8 @@ import { eventSource, event_types } from "../../../../scripts/events.js";
 import { extension_settings } from "../../../../scripts/extensions.js";
 
 import { initSettings, isEnabled, getSetting } from "./settings.js";
-import { getSettings, getPresentCharacters, savePresentCharacters, getMessageCounter, incrementMessageCounter, getPendingUpdates, savePendingUpdates } from "./data/storage.js";
-import { createCharacter, findCharacterByName } from "./data/characters.js";
+import { getSettings, getPresentCharacters, savePresentCharacters, getNameBlacklist, getMessageCounter, incrementMessageCounter, getPendingUpdates, savePendingUpdates } from "./data/storage.js";
+import { createCharacter, findCharacterByName, findCharacterByFuzzyName } from "./data/characters.js";
 import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary, updateSceneTitle } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
 import { generateStatUpdate } from "./llm/statUpdate.js";
@@ -33,6 +34,11 @@ const EXTENSION_NAME = "rst";
 // ─── Re-entrancy guard ───────────────────────────────────
 // Prevents overlapping sidecar detection calls that could cause connection profile churn
 let _sidecarRunning = false;
+
+// ─── Rejected names (in-memory, session-only) ────────────
+// Names the user clicked "Ignore" on in the new-character popup.
+// Prevents repeated popups for the same name within a session.
+const _rejectedNames = new Set();
 
 // ─── jQuery Extension init ────────────────────────────────
 
@@ -87,6 +93,9 @@ jQuery(async () => {
             });
         });
 
+        // 9a. Register the entry in ST's magic wand menu (chatbar dropdown)
+        registerMagicWandMenuEntry();
+
         // 9. Listen for tab switches to refresh content
         $(document).on("rst:tab-switched", (_e, tabId) => {
             const $pane = getPane(tabId);
@@ -115,8 +124,19 @@ jQuery(async () => {
         $(document).on("rst:toggle", (_e, enabled) => {
             if (enabled) {
                 updateInjection();
+                $(".rst-scene-btn").show();
+                $(".rst-scene-btn").prop("disabled", false);
+                $("body").removeClass("rst-disabled");
+                $("#rst_container").css({ opacity: "", pointerEvents: "", userSelect: "" });
             } else {
                 removeInjection();
+                $(".rst-scene-btn").hide();
+                $(".rst-scene-btn").prop("disabled", true);
+                $("body").addClass("rst-disabled");
+                $("#rst_container").css({ opacity: "0.45", pointerEvents: "none", userSelect: "none" });
+                // Keep the toggle switch itself clickable
+                $("#rst_container .rst-toggle").css({ pointerEvents: "auto", cursor: "pointer" });
+                $("#rst_container .rst-toggle *").css({ pointerEvents: "auto" });
             }
         });
 
@@ -201,22 +221,68 @@ async function onMessageReceived(mesId) {
 
             console.log("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length);
 
-            // Filter out {{user}} from detected and unknown names
-            const EXCLUDED_NAMES = new Set(["{{user}}", "user", "User"]);
-            const filteredDetected = result.detected.filter((name) => !EXCLUDED_NAMES.has(name));
-            const filteredUnknown = result.unknown.filter((name) => !EXCLUDED_NAMES.has(name));
+            // Build exclusion set from ST user persona name + hardcoded placeholders + per-chat blacklist
+            const personaName = (name1 || "").toLowerCase().trim();
+            const blacklist = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+            const EXCLUDED_NAMES = new Set([
+                "{{user}}",
+                "user",
+                "User",
+                personaName,
+                ...blacklist,
+            ]);
 
-            // Build detected character IDs
-            const newDetected = [...filteredDetected, ...filteredUnknown.map((name) => {
+            // Filter out excluded and previously-rejected names
+            const filteredDetected = result.detected.filter((name) => {
+                const n = name.toLowerCase().trim();
+                return !EXCLUDED_NAMES.has(n) && !_rejectedNames.has(n);
+            });
+            const filteredUnknown = result.unknown.filter((name) => {
+                const n = name.toLowerCase().trim();
+                return !EXCLUDED_NAMES.has(n) && !_rejectedNames.has(n);
+            });
+
+            // Build detected character IDs:
+            // - filteredDetected: already canonical names from categorizeNames() — map directly
+            //   via exact name match (no need to re-fuzzy-match, that was already done in
+            //   categorizeNames() which does exact variant + fuzzy matching).
+            // - filteredUnknown: raw LLM names that didn't match any known character —
+            //   give them ONE pass of fuzzy matching as a second chance.
+            const detectedIds = new Set();
+            for (const name of filteredDetected) {
                 const existing = findCharacterByName(name);
-                return existing ? existing.id : null;
-            })].filter(Boolean);
-
-            // Handle unknown characters
+                if (existing) {
+                    detectedIds.add(existing.id);
+                }
+            }
             for (const unknownName of filteredUnknown) {
-                const existing = findCharacterByName(unknownName);
-                if (!existing && settings.newCharPopup) {
-                    showNewCharacterDetected(unknownName);
+                const existing = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
+                if (existing && !detectedIds.has(existing.id)) {
+                    detectedIds.add(existing.id);
+                }
+            }
+
+            // Handle truly unknown characters — with rejection tracking to prevent repeat popups.
+            let newDetected = [...detectedIds];
+            for (const unknownName of filteredUnknown) {
+                // Skip names that already matched via fuzzy matching above
+                const alreadyMatched = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
+                if (alreadyMatched) continue;
+
+                if (settings.newCharPopup) {
+                    const created = await showNewCharacterDetected(unknownName);
+                    if (created) {
+                        // Character was created — re-find and include as present
+                        const newChar = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
+                        if (newChar && !detectedIds.has(newChar.id)) {
+                            newDetected.push(newChar.id);
+                            detectedIds.add(newChar.id);
+                        }
+                    } else {
+                        // User clicked "Ignore" — track to prevent repeat popups this session
+                        _rejectedNames.add(unknownName.toLowerCase().trim());
+                        console.log("[RST] Name rejected by user, added to session rejection set:", unknownName);
+                    }
                 }
             }
 
@@ -227,18 +293,21 @@ async function onMessageReceived(mesId) {
 
             if (changed) {
                 console.log("[RST] Present characters changed — old:", currentPresent.length, "new:", newDetected.length, ". Updating.");
-                if (newDetected.length > 0) {
-                    savePresentCharacters(newDetected);
-                }
+                // Always save — if empty, clears the present list; if non-empty, updates it
+                savePresentCharacters(newDetected);
                 updateInjection();
             } else {
                 console.log("[RST] Present characters unchanged — skipping injection update.");
             }
 
-            // Refresh Home tab if visible
+            // Refresh both Home and Library tabs if visible so present-indicator UI stays in sync
             const $homePane = getPane("home");
             if ($homePane.hasClass("on")) {
                 renderHomeTab($homePane);
+            }
+            const $libPane = getPane("lib");
+            if ($libPane.hasClass("on")) {
+                renderLibraryTab($libPane);
             }
         } catch (err) {
             console.error("[RST] Sidecar detection error:", err);
@@ -333,6 +402,8 @@ function migrateGlobalCharacters() {
  * @param {number} mesId
  */
 function addSceneButtons(mesId) {
+    if (!isEnabled()) return;
+
     const $messageBar = $(`.mes[mesid="${mesId}"] .extraMesButtons`);
     if ($messageBar.length === 0) return;
 
@@ -371,6 +442,13 @@ function addSceneButtons(mesId) {
         const alreadyStartsScene = allScenes.some((s) => s.messageStart === mesId);
         if (alreadyStartsScene) {
             toastr?.warning?.(`Message ${mesId} already starts a scene.`);
+            return;
+        }
+
+        // Prevent starting a scene on a message that's already part of a closed scene
+        const alreadyInScene = allScenes.some((s) => s.status === "closed" && isMessageInScene(s, mesId));
+        if (alreadyInScene) {
+            toastr?.warning?.("This message is already part of a closed scene.");
             return;
         }
 
@@ -440,6 +518,171 @@ function addSceneButtons(mesId) {
 
     $messageBar.prepend($endBtn);
     $messageBar.prepend($startBtn);
+}
+
+// ─── Slash Commands ───────────────────────────────────────
+
+// ─── Magic Wand Menu Entry (Chat Bar Popout) ─────────────
+
+/**
+ * Reference to the popout visibility flag.
+ * @type {boolean}
+ */
+let rstPopoutVisible = false;
+
+/**
+ * Reference to the RST popout jQuery element.
+ * @type {jQuery|null}
+ */
+let $rstPopout = null;
+
+/**
+ * Adds an entry for RST in ST's magic wand dropdown (#extensionsMenu).
+ * Third-party extensions are NOT auto-discovered in the wand menu — each
+ * extension must self-register. This follows the same pattern used by
+ * TypefaceR, Extension-Notebook, and Narrative-World-State-Tracker.
+ *
+ * Clicking the wand entry toggles a standalone floating popup (TypefaceR
+ * pattern) — it does NOT open the sidebar extensions drawer.
+ */
+function registerMagicWandMenuEntry() {
+    const menu = document.getElementById('extensionsMenu');
+    if (!menu) {
+        console.log('[RST] Magic wand menu (#extensionsMenu) not found — cannot register wand entry.');
+        return;
+    }
+
+    // Prevent duplicate entries if init is somehow called again
+    if (document.getElementById('rst-wand-entry')) {
+        return;
+    }
+
+    const entry = document.createElement('div');
+    entry.id = 'rst-wand-entry';
+    entry.className = 'list-group-item flex-container flexGap5 interactable';
+    entry.title = 'Open Relationship Stat Tracker';
+    entry.tabIndex = 0;
+    entry.innerHTML = `
+        <i class="fa-solid fa-heart"></i>
+        <span>Relationship Stats</span>
+    `;
+
+    // NOTE: No e.stopPropagation() here — that would prevent the magic wand
+    // dropdown from closing. ST's extensions.js listens for clicks on $('html')
+    // to close the dropdown, and stopPropagation() blocks that handler.
+    entry.addEventListener('click', function () {
+        // Toggle the standalone floating popup — NOT the sidebar drawer
+        if (rstPopoutVisible) {
+            closeRstPopout();
+        } else {
+            openRstPopout();
+        }
+    });
+
+    menu.appendChild(entry);
+    console.log('[RST] Magic wand menu entry registered.');
+}
+
+/**
+ * Opens a standalone floating popup (like TypefaceR's popout) that contains
+ * the RST panel content. This is the pattern used by ALL third-party
+ * extensions in ST's magic wand menu — they open their own independent
+ * floating UI, NOT the sidebar extensions drawer.
+ *
+ * IMPORTANT: The drawer content is MOVED (not cloned) to the popout to avoid
+ * duplicate-ID issues. The `buildTab()` functions in ui/panel.js use
+ * document.getElementById() which only finds the FIRST element with that ID.
+ * Cloning creates duplicates — buildTab() would populate the hidden original
+ * instead of the visible clone. Moving avoids this entirely. When the popout
+ * closes, the content is moved back to the sidebar drawer.
+ *
+ * References:
+ *   - TypefaceR:  openPopout() clones drawer content into a draggable popup
+ *   - Notebook:   creates a panel in #movingDivs and toggles its visibility
+ */
+function openRstPopout() {
+    if (rstPopoutVisible) return;
+
+    const $drawerContent = $('#rst_container .inline-drawer-content');
+    if ($drawerContent.length === 0) {
+        console.log('[RST] Drawer content not found — cannot open popout.');
+        return;
+    }
+
+    // Create the floating popup container (matches TypefaceR pattern)
+    $rstPopout = $(`
+        <div id="rst-popout" class="draggable">
+            <div id="rst-popout-header" class="rst-popout-header">
+                <div class="rst-popout-title">
+                    <i class="fa-solid fa-heart"></i>
+                    <span>Relationship Stat Tracker</span>
+                </div>
+                <div class="rst-popout-close" title="Close">
+                    <i class="fa-solid fa-xmark"></i>
+                </div>
+            </div>
+            <div id="rst-popout-content"></div>
+        </div>
+    `);
+
+    // Append to body
+    $('body').append($rstPopout);
+
+    // ── MOVE the drawer content into the popout (do NOT clone) ──
+    // Cloning creates duplicate IDs, and buildTab() uses document.getElementById()
+    // which only finds the first (hidden) element. Moving ensures no duplicates.
+    const popoutContent = $rstPopout.find('#rst-popout-content')[0];
+    const drawerContentEl = $drawerContent[0];
+    // Detach from sidebar drawer and append to popout
+    popoutContent.appendChild(drawerContentEl);
+
+    // Close button handler
+    $rstPopout.find('.rst-popout-close').on('click', closeRstPopout);
+
+    // Close on Escape key
+    $(document).on('keydown.rst_popout', (e) => {
+        if (e.key === 'Escape') {
+            closeRstPopout();
+        }
+    });
+
+    // Make draggable using ST's built-in dragElement (from RossAscends-mods.js)
+    if (typeof window.dragElement === 'function') {
+        window.dragElement($rstPopout);
+    }
+
+    // Fade in
+    $rstPopout.fadeIn(200);
+    rstPopoutVisible = true;
+    console.log('[RST] Popout opened.');
+}
+
+function closeRstPopout() {
+    if (!rstPopoutVisible || !$rstPopout) return;
+
+    // ── Move the content back to the sidebar drawer ──
+    const popoutContent = document.getElementById('rst-popout-content');
+    const drawerContent = popoutContent?.firstElementChild; // .inline-drawer-content
+
+    $rstPopout.fadeOut(200, () => {
+        // Move content back inside the original .inline-drawer parent
+        // (NOT #rst_container — content was originally a child of .inline-drawer)
+        if (drawerContent) {
+            const $drawerParent = $('#rst_container .inline-drawer');
+            if ($drawerParent.length > 0) {
+                $drawerParent.append(drawerContent);
+            } else {
+                // Fallback: just append to #rst_container if .inline-drawer is gone
+                $('#rst_container').append(drawerContent);
+            }
+        }
+        $rstPopout.remove();
+        $rstPopout = null;
+    });
+
+    rstPopoutVisible = false;
+    $(document).off('keydown.rst_popout');
+    console.log('[RST] Popout closed.');
 }
 
 // ─── Slash Commands ───────────────────────────────────────

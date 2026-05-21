@@ -212,6 +212,25 @@ export function savePresentCharacters(charIds) {
 }
 
 /**
+ * Get the per-chat name blacklist.
+ * @returns {Array<string>}
+ */
+export function getNameBlacklist() {
+    ensureChatNamespace();
+    return chat_metadata[NAMESPACE].nameBlacklist || [];
+}
+
+/**
+ * Save the per-chat name blacklist.
+ * @param {Array<string>} names
+ */
+export function saveNameBlacklist(names) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].nameBlacklist = names;
+    saveChatDebounced();
+}
+
+/**
  * Get the message counter for sidecar scan frequency.
  * @returns {number}
  */
@@ -272,6 +291,12 @@ export function getDefaultSettings() {
         batchScan: {
             sceneDetectionMaxTokens: 4000,
             initialStatMaxTokens: 3000,
+            requestsPerMinute: 10,
+            maxRetries: 3,
+            baseRetryDelay: 1000,
+            perSceneDelay: 0,
+            interPhaseDelay: 0,
+            combineRanges: true,
         },
 
         injection: {

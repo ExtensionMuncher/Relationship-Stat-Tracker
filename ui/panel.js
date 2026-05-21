@@ -152,7 +152,7 @@ export function renderHomeHeader($pane) {
     const $header = $(`
         <div id="rst-header-wrap" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
             <div>
-                <div style="font-size:14px;font-weight:500">Relationship state tracker</div>
+                <div style="font-size:14px;font-weight:500">Relationship Stat Tracker</div>
                 <div id="rst-ext-lbl" style="font-size:11px;color:var(--rst-text-muted)">${statusText}</div>
             </div>
             <label class="rst-toggle">

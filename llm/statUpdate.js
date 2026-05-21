@@ -7,9 +7,31 @@
 import { chat } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
 import { makeRequest } from "./connections.js";
-import { getSettings } from "../data/storage.js";
-import { getCharacterProfile, getAllCharacters, findCharacterByName, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter } from "../data/characters.js";
+import { getSettings, getNameBlacklist } from "../data/storage.js";
+import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneTitle } from "../data/scenes.js";
+
+// ─── Auto-created Character Tracking ──────────────────────
+// Tracks which character IDs were auto-created during a generation cycle
+// so dismiss handlers can reliably clean them up without relying on
+// heuristic checks like `source === "auto_generated"`.
+/** @type {Set<string>} */
+let _autoCreatedIds = new Set();
+
+/**
+ * Get the set of auto-created character IDs from the current generation cycle.
+ * @returns {string[]}
+ */
+export function getAutoCreatedIds() {
+    return [..._autoCreatedIds];
+}
+
+/**
+ * Reset the auto-created IDs tracker for a new generation cycle.
+ */
+export function resetAutoCreatedIds() {
+    _autoCreatedIds = new Set();
+}
 
 // ─── Main Generation Function ─────────────────────────────
 
@@ -22,6 +44,9 @@ import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneT
  * @returns {Promise<object>} The full update result
  */
 export async function generateStatUpdate(sceneId, guidance = "") {
+    // Reset auto-created character tracker for this generation cycle
+    resetAutoCreatedIds();
+
     const settings = getSettings();
     const scene = getSceneById(sceneId);
     if (!scene) throw new Error(`Scene ${sceneId} not found`);
@@ -109,6 +134,7 @@ export async function generateStatUpdate(sceneId, guidance = "") {
             sceneTitle,
             summaryGuidance: guidance,
             characterUpdates,
+            autoCreatedIds: getAutoCreatedIds(),
         };
     } catch (err) {
         console.error("[RST] Stat update generation failed:", err);
@@ -158,9 +184,9 @@ function buildStatUpdateSystemPrompt(settings) {
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
         '- Range: -100 to 100. 0 = neutral.',
-        `- Change per scene: ${range.min} to ${range.max}.`,
-        '- Stats are NEW totals, not deltas.',
-        '- Commentary: explain each stat change from scene events.',
+        `- Each stat MUST stay within ${range.min} to ${range.max} points of its current (pre-scene) value. For example, if Trust is currently 30 and the range is -5 to +5, the new Trust must be between 25 and 35.`,
+        '- Stats are ABSOLUTE values (not deltas), but each must respect the per-scene change limit above.',
+        '- Commentary: provide a brief narrative explanation for each stat (describe WHY this character feels this way based on scene events). Do NOT describe how much a stat changed numerically.',
         '- Milestone: all four elements in a category cross 25/50/75/100%.',
     ].join('\n');
 }
@@ -191,7 +217,9 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
     // Current character stats
     parts.push("\nCURRENT CHARACTER STATS (character → {{user}} perspective):");
     for (const char of characters) {
-        parts.push(`\n${char.name}:`);
+        const aliases = getCharacterNameVariants(char).filter(a => a !== char.name.toLowerCase().trim());
+        const aliasStr = aliases.length > 0 ? ` (also known as: ${aliases.join(", ")})` : "";
+        parts.push(`\n${char.name}${aliasStr}:`);
         parts.push(`  Current dynamic title: "${char.dynamicTitle || "None"}"`);
         parts.push(`  Current narrative: "${char.narrativeSummary || "None"}"`);
         parts.push(`  Stats:`);
@@ -216,9 +244,15 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
         parts.push(`\nUSER GUIDANCE: ${guidance}`);
     }
 
-    // Character discovery instruction
+    // Character discovery instruction — be INCLUSIVE by default
     parts.push('');
-    parts.push('Also scan the messages for ANY additional characters (named individuals) who appear, speak, or are referenced. Include them in your characters object with full stat updates using the same schema.');
+    parts.push('CRITICAL — Scan for ALL additional characters:');
+    parts.push('- You MUST identify EVERY named individual who appears, speaks, interacts, or is described as doing something in the scene messages.');
+    parts.push('- INCLUDE characters who: speak dialogue, are addressed by name, perform actions described by another speaker, interact with someone in the scene, or are described as being physically present or doing an activity.');
+    parts.push('- Example of INCLUDE: a character says "I talked with [Name]" or "[Name] handed me the package" or "[Name] and I went to the store" — [Name] is described as interacting and should be included.');
+    parts.push('- Example of EXCLUDE: "I heard about [Name]\'s reputation" or "someone mentioned [Name] is tall" — [Name] is merely discussed with no described interaction.');
+    parts.push('- When in doubt, INCLUDE the character. It is better to include a character unnecessarily than to miss someone.');
+    parts.push('Include them in your characters object with full stat updates using the same schema.');
     parts.push('');
 
     // Force JSON-only output
@@ -260,7 +294,24 @@ function parseStatUpdateResponse(response, characters) {
     const characterUpdates = [];
 
     for (const char of characters) {
-        const charData = parsed.characters?.[char.name];
+        // Try exact canonical name first, then alias variants, then fuzzy match
+        let charData = parsed.characters?.[char.name];
+        if (!charData && char.nameAliases && Array.isArray(char.nameAliases)) {
+            for (const alias of char.nameAliases) {
+                charData = parsed.characters?.[alias];
+                if (charData) break;
+            }
+        }
+        if (!charData) {
+            // Try fuzzy match: find which key in parsed.characters matches this character
+            for (const [llmKey] of Object.entries(parsed.characters || {})) {
+                const matched = findCharacterByFuzzyName(llmKey);
+                if (matched && matched.id === char.id) {
+                    charData = parsed.characters[llmKey];
+                    break;
+                }
+            }
+        }
         if (!charData) {
             // Character not found in LLM response — create a no-change entry
             characterUpdates.push(createNoChangeEntry(char));
@@ -268,11 +319,18 @@ function parseStatUpdateResponse(response, characters) {
         }
 
         const statsBefore = cloneStats(char.stats);
-        const statsAfter = clampStats(charData.stats || char.stats);
+        const settings = getSettings();
+        const range = settings.statChangeRange || { min: -5, max: 5 };
+        // Merge LLM stats over existing stats so unmentioned ones don't default to 0
+        const mergedStats = mergeWithExistingStats(statsBefore, charData.stats || {});
+        const statsAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range);
         // Use LLM commentary if provided, otherwise generate fallback
+        // Pass char to preserve old commentary for unchanged stats
         let commentary = charData.commentary || null;
         if (!commentary || hasEmptyCommentary(commentary)) {
-            commentary = generateFallbackCommentary(statsBefore, statsAfter);
+            commentary = generateFallbackCommentary(statsBefore, statsAfter, char);
+        } else {
+            commentary = fillMissingCommentary(commentary, statsBefore, statsAfter, char);
         }
 
         // Count actual changes
@@ -297,30 +355,78 @@ function parseStatUpdateResponse(response, characters) {
     // Handle LLM-discovered characters (in parsed.characters but not in input list)
     if (parsed && parsed.characters) {
         const inputNames = new Set(characters.map(c => c.name));
+        const allKnownChars = getAllCharacters();
         for (const [llmName, llmData] of Object.entries(parsed.characters)) {
             if (!inputNames.has(llmName) && llmData && llmData.stats) {
-                console.log("[RST] LLM discovered additional character:", llmName);
-                const newChar = createCharacter(llmName, { source: "auto_generated" });
-                if (newChar) {
-                    const statsAfter = clampStats(llmData.stats);
+                const lowerLlmName = llmName.toLowerCase().trim();
+                // Check if this LLM name matches an existing character (by alias, exact name, or fuzzy word match)
+                const matchedExisting = allKnownChars.find(c => {
+                    if (c.name.toLowerCase().trim() === lowerLlmName) return true;
+                    if (c.nameAliases && Array.isArray(c.nameAliases)) {
+                        if (c.nameAliases.some(a => a.toLowerCase().trim() === lowerLlmName)) return true;
+                    }
+                    const cWords = c.name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
+                    const llmWords = lowerLlmName.split(/\s+/).filter(Boolean).sort().join(" ");
+                    return cWords === llmWords;
+                });
+                if (matchedExisting) {
+                    // Name matches existing character — create update entry instead of duplicate
+                    console.log(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating update entry`);
+                    const statsBefore = cloneStats(matchedExisting.stats);
+                    const settings = getSettings();
+                    const range = settings.statChangeRange || { min: -5, max: 5 };
+                    // Merge LLM stats over existing stats so unmentioned ones don't default to 0
+                    const mergedStats = mergeWithExistingStats(statsBefore, llmData.stats || {});
+                    const statsAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range);
                     let commentary = llmData.commentary || null;
                     if (!commentary || hasEmptyCommentary(commentary)) {
-                        commentary = generateFallbackCommentary({}, statsAfter);
+                        commentary = generateFallbackCommentary(statsBefore, statsAfter, matchedExisting);
+                    } else {
+                        commentary = fillMissingCommentary(commentary, statsBefore, statsAfter, matchedExisting);
                     }
+                    const changeCount = countChanges(statsBefore, statsAfter);
                     characterUpdates.push({
-                        characterId: newChar.id,
-                        characterName: newChar.name,
-                        statsBefore: null,
+                        characterId: matchedExisting.id,
+                        characterName: matchedExisting.name,
+                        statsBefore,
                         statsAfter,
                         commentary,
-                        dynamicTitleBefore: "",
-                        dynamicTitleAfter: llmData.dynamicTitle || "",
+                        dynamicTitleBefore: matchedExisting.dynamicTitle || "",
+                        dynamicTitleAfter: llmData.dynamicTitle || matchedExisting.dynamicTitle || "",
                         milestoneReached: llmData.milestoneReached || false,
                         milestoneDetail: llmData.milestoneDetail || "",
-                        narrativeSummary: llmData.narrativeSummary || "",
-                        source: "llm_discovered",
-                        changeCount: 12,
+                        narrativeSummary: llmData.narrativeSummary || matchedExisting.narrativeSummary || "",
+                        source: "llm",
+                        changeCount,
                     });
+                } else {
+                    // Truly new character — create new profile
+                    console.log("[RST] LLM discovered additional character:", llmName);
+                    const newChar = createCharacter(llmName, { source: "auto_generated" });
+                    if (newChar) {
+                        _autoCreatedIds.add(newChar.id);
+                        const statsAfter = clampStats(llmData.stats);
+                        let commentary = llmData.commentary || null;
+                        if (!commentary || hasEmptyCommentary(commentary)) {
+                            commentary = generateFallbackCommentary({}, statsAfter);
+                        } else {
+                            commentary = fillMissingCommentary(commentary, {}, statsAfter);
+                        }
+                        characterUpdates.push({
+                            characterId: newChar.id,
+                            characterName: newChar.name,
+                            statsBefore: null,
+                            statsAfter,
+                            commentary,
+                            dynamicTitleBefore: "",
+                            dynamicTitleAfter: llmData.dynamicTitle || "",
+                            milestoneReached: llmData.milestoneReached || false,
+                            milestoneDetail: llmData.milestoneDetail || "",
+                            narrativeSummary: llmData.narrativeSummary || "",
+                            source: "llm_discovered",
+                            changeCount: 12,
+                        });
+                    }
                 }
             }
         }
@@ -577,13 +683,13 @@ function parseStatUpdateAnalysisText(text, characters) {
                     const statMatch = statLine.match(statRegex);
                     if (statMatch) {
                         statsAfter[cat][stat] = Math.max(-100, Math.min(100, parseInt(statMatch[1], 10)));
-                    } else {
-                        statsAfter[cat][stat] = 0;
                     }
+                    // Don't default unmentioned stats to 0 — leave undefined
+                    // so mergeWithExistingStats can preserve current values
                 }
-            } else {
-                statsAfter[cat] = { trust: 0, openness: 0, support: 0, affection: 0 };
             }
+            // Don't default missing categories — leave undefined
+            // so mergeWithExistingStats preserves current values
         }
 
         if (!foundAnyStat) {
@@ -630,20 +736,27 @@ function parseStatUpdateAnalysisText(text, characters) {
         }
 
         const statsBefore = cloneStats(char.stats);
+        const settings = getSettings();
+        const range = settings.statChangeRange || { min: -5, max: 5 };
+        // Merge analysis-text stats over existing stats so unmentioned ones don't default to 0
+        const mergedStats = mergeWithExistingStats(statsBefore, statsAfter);
+        const clampedAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range);
+        // Preserve old commentary for unchanged stats via fillMissingCommentary
+        const filledCommentary = fillMissingCommentary(commentary, statsBefore, clampedAfter, char);
 
         characterUpdates.push({
             characterId: char.id,
             characterName: char.name,
             statsBefore,
-            statsAfter: clampStats(statsAfter),
-            commentary,
+            statsAfter: clampedAfter,
+            commentary: filledCommentary,
             dynamicTitleBefore: char.dynamicTitle || "",
             dynamicTitleAfter,
             milestoneReached: false,
             milestoneDetail: "",
             narrativeSummary: narrativeSummary || char.narrativeSummary || "",
             source: "llm_fallback",
-            changeCount: countChanges(statsBefore, statsAfter),
+            changeCount: countChanges(statsBefore, clampedAfter),
         });
     }
 
@@ -691,25 +804,55 @@ function getSceneCharacters(scene) {
     const foundIds = new Set();
     const unknownSpeakers = new Set();
 
+    // Build exclusion set: persona name + settings blacklist
+    const settings = getSettings();
+    const personaName = (getContext().name1 || "").toLowerCase().trim();
+    const blacklistNames = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
+    const excludedNames = new Set(["{{user}}", "user", "User", personaName, ...blacklistNames]);
+
+    // Helper: check if a name is excluded
+    function isExcluded(name) {
+        const n = (name || "").toLowerCase().trim();
+        return !n || excludedNames.has(n);
+    }
+
     // Step 1: Collect any characters already registered on the scene
     const charIds = scene.charactersPresent || [];
     for (const id of charIds) {
         const profile = getCharacterProfile(id);
-        if (profile) foundIds.add(id);
+        if (profile && !isExcluded(profile.name)) foundIds.add(id);
     }
 
-    // Step 2: Scan scene message speakers for additional characters
-    // This catches NPCs the sidecar may have missed (pre-existing chats,
-    // frequency-gated detection gaps, etc.)
+    // Step 2: Detect multi-character RP scenario
+    // In multi-character RP, all assistant messages share the same msg.name
+    // (the {{char}} card's display name), so scanning speaker names is useless.
+    // Detect: count unique non-user speaker names across scene messages.
+    const uniqueSpeakers = new Set();
     for (const msg of sceneMessages) {
-        const speaker = msg.name || "";
-        if (!speaker || msg.is_user) continue;
-        const match = allKnownChars.find((c) => c.name.toLowerCase().trim() === speaker.toLowerCase().trim());
-        if (match) {
-            foundIds.add(match.id);
-        } else {
-            unknownSpeakers.add(speaker);
+        if (msg.name && !msg.is_user) {
+            uniqueSpeakers.add(msg.name.toLowerCase().trim());
         }
+    }
+    const isMultiCharRP = uniqueSpeakers.size <= 1 && charIds.length > 1;
+    console.log(`[RST] getSceneCharacters: uniqueSpeakers=${uniqueSpeakers.size}, sceneHasChars=${charIds.length}, isMultiCharRP=${isMultiCharRP}`);
+
+    if (!isMultiCharRP) {
+        // Step 2 (single-character RP): Scan scene message speakers for additional characters.
+        // This catches NPCs the sidecar may have missed (pre-existing chats,
+        // frequency-gated detection gaps, etc.)
+        for (const msg of sceneMessages) {
+            const speaker = msg.name || "";
+            if (!speaker || msg.is_user || isExcluded(speaker)) continue;
+            // Use alias-aware fuzzy matching so "Gojo" matches "Satoru Gojo"
+            const match = findCharacterByFuzzyName(speaker) || allKnownChars.find((c) => c.name.toLowerCase().trim() === speaker.toLowerCase().trim());
+            if (match) {
+                foundIds.add(match.id);
+            } else {
+                unknownSpeakers.add(speaker);
+            }
+        }
+    } else {
+        console.log("[RST] Multi-character RP detected — trusting scene.charactersPresent, skipping speaker-name scan.");
     }
 
     // Step 3: Build character list from found IDs + auto-create unknowns
@@ -719,12 +862,15 @@ function getSceneCharacters(scene) {
         if (profile) chars.push(profile);
     }
 
-    // Auto-create characters for unknown non-user speakers
+    // Auto-create characters for unknown non-user speakers (single-character RP only)
     if (unknownSpeakers.size > 0) {
         console.log("[RST] Auto-creating", unknownSpeakers.size, "character(s) from scene speakers:", [...unknownSpeakers]);
         for (const name of unknownSpeakers) {
             const char = createCharacter(name, { source: "auto_generated" });
-            if (char) chars.push(char);
+            if (char) {
+                _autoCreatedIds.add(char.id);
+                chars.push(char);
+            }
         }
 
         // Update scene's charactersPresent so subsequent calls find them
@@ -738,8 +884,39 @@ function getSceneCharacters(scene) {
         }
     }
 
-    console.log("[RST] getSceneCharacters: found", chars.length, "characters (scene had", charIds.length, "registered)");
-    return chars;
+    // Step 4: Filter out any blacklisted/excluded characters from the final list
+    const filteredChars = chars.filter(c => c && !isExcluded(c.name));
+    const removedCount = chars.length - filteredChars.length;
+    if (removedCount > 0) {
+        console.log(`[RST] getSceneCharacters: removed ${removedCount} excluded character(s) from scene character list`);
+    }
+
+    console.log("[RST] getSceneCharacters: found", filteredChars.length, "characters (scene had", charIds.length, "registered)");
+    return filteredChars;
+}
+
+/**
+ * Merge LLM-provided stats over existing stats so unmentioned stats
+ * retain their current value instead of defaulting to 0.
+ * Only the specific stats the LLM included (defined !== undefined) are overridden.
+ * @param {object} statsBefore - Current stat values (baseline)
+ * @param {object} llmStats - Partial stats from LLM response (may have missing categories/stats)
+ * @returns {object} Merged stats object
+ */
+function mergeWithExistingStats(statsBefore, llmStats) {
+    const merged = cloneStats(statsBefore);
+    for (const cat of STAT_CATEGORIES) {
+        if (!llmStats[cat] || typeof llmStats[cat] !== "object") continue;
+        for (const stat of STAT_NAMES) {
+            // Only override if the LLM explicitly provided a value
+            const val = llmStats[cat][stat];
+            if (typeof val === "number" && !isNaN(val)) {
+                merged[cat][stat] = val;
+            }
+            // null, undefined, NaN, or non-number → keep statsBefore value
+        }
+    }
+    return merged;
 }
 
 /**
@@ -760,6 +937,30 @@ function clampStats(stats) {
 }
 
 /**
+ * Apply the configured stat change range to clamp statsAfter relative to statsBefore.
+ * Ensures each stat stays within [range.min, range.max] of its current value.
+ * This prevents LLM from making wild jumps beyond the configured per-scene limit.
+ * @param {object} statsBefore - Current stat values
+ * @param {object} statsAfter - Raw LLM-proposed stat values
+ * @param {{min: number, max: number}} range - Allowed delta range from settings
+ * @returns {object} Clamped statsAfter values
+ */
+function applyDeltaRange(statsBefore, statsAfter, range) {
+    const result = {};
+    for (const cat of STAT_CATEGORIES) {
+        result[cat] = {};
+        for (const stat of STAT_NAMES) {
+            const before = statsBefore[cat]?.[stat] ?? 0;
+            const after = statsAfter[cat]?.[stat] ?? 0;
+            const minVal = before + range.min;
+            const maxVal = before + range.max;
+            result[cat][stat] = Math.max(minVal, Math.min(maxVal, after));
+        }
+    }
+    return result;
+}
+
+/**
  * Create a blank commentary object.
  * @returns {object}
  */
@@ -774,30 +975,98 @@ function createBlankCommentary() {
     return commentary;
 }
 
-/**
- * Create a no-change entry for a character not found in LLM response.
- * @param {object} char - Character profile
- * @returns {object}
- */
 function hasEmptyCommentary(commentary) {
     if (!commentary || typeof commentary !== "object") return true;
+    // Only return true if commentary is completely missing or empty object
+    // We no longer require ALL 12 slots — partial commentary is fine
+    let hasAnyContent = false;
     for (const cat of STAT_CATEGORIES) {
-        if (!commentary[cat]) return true;
+        if (!commentary[cat]) continue;
         for (const stat of STAT_NAMES) {
-            if (!commentary[cat][stat] || commentary[cat][stat].trim() === "") return true;
+            if (commentary[cat][stat] && commentary[cat][stat].trim() !== "") {
+                hasAnyContent = true;
+                break;
+            }
         }
+        if (hasAnyContent) break;
     }
-    return false;
+    return !hasAnyContent;
 }
 
 /**
- * Generate fallback commentary from stat deltas when LLM omits commentary.
- * Creates human-readable reasons for each stat change based on the direction of movement.
+ * Get the most recent commentary for a specific stat from a character's update log.
+ * Used to preserve narrative continuity for unchanged stats across updates.
+ * @param {object} char - Character profile (with updateLog)
+ * @param {string} cat - Stat category
+ * @param {string} stat - Stat name
+ * @returns {string} The commentary text, or empty string if none found
+ */
+function getLatestCommentary(char, cat, stat) {
+    if (char?.updateLog?.length > 0) {
+        const latest = char.updateLog[0];
+        const text = latest.commentary?.[cat]?.[stat];
+        if (text && typeof text === "string" && text.trim() !== "") {
+            return text.trim();
+        }
+    }
+    return "";
+}
+
+/**
+ * Fill in empty commentary slots for stats that actually changed.
+ * Preserves existing LLM commentary for stats that already have it.
+ * For unchanged stats with no LLM commentary, preserves the latest
+ * commentary from the character's update log for narrative continuity.
+ * @param {object} commentary - Partially filled commentary from LLM
  * @param {object} statsBefore
  * @param {object} statsAfter
+ * @param {object} [char] - Character profile (for old commentary lookup)
  * @returns {object}
  */
-function generateFallbackCommentary(statsBefore, statsAfter) {
+function fillMissingCommentary(commentary, statsBefore, statsAfter, char) {
+    const result = {};
+    for (const cat of STAT_CATEGORIES) {
+        result[cat] = {};
+        for (const stat of STAT_NAMES) {
+            const existing = commentary?.[cat]?.[stat];
+            if (existing && existing.trim() !== "") {
+                // Preserve LLM-provided commentary
+                result[cat][stat] = existing;
+            } else {
+                const before = statsBefore[cat]?.[stat] ?? 0;
+                const after = statsAfter[cat]?.[stat] ?? 0;
+                const diff = after - before;
+                if (diff > 0) {
+                    result[cat][stat] = `Scene events positively influenced ${cat}.${stat}.`;
+                } else if (diff < 0) {
+                    result[cat][stat] = `Scene events negatively influenced ${cat}.${stat}.`;
+                } else {
+                    // Unchanged stat — preserve old commentary from update log
+                    const oldCommentary = getLatestCommentary(char, cat, stat);
+                    if (oldCommentary) {
+                        result[cat][stat] = oldCommentary;
+                    } else {
+                        // No old commentary either — leave empty (no overwrite)
+                        result[cat][stat] = "";
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
+/**
+ * Generate fallback commentary from stat deltas when LLM provides NO commentary at all.
+ * Only generates narrative for stats that actually changed.
+ * For unchanged stats, preserves the latest commentary from the character's
+ * update log for narrative continuity.
+ * @param {object} statsBefore
+ * @param {object} statsAfter
+ * @param {object} [char] - Character profile (for old commentary lookup)
+ * @returns {object}
+ */
+function generateFallbackCommentary(statsBefore, statsAfter, char) {
     const commentary = {};
     for (const cat of STAT_CATEGORIES) {
         commentary[cat] = {};
@@ -806,11 +1075,18 @@ function generateFallbackCommentary(statsBefore, statsAfter) {
             const after = statsAfter[cat]?.[stat] ?? 0;
             const diff = after - before;
             if (diff > 0) {
-                commentary[cat][stat] = `${cat}.${stat} increased by ${diff}% based on scene events.`;
+                commentary[cat][stat] = `Scene events positively influenced ${cat}.${stat}.`;
             } else if (diff < 0) {
-                commentary[cat][stat] = `${cat}.${stat} decreased by ${Math.abs(diff)}% based on scene events.`;
+                commentary[cat][stat] = `Scene events negatively influenced ${cat}.${stat}.`;
             } else {
-                commentary[cat][stat] = `No change in ${cat}.${stat}.`;
+                // Unchanged stat — preserve old commentary from update log
+                const oldCommentary = getLatestCommentary(char, cat, stat);
+                if (oldCommentary) {
+                    commentary[cat][stat] = oldCommentary;
+                } else {
+                    // No old commentary either — leave empty (no overwrite)
+                    commentary[cat][stat] = "";
+                }
             }
         }
     }
@@ -819,12 +1095,14 @@ function generateFallbackCommentary(statsBefore, statsAfter) {
 
 function createNoChangeEntry(char) {
     const stats = cloneStats(char.stats);
+    // Pass char for old commentary lookup; unchanged stats preserve their update-log commentary
+    const preservedCommentary = generateFallbackCommentary(stats, stats, char);
     return {
         characterId: char.id,
         characterName: char.name,
         statsBefore: stats,
         statsAfter: stats,
-        commentary: createBlankCommentary(),
+        commentary: preservedCommentary,
         dynamicTitleBefore: char.dynamicTitle || "",
         dynamicTitleAfter: char.dynamicTitle || "",
         narrativeSummary: char.narrativeSummary || "",
@@ -944,7 +1222,9 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
     // Character list
     parts.push("CHARACTERS IN THIS SCENE (stats represent character \u2192 {{user}} perspective):");
     for (const char of characters) {
-        parts.push("- " + char.name);
+        const aliases = getCharacterNameVariants(char).filter(a => a !== char.name.toLowerCase().trim());
+        const aliasStr = aliases.length > 0 ? ` (also known as: ${aliases.join(", ")})` : "";
+        parts.push("- " + char.name + aliasStr);
     }
     parts.push("");
 
@@ -958,9 +1238,14 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
         parts.push("[" + i + "]" + isUser + " " + speaker + ": " + text);
     });
 
-    // Character discovery instruction: also scan messages for unlisted characters
+    // Character discovery instruction — be INCLUSIVE by default
     parts.push('');
-    parts.push('Also scan the messages for ANY additional characters (named individuals) who appear, speak, or are referenced.');
+    parts.push('CRITICAL — Scan for ALL additional characters:');
+    parts.push('- You MUST identify EVERY named individual who appears, speaks, interacts, or is described as doing something in the scene messages.');
+    parts.push('- INCLUDE characters who: speak dialogue, are addressed by name, perform actions described by another speaker, interact with someone in the scene, or are described as being physically present or doing an activity.');
+    parts.push('- Example of INCLUDE: a character says "I talked with [Name]" or "[Name] handed me the package" — [Name] is described as interacting and should be included.');
+    parts.push('- Example of EXCLUDE: "I heard about [Name]\'s reputation" — [Name] is merely discussed with no described interaction.');
+    parts.push('- When in doubt, INCLUDE the character.');
     parts.push('Include them in your characters object with full stat estimates based on their scene behavior.');
     parts.push('');
 
@@ -1017,18 +1302,18 @@ function parseInitialStatResponse(response, characters) {
 
         const commentary = charData.commentary || null;
         if (!commentary || hasEmptyCommentary(commentary)) {
-            // Since there are no "before" stats, use a generic fallback
+            // Since there are no "before" stats, use a generic narrative-only fallback
             const fallback = {};
             for (const cat of STAT_CATEGORIES) {
                 fallback[cat] = {};
                 for (const stat of STAT_NAMES) {
                     const val = statsAfter[cat][stat];
                     if (val > 0) {
-                        fallback[cat][stat] = "Initial assessment: " + cat + "." + stat + " set to " + val + "% based on first impressions.";
+                        fallback[cat][stat] = "First impressions suggest positive feelings.";
                     } else if (val < 0) {
-                        fallback[cat][stat] = "Initial assessment: " + cat + "." + stat + " set to " + val + "% based on observed behavior.";
+                        fallback[cat][stat] = "First impressions suggest negative feelings.";
                     } else {
-                        fallback[cat][stat] = "No initial impression for " + cat + "." + stat + ".";
+                        fallback[cat][stat] = "No strong initial impression formed.";
                     }
                 }
             }
@@ -1067,11 +1352,23 @@ function parseInitialStatResponse(response, characters) {
     // Handle LLM-discovered characters (in parsed.characters but not in input list)
     if (parsed && parsed.characters) {
         const inputNames = new Set(characters.map(c => c.name));
+        const allKnownChars = getAllCharacters();
         for (const [llmName, llmData] of Object.entries(parsed.characters)) {
             if (!inputNames.has(llmName) && llmData && llmData.stats) {
-                console.log("[RST] LLM discovered additional character (initial stat):", llmName);
-                const newChar = createCharacter(llmName, { source: "auto_generated" });
-                if (newChar) {
+                const lowerLlmName = llmName.toLowerCase().trim();
+                // Check if this LLM name matches an existing character (by alias, exact name, or fuzzy word match)
+                const matchedExisting = allKnownChars.find(c => {
+                    if (c.name.toLowerCase().trim() === lowerLlmName) return true;
+                    if (c.nameAliases && Array.isArray(c.nameAliases)) {
+                        if (c.nameAliases.some(a => a.toLowerCase().trim() === lowerLlmName)) return true;
+                    }
+                    const cWords = c.name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
+                    const llmWords = lowerLlmName.split(/\s+/).filter(Boolean).sort().join(" ");
+                    return cWords === llmWords;
+                });
+                if (matchedExisting) {
+                    // Name matches existing character — create update entry instead of duplicate
+                    console.log(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating initial stat update entry`);
                     const statsAfter = {};
                     for (const cat of STAT_CATEGORIES) {
                         statsAfter[cat] = {};
@@ -1080,51 +1377,93 @@ function parseInitialStatResponse(response, characters) {
                             statsAfter[cat][stat] = typeof val === "number" ? Math.max(-100, Math.min(100, val)) : 0;
                         }
                     }
-                    const commentary = llmData.commentary || null;
+                    const statsBefore = cloneStats(matchedExisting.stats);
+                    const settings = getSettings();
+                    const range = settings.statChangeRange || { min: -5, max: 5 };
+                    // Merge LLM stats over existing stats so unmentioned ones don't default to 0
+                    const mergedStats = mergeWithExistingStats(statsBefore, statsAfter);
+                    const clampedAfter = applyDeltaRange(statsBefore, mergedStats, range);
+                    let commentary = llmData.commentary || null;
                     if (!commentary || hasEmptyCommentary(commentary)) {
-                        const fallback = {};
+                        commentary = generateFallbackCommentary(statsBefore, clampedAfter, matchedExisting);
+                    } else {
+                        commentary = fillMissingCommentary(commentary, statsBefore, clampedAfter, matchedExisting);
+                    }
+                    const changeCount = countChanges(statsBefore, clampedAfter);
+                    characterUpdates.push({
+                        characterId: matchedExisting.id,
+                        characterName: matchedExisting.name,
+                        statsBefore,
+                        statsAfter: clampedAfter,
+                        commentary,
+                        dynamicTitleBefore: matchedExisting.dynamicTitle || "",
+                        dynamicTitleAfter: llmData.dynamicTitle || matchedExisting.dynamicTitle || "",
+                        milestoneReached: false,
+                        milestoneDetail: "",
+                        narrativeSummary: llmData.narrativeSummary || matchedExisting.narrativeSummary || "",
+                        source: "llm_initial",
+                        changeCount,
+                    });
+                } else {
+                    // Truly new character — create new profile
+                    console.log("[RST] LLM discovered additional character (initial stat):", llmName);
+                    const newChar = createCharacter(llmName, { source: "auto_generated" });
+                    if (newChar) {
+                        _autoCreatedIds.add(newChar.id);
+                        const statsAfter = {};
                         for (const cat of STAT_CATEGORIES) {
-                            fallback[cat] = {};
+                            statsAfter[cat] = {};
                             for (const stat of STAT_NAMES) {
-                                const val = statsAfter[cat][stat];
-                                if (val > 0) {
-                                    fallback[cat][stat] = "Initial assessment: " + cat + "." + stat + " set to " + val + "% based on first impressions.";
-                                } else if (val < 0) {
-                                    fallback[cat][stat] = "Initial assessment: " + cat + "." + stat + " set to " + val + "% based on observed behavior.";
-                                } else {
-                                    fallback[cat][stat] = "No initial impression for " + cat + "." + stat + ".";
-                                }
+                                const val = llmData.stats[cat]?.[stat];
+                                statsAfter[cat][stat] = typeof val === "number" ? Math.max(-100, Math.min(100, val)) : 0;
                             }
                         }
-                        characterUpdates.push({
-                            characterId: newChar.id,
-                            characterName: newChar.name,
-                            statsBefore: null,
-                            statsAfter,
-                            commentary: fallback,
-                            dynamicTitleBefore: "",
-                            dynamicTitleAfter: llmData.dynamicTitle || "",
-                            milestoneReached: false,
-                            milestoneDetail: "",
-                            narrativeSummary: llmData.narrativeSummary || "",
-                            source: "llm_discovered_initial",
-                            changeCount: 12,
-                        });
-                    } else {
-                        characterUpdates.push({
-                            characterId: newChar.id,
-                            characterName: newChar.name,
-                            statsBefore: null,
-                            statsAfter,
-                            commentary,
-                            dynamicTitleBefore: "",
-                            dynamicTitleAfter: llmData.dynamicTitle || "",
-                            milestoneReached: false,
-                            milestoneDetail: "",
-                            narrativeSummary: llmData.narrativeSummary || "",
-                            source: "llm_discovered_initial",
-                            changeCount: 12,
-                        });
+                        const commentary = llmData.commentary || null;
+                        if (!commentary || hasEmptyCommentary(commentary)) {
+                            const fallback = {};
+                            for (const cat of STAT_CATEGORIES) {
+                                fallback[cat] = {};
+                                for (const stat of STAT_NAMES) {
+                                    const val = statsAfter[cat][stat];
+                                    if (val > 0) {
+                                        fallback[cat][stat] = "First impressions suggest positive feelings.";
+                                    } else if (val < 0) {
+                                        fallback[cat][stat] = "First impressions suggest negative feelings.";
+                                    } else {
+                                        fallback[cat][stat] = "No strong initial impression formed.";
+                                    }
+                                }
+                            }
+                            characterUpdates.push({
+                                characterId: newChar.id,
+                                characterName: newChar.name,
+                                statsBefore: null,
+                                statsAfter,
+                                commentary: fallback,
+                                dynamicTitleBefore: "",
+                                dynamicTitleAfter: llmData.dynamicTitle || "",
+                                milestoneReached: false,
+                                milestoneDetail: "",
+                                narrativeSummary: llmData.narrativeSummary || "",
+                                source: "llm_discovered_initial",
+                                changeCount: 12,
+                            });
+                        } else {
+                            characterUpdates.push({
+                                characterId: newChar.id,
+                                characterName: newChar.name,
+                                statsBefore: null,
+                                statsAfter,
+                                commentary,
+                                dynamicTitleBefore: "",
+                                dynamicTitleAfter: llmData.dynamicTitle || "",
+                                milestoneReached: false,
+                                milestoneDetail: "",
+                                narrativeSummary: llmData.narrativeSummary || "",
+                                source: "llm_discovered_initial",
+                                changeCount: 12,
+                            });
+                        }
                     }
                 }
             }

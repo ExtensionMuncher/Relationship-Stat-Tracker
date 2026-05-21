@@ -3,12 +3,14 @@
  * Renders the Home tab with pending update cards and present character list
  */
 
-import { getPendingUpdates, savePendingUpdates, getPresentCharacters, getSettings } from "../data/storage.js";
-import { getCharacterProfile, getInitials, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
+import { getPendingUpdates, savePendingUpdates, getPresentCharacters, savePresentCharacters, getSettings, deleteCharacterData } from "../data/storage.js";
+import { getCharacterProfile, getInitials, getAllCharacters, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { getOpenScene, getSceneById, deleteScene, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
 import { generateStatUpdate } from "../llm/statUpdate.js";
 import { renderScenesTab } from "./scenes.js";
+import { renderLibraryTab } from "./library.js";
 import { switchTab, getPane, showPanelLoading, hidePanelLoading } from "./panel.js";
+import { Popup, POPUP_RESULT, POPUP_TYPE } from "../../../../../scripts/popup.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -39,28 +41,26 @@ export function renderHomeTab($pane) {
  * @param {jQuery} $pane
  */
 export function refreshPending($pane) {
-    const $pendingSection = $pane.find("#rst-pending-section");
+    // Always append inside #rst-home-content (same container renderHomeTab uses)
+    // to prevent orphaned sections from accumulating outside the content div.
+    const $container = $pane.find("#rst-home-content");
+    const $target = $container.length ? $container : $pane;
+
+    const $pendingSection = $target.find("#rst-pending-section");
     if ($pendingSection.length) {
         $pendingSection.remove();
     }
 
-    const $noPending = $pane.find("#rst-no-pending");
+    const $noPending = $target.find("#rst-no-pending");
     if ($noPending.length) {
         $noPending.remove();
     }
 
     const pending = getPendingUpdates();
     if (pending) {
-        renderPendingSection($pane, pending);
+        renderPendingSection($target, pending);
     } else {
-        renderNoPending($pane);
-    }
-
-    // Re-position before the present characters section
-    const $presentSection = $pane.find("#rst-present-section");
-    const $newContent = $pane.find("#rst-pending-section, #rst-no-pending");
-    if ($presentSection.length && $newContent.length) {
-        // Already in correct position
+        renderNoPending($target);
     }
 }
 
@@ -88,10 +88,15 @@ function renderPendingSection($pane, pending) {
     // Scene summary card
     renderSceneSummaryCard($section, pending);
 
-    // Per-character pending updates
+    // Per-character pending updates — skip entries with 0 changes (no actual stat changes to review)
     if (pending.characterUpdates) {
-        for (const charUpdate of pending.characterUpdates) {
-            renderCharacterPending($section, charUpdate, pending.sceneId);
+        const meaningfulUpdates = pending.characterUpdates.filter(u => u.changeCount > 0);
+        if (meaningfulUpdates.length === 0) {
+            $section.append(`<div style="font-size:12px;color:var(--rst-text-muted);padding:12px 0">No stat changes detected for any characters.</div>`);
+        } else {
+            for (const charUpdate of meaningfulUpdates) {
+                renderCharacterPending($section, charUpdate, pending.sceneId);
+            }
         }
     }
 
@@ -124,9 +129,12 @@ function renderPendingSection($pane, pending) {
  */
 function renderSceneSummaryCard($container, pending) {
     const $card = $(`<div class="rst-pending-card"></div>`);
-    $card.append('<div style="font-size:12px;font-weight:500;margin-bottom:8px;color:var(--rst-text-muted)">Proposed scene summary</div>');
+    $card.append(`<div style="font-size:12px;font-weight:500;margin-bottom:8px;color:var(--rst-text-muted)">
+        <span>Proposed scene summary</span>
+        <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-edit-scene-summary" title="Expand the editor"></i>
+    </div>`);
 
-    const $textarea = $(`<textarea rows="3" style="margin-bottom:8px">${pending.sceneSummary || ""}</textarea>`);
+    const $textarea = $(`<textarea id="rst-edit-scene-summary" rows="3" style="margin-bottom:8px">${pending.sceneSummary || ""}</textarea>`);
     $card.append($textarea);
 
     const $btnRow = $(`
@@ -218,6 +226,7 @@ function renderCharacterPending($container, charUpdate, sceneId) {
             <button class="rst-btn-approve">Approve changes</button>
             <button class="rst-btn rst-regen-toggle">Regenerate</button>
             <button class="rst-btn rst-edit-btn">Edit manually</button>
+            <button class="rst-btn rst-btn-danger" style="margin-left:auto">Dismiss</button>
         </div>
     `);
 
@@ -230,11 +239,15 @@ function renderCharacterPending($container, charUpdate, sceneId) {
     });
 
     $btnRow.find(".rst-btn-approve").on("click", async () => {
-        await approveCharacterUpdate(charUpdate);
+        await approveCharacterUpdate(charUpdate, sceneId);
     });
 
     $btnRow.find(".rst-edit-btn").on("click", () => {
         showEditStatsModal(charUpdate, sceneId);
+    });
+
+    $btnRow.find(".rst-btn-danger").on("click", () => {
+        dismissCharacterUpdate(charUpdate);
     });
 
     $body.append($btnRow);
@@ -327,41 +340,106 @@ function renderRegenBox(id, onRegenerate) {
  * @param {jQuery} $pane
  */
 function renderPresentCharacters($pane) {
-    const presentIds = getPresentCharacters();
     const $section = $(`<div id="rst-present-section"></div>`);
     $section.append('<div class="rst-lbl">Characters currently present</div>');
 
-    if (presentIds.length === 0) {
-        $section.append(
-            '<div style="font-size:12px;color:var(--rst-text-muted);padding:6px 2px;margin-bottom:12px">No characters detected in current context.</div>'
-        );
-    } else {
+    // Chip container
+    const $chipContainer = $(`<div id="rst-present-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px"></div>`);
+    $section.append($chipContainer);
+
+    function renderChips() {
+        $chipContainer.empty();
+        const presentIds = getPresentCharacters();
+
+        if (presentIds.length === 0) {
+            $chipContainer.append(
+                '<div style="font-size:12px;color:var(--rst-text-muted);padding:6px 2px">No characters detected in current context.</div>'
+            );
+            return;
+        }
+
         for (const charId of presentIds) {
             const profile = getCharacterProfile(charId);
             if (!profile) continue;
 
             const initials = getInitials(profile.name);
             const $chip = $(`
-                <div class="rst-chip">
+                <div class="rst-chip" style="cursor:pointer">
                     <div class="rst-dot"></div>
                     <div class="rst-av">${initials}</div>
                     <span style="font-weight:500">${profile.name}</span>
-                    <span style="margin-left:auto;font-size:11px;color:var(--rst-text-muted)">view profile →</span>
+                    <span class="rst-present-remove" data-char-id="${charId}" style="cursor:pointer;color:var(--rst-danger);margin-left:4px;font-size:13px;line-height:1" title="Remove from presence">✕</span>
                 </div>
             `);
 
+            // Click on chip opens library tab
             $chip.on("click", () => {
                 switchTab("lib");
                 $(document).trigger("rst:select-character", [charId]);
             });
 
-            $section.append($chip);
-        }
+            // Click on remove button removes character from presence
+            $chip.find(".rst-present-remove").on("click", async (e) => {
+                e.stopPropagation();
+                const idToRemove = $(e.target).data("char-id");
+                const filtered = getPresentCharacters().filter((id) => id !== idToRemove);
+                savePresentCharacters(filtered);
+                const { updateInjection } = await import("../inject/promptInjector.js");
+                updateInjection();
+                renderChips();
+                populateAddDropdown();
+            });
 
-        $section.append(
-            '<div style="font-size:12px;color:var(--rst-text-muted);padding:6px 2px;margin-bottom:12px">No other characters detected in current context.</div>'
-        );
+            $chipContainer.append($chip);
+        }
     }
+
+    // Add character row — same pattern as Scenes tab
+    const $addRow = $(`
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
+            <select id="rst-present-add-select" style="flex:1;font-size:12px;padding:4px 6px;border:0.5px solid var(--rst-border);border-radius:6px;background:transparent;color:inherit">
+                <option value="">— Add character —</option>
+            </select>
+            <button id="rst-present-add-btn" class="rst-btn" style="font-size:11px;padding:3px 10px" disabled>+</button>
+        </div>
+    `);
+    const $addSelect = $addRow.find("#rst-present-add-select");
+    const $addBtn = $addRow.find("#rst-present-add-btn");
+
+    function populateAddDropdown() {
+        const currentIds = getPresentCharacters();
+        const allChars = getAllCharacters();
+        const available = allChars.filter((c) => !currentIds.includes(c.id));
+        $addSelect.find("option:not([value=''])").remove();
+        for (const c of available) {
+            $addSelect.append(`<option value="${c.id}">${c.name}</option>`);
+        }
+        $addSelect.val("");
+        $addBtn.prop("disabled", true);
+    }
+
+    $addSelect.on("change", function () {
+        $addBtn.prop("disabled", !$(this).val());
+    });
+
+    $addBtn.on("click", async () => {
+        const newId = $addSelect.val();
+        if (!newId) return;
+        const currentIds = getPresentCharacters();
+        if (!currentIds.includes(newId)) {
+            const updatedIds = [...currentIds, newId];
+            savePresentCharacters(updatedIds);
+            const { updateInjection } = await import("../inject/promptInjector.js");
+            updateInjection();
+            renderChips();
+            populateAddDropdown();
+        }
+    });
+
+    renderChips();
+    populateAddDropdown();
+
+    $section.append($addRow);
 
     const $libBtn = $('<button class="rst-btn">Open character library</button>');
     $libBtn.on("click", () => switchTab("lib"));
@@ -395,12 +473,14 @@ function renderNoPending($pane) {
  * Approve a single character's pending update.
  * @param {object} charUpdate
  */
-async function approveCharacterUpdate(charUpdate) {
+async function approveCharacterUpdate(charUpdate, sceneId) {
+    console.log("[RST] Approving update for:", charUpdate.characterName, { sceneId, statsBefore: charUpdate.statsBefore, statsAfter: charUpdate.statsAfter, commentary: charUpdate.commentary });
     try {
         const { updateCharacterStats, updateCharacterProfile, addUpdateLogEntry } = await import("../data/characters.js");
         const { updateSceneSummary } = await import("../data/scenes.js");
 
         // Commit stats
+        console.log("[RST] Committing stats for:", charUpdate.characterName, charUpdate.statsAfter);
         updateCharacterStats(charUpdate.characterId, charUpdate.statsAfter);
 
         // Update dynamic title and narrative
@@ -410,14 +490,15 @@ async function approveCharacterUpdate(charUpdate) {
         });
 
         // Get actual message range from the scene
-        const scene = charUpdate.sceneId ? getSceneById(charUpdate.sceneId) : null;
+        const scene = sceneId ? getSceneById(sceneId) : null;
         const messageRange = scene
             ? { start: scene.messageStart, end: scene.messageEnd }
             : null; // No scene available — skip message range in log entry
 
         // Create update log entry
+        console.log("[RST] Adding update log entry for:", charUpdate.characterName, { statsBefore: charUpdate.statsBefore, statsAfter: charUpdate.statsAfter, commentary: charUpdate.commentary });
         addUpdateLogEntry(charUpdate.characterId, {
-            sceneId: charUpdate.sceneId || "",
+            sceneId: sceneId || "",
             messageRange,
             timestamp: Date.now(),
             statsBefore: charUpdate.statsBefore,
@@ -426,6 +507,7 @@ async function approveCharacterUpdate(charUpdate) {
             dynamicTitleBefore: charUpdate.dynamicTitleBefore,
             dynamicTitleAfter: charUpdate.dynamicTitleAfter,
             narrativeSummary: charUpdate.narrativeSummary,
+            source: charUpdate.source || "unknown",
         });
 
         // Remove from pending
@@ -440,6 +522,7 @@ async function approveCharacterUpdate(charUpdate) {
                 savePendingUpdates(pending);
             }
         }
+        console.log("[RST] Removed from pending:", charUpdate.characterName);
 
         toastr?.success?.(`${charUpdate.characterName} stat changes approved and saved.`);
 
@@ -463,8 +546,18 @@ async function approveCharacterUpdate(charUpdate) {
 async function approveAllPending(pending) {
     if (!pending || !pending.characterUpdates) return;
 
+    // Save the scene summary first (if present)
+    if (pending.sceneId && pending.sceneSummary) {
+        try {
+            const { updateSceneSummary } = await import("../data/scenes.js");
+            updateSceneSummary(pending.sceneId, pending.sceneSummary);
+        } catch (err) {
+            console.error("[RST] Failed to save scene summary during approve-all:", err);
+        }
+    }
+
     for (const charUpdate of pending.characterUpdates) {
-        await approveCharacterUpdate(charUpdate);
+        await approveCharacterUpdate(charUpdate, pending.sceneId);
     }
 
     toastr?.success?.("All stat changes approved and saved.");
@@ -475,6 +568,13 @@ async function approveAllPending(pending) {
  */
 function dismissAllPending() {
     const pending = getPendingUpdates();
+
+    // Delete any auto-created character profiles (tracked deterministically during generation)
+    if (pending && pending.autoCreatedIds && pending.autoCreatedIds.length > 0) {
+        for (const id of pending.autoCreatedIds) {
+            deleteCharacterData(id);
+        }
+    }
 
     // If there's a scene associated with these pending updates, delete it
     if (pending && pending.sceneId) {
@@ -491,6 +591,49 @@ function dismissAllPending() {
     const $scenesPane = getPane("scenes");
     if ($scenesPane) {
         renderScenesTab($scenesPane);
+    }
+
+    // Also refresh the Library tab to remove blank characters from view
+    const $libPane = getPane("lib");
+    if ($libPane) {
+        renderLibraryTab($libPane);
+    }
+}
+
+/**
+ * Dismiss a single character's pending update.
+ * Also cleans up auto-created character profiles to prevent blank characters in the Library.
+ * @param {object} charUpdate
+ */
+function dismissCharacterUpdate(charUpdate) {
+    const pending = getPendingUpdates();
+    if (!pending || !pending.characterUpdates) return;
+
+    // If this character was auto-created during generation, delete its profile
+    // to prevent blank characters in the Library
+    if (pending.autoCreatedIds && pending.autoCreatedIds.includes(charUpdate.characterId)) {
+        deleteCharacterData(charUpdate.characterId);
+    }
+
+    pending.characterUpdates = pending.characterUpdates.filter(
+        (u) => u.characterId !== charUpdate.characterId
+    );
+
+    if (pending.characterUpdates.length === 0) {
+        savePendingUpdates(null);
+    } else {
+        savePendingUpdates(pending);
+    }
+
+    toastr?.info?.(`${charUpdate.characterName || "Character"} stats dismissed.`);
+
+    const $pane = getPane("home");
+    refreshPending($pane);
+
+    // Also refresh the Library tab to remove blank character from view
+    const $libPane = getPane("lib");
+    if ($libPane) {
+        renderLibraryTab($libPane);
     }
 }
 
@@ -554,6 +697,18 @@ async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
                 }
             }
 
+            // Merge any newly discovered auto-created IDs into the pending list
+            if (result.autoCreatedIds && result.autoCreatedIds.length > 0) {
+                if (!pending.autoCreatedIds) {
+                    pending.autoCreatedIds = [];
+                }
+                for (const id of result.autoCreatedIds) {
+                    if (!pending.autoCreatedIds.includes(id)) {
+                        pending.autoCreatedIds.push(id);
+                    }
+                }
+            }
+
             savePendingUpdates(pending);
         }
 
@@ -577,6 +732,7 @@ async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
  * @param {string} sceneId - The scene ID
  */
 async function showEditStatsModal(charUpdate, sceneId) {
+    console.log("[RST] Opening edit modal for:", charUpdate.characterName, charUpdate);
     // Load character profile for editable fields
     const profile = getCharacterProfile(charUpdate.characterId) || {};
     const editedStats = JSON.parse(JSON.stringify(charUpdate.statsAfter || {}));
@@ -597,13 +753,19 @@ async function showEditStatsModal(charUpdate, sceneId) {
         </div>
 
         <div style="margin-bottom:8px">
-            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:3px">Description</div>
+            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:3px">
+                <span>Description</span>
+                <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-edit-description" title="Expand the editor"></i>
+            </div>
             <textarea id="rst-edit-description" rows="2"
                 style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${currentDesc.replace(/"/g, '"')}</textarea>
         </div>
 
         <div style="margin-bottom:8px">
-            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:3px">Notes</div>
+            <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:3px">
+                <span>Notes</span>
+                <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-edit-notes" title="Expand the editor"></i>
+            </div>
             <textarea id="rst-edit-notes" rows="2"
                 style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${currentNotes.replace(/"/g, '"')}</textarea>
         </div>
@@ -667,39 +829,117 @@ async function showEditStatsModal(charUpdate, sceneId) {
     // Narrative summary
     const editedNarrative = charUpdate.narrativeSummary || "";
     html += `<div style="margin-bottom:10px">
-        <div style="font-weight:500;font-size:13px;margin-bottom:4px;color:var(--rst-text)">Narrative Summary</div>
+        <div style="font-weight:500;font-size:13px;margin-bottom:4px;color:var(--rst-text)">
+            <span>Narrative Summary</span>
+            <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-edit-narrative" title="Expand the editor"></i>
+        </div>
         <textarea id="rst-edit-narrative" rows="3"
             style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${editedNarrative}</textarea>
     </div>`;
 
     html += `</div>`; // End scroll container
 
-    // Use ST's Popup system
+    // Use ST's Popup system — Popup API uses constructor options + custom button actions
+    // IMPORTANT: DOM values must be read INSIDE the action callback (BEFORE the popup closes).
+    // Reading after await popup.show() returns will get empty strings because the popup DOM
+    // is removed by this.dlg.remove() in Popup.#hide() before show() resolves.
     try {
-        const { Popup, POPUP_TYPE } = globalThis;
-
         const popup = new Popup(html, POPUP_TYPE.TEXT, "", {
-            okButton: "Save changes",
-            cancelButton: "Cancel",
+            okButton: false, // Hide default OK button — using custom "Save changes" instead
             customButtons: [
+                {
+                    text: "Save changes",
+                    result: POPUP_RESULT.AFFIRMATIVE,
+                    action: () => {
+                        console.log("[RST] Save changes clicked for:", charUpdate.characterName);
+                        // Read all edited values from the DOM while it's still present
+                        const newStats = JSON.parse(JSON.stringify(charUpdate.statsAfter || {}));
+                        $(popup.dlg).find(".rst-edit-stat").each(function () {
+                            const cat = $(this).data("cat");
+                            const stat = $(this).data("stat");
+                            const val = parseInt($(this).val(), 10);
+                            if (!isNaN(val)) {
+                                if (!newStats[cat]) newStats[cat] = {};
+                                newStats[cat][stat] = Math.max(-100, Math.min(100, val));
+                            }
+                        });
+                        console.log("[RST] Edited stats:", JSON.stringify(newStats));
+
+                        const newCommentary = JSON.parse(JSON.stringify(charUpdate.commentary || {}));
+                        $(popup.dlg).find(".rst-edit-commentary").each(function () {
+                            const cat = $(this).data("cat");
+                            const stat = $(this).data("stat");
+                            if (!newCommentary[cat]) newCommentary[cat] = {};
+                            newCommentary[cat][stat] = $(this).val() || "";
+                        });
+                        console.log("[RST] Edited commentary:", JSON.stringify(newCommentary));
+
+                        const newTitle = $(popup.dlg).find("#rst-edit-title").val() || "";
+                        const newNarrative = $(popup.dlg).find("#rst-edit-narrative").val() || "";
+                        const newName = $(popup.dlg).find("#rst-edit-name").val() || "";
+                        const newDesc = $(popup.dlg).find("#rst-edit-description").val() || "";
+                        const newNotes = $(popup.dlg).find("#rst-edit-notes").val() || "";
+
+                        // Save profile changes to character database
+                        const profileChanges = {};
+                        if (newName !== (profile.name || charUpdate.characterName || "")) profileChanges.name = newName;
+                        if (newDesc !== (profile.description || "")) profileChanges.description = newDesc;
+                        if (newNotes !== (profile.notes || "")) profileChanges.notes = newNotes;
+                        if (Object.keys(profileChanges).length > 0) {
+                            updateCharacterProfile(charUpdate.characterId, profileChanges);
+                        }
+
+                        // Apply to pending updates
+                        const pending = getPendingUpdates();
+                        if (pending && pending.characterUpdates) {
+                            const update = pending.characterUpdates.find((u) => u.characterId === charUpdate.characterId);
+                            if (update) {
+                                update.statsAfter = newStats;
+                                update.commentary = newCommentary;
+                                update.dynamicTitleAfter = newTitle;
+                                update.narrativeSummary = newNarrative;
+                                if (profileChanges.name) {
+                                    update.characterName = newName;
+                                }
+                                // Recalculate change count
+                                let changeCount = 0;
+                                for (const cat of STAT_CATEGORIES) {
+                                    for (const stat of STAT_NAMES) {
+                                        const before = update.statsBefore?.[cat]?.[stat] ?? 0;
+                                        const after = newStats[cat]?.[stat] ?? 0;
+                                        if (before !== after) changeCount++;
+                                    }
+                                }
+                                update.changeCount = changeCount;
+                                savePendingUpdates(pending);
+                                console.log("[RST] Saved pending updates for:", newName, { statsAfter: newStats, commentary: newCommentary });
+
+                                // Refresh the UI
+                                const $pane = $("#rst-p-home");
+                                refreshPending($pane);
+                                toastr?.success?.(`${newName} stats and profile updated manually.`);
+                            }
+                        }
+                    },
+                },
                 {
                     text: "Reset to LLM values",
                     action: () => {
                         // Reset profile fields
-                        $(popup.element).find("#rst-edit-name").val(profile.name || charUpdate.characterName || "");
-                        $(popup.element).find("#rst-edit-description").val(profile.description || "");
-                        $(popup.element).find("#rst-edit-notes").val(profile.notes || "");
+                        $(popup.dlg).find("#rst-edit-name").val(profile.name || charUpdate.characterName || "");
+                        $(popup.dlg).find("#rst-edit-description").val(profile.description || "");
+                        $(popup.dlg).find("#rst-edit-notes").val(profile.notes || "");
                         // Reset stat fields
                         const originalAfter = charUpdate.statsAfter || {};
-                        $(popup.element).find(".rst-edit-stat").each(function () {
+                        $(popup.dlg).find(".rst-edit-stat").each(function () {
                             const cat = $(this).data("cat");
                             const stat = $(this).data("stat");
                             $(this).val(originalAfter[cat]?.[stat] ?? 0);
                         });
                         // Reset dynamic fields
-                        $(popup.element).find("#rst-edit-title").val(charUpdate.dynamicTitleAfter || "");
-                        $(popup.element).find("#rst-edit-narrative").val(charUpdate.narrativeSummary || "");
-                        $(popup.element).find(".rst-edit-commentary").each(function () {
+                        $(popup.dlg).find("#rst-edit-title").val(charUpdate.dynamicTitleAfter || "");
+                        $(popup.dlg).find("#rst-edit-narrative").val(charUpdate.narrativeSummary || "");
+                        $(popup.dlg).find(".rst-edit-commentary").each(function () {
                             const cat = $(this).data("cat");
                             const stat = $(this).data("stat");
                             $(this).val(charUpdate.commentary?.[cat]?.[stat] || "");
@@ -710,83 +950,13 @@ async function showEditStatsModal(charUpdate, sceneId) {
             ],
         });
 
-        popup.onCancelled(() => {
-            // Do nothing — discard edits
-        });
-
-        popup.onConfirmed(async () => {
-            // Read all edited values from the DOM
-            const newStats = JSON.parse(JSON.stringify(charUpdate.statsAfter || {}));
-            $(popup.element).find(".rst-edit-stat").each(function () {
-                const cat = $(this).data("cat");
-                const stat = $(this).data("stat");
-                const val = parseInt($(this).val(), 10);
-                if (!isNaN(val)) {
-                    if (!newStats[cat]) newStats[cat] = {};
-                    newStats[cat][stat] = Math.max(-100, Math.min(100, val));
-                }
-            });
-
-            const newCommentary = JSON.parse(JSON.stringify(charUpdate.commentary || {}));
-            $(popup.element).find(".rst-edit-commentary").each(function () {
-                const cat = $(this).data("cat");
-                const stat = $(this).data("stat");
-                if (!newCommentary[cat]) newCommentary[cat] = {};
-                newCommentary[cat][stat] = $(this).val() || "";
-            });
-
-            const newTitle = $(popup.element).find("#rst-edit-title").val() || "";
-            const newNarrative = $(popup.element).find("#rst-edit-narrative").val() || "";
-            const newName = $(popup.element).find("#rst-edit-name").val() || "";
-            const newDesc = $(popup.element).find("#rst-edit-description").val() || "";
-            const newNotes = $(popup.element).find("#rst-edit-notes").val() || "";
-
-            // Save profile changes to character database
-            const profileChanges = {};
-            if (newName !== (profile.name || charUpdate.characterName || "")) profileChanges.name = newName;
-            if (newDesc !== (profile.description || "")) profileChanges.description = newDesc;
-            if (newNotes !== (profile.notes || "")) profileChanges.notes = newNotes;
-            if (Object.keys(profileChanges).length > 0) {
-                updateCharacterProfile(charUpdate.characterId, profileChanges);
-            }
-
-            // Apply to pending updates
-            const pending = getPendingUpdates();
-            if (pending && pending.characterUpdates) {
-                const update = pending.characterUpdates.find((u) => u.characterId === charUpdate.characterId);
-                if (update) {
-                    update.statsAfter = newStats;
-                    update.commentary = newCommentary;
-                    update.dynamicTitleAfter = newTitle;
-                    update.narrativeSummary = newNarrative;
-                    if (profileChanges.name) {
-                        update.characterName = newName;
-                    }
-                    // Recalculate change count
-                    let changeCount = 0;
-                    for (const cat of STAT_CATEGORIES) {
-                        for (const stat of STAT_NAMES) {
-                            const before = update.statsBefore?.[cat]?.[stat] ?? 0;
-                            const after = newStats[cat]?.[stat] ?? 0;
-                            if (before !== after) changeCount++;
-                        }
-                    }
-                    update.changeCount = changeCount;
-                    savePendingUpdates(pending);
-
-                    // Refresh the UI
-                    const $pane = $("#rst-p-home");
-                    refreshPending($pane);
-                    toastr?.success?.(`${newName} stats and profile updated manually.`);
-                }
-            }
-        });
+        // Show popup — all saving is handled inside the "Save changes" action callback
+        await popup.show();
     } catch (err) {
         console.error("[RST] Failed to open edit modal:", err);
 
-        // Fallback: use ST Popup input instead of native prompt()
+        // Fallback: use ST Popup with custom button for JSON editing
         try {
-            const { Popup, POPUP_TYPE } = globalThis;
             const fallbackHtml = `
                 <h3>Edit stats for ${charUpdate.characterName}</h3>
                 <p style="font-size:12px;color:var(--rst-text-muted);margin-bottom:8px">
@@ -795,30 +965,38 @@ async function showEditStatsModal(charUpdate, sceneId) {
                 <textarea id="rst-fallback-edit" rows="10" style="width:100%;font-family:monospace;font-size:11px">${JSON.stringify(charUpdate.statsAfter, null, 2)}</textarea>
             `;
             const fallbackPopup = new Popup(fallbackHtml, POPUP_TYPE.TEXT, "", {
-                okButton: "Save",
-                cancelButton: "Cancel",
+                okButton: false, // Hide default OK button — using custom "Save" instead
+                customButtons: [
+                    {
+                        text: "Save",
+                        result: POPUP_RESULT.AFFIRMATIVE,
+                        action: () => {
+                            console.log("[RST] Fallback save triggered for:", charUpdate.characterName);
+                            const newVal = $(fallbackPopup.dlg).find("#rst-fallback-edit").val();
+                            try {
+                                const parsed = JSON.parse(newVal);
+                                console.log("[RST] Fallback parsed stats:", JSON.stringify(parsed));
+                                const pending = getPendingUpdates();
+                                if (pending && pending.characterUpdates) {
+                                    const update = pending.characterUpdates.find((u) => u.characterId === charUpdate.characterId);
+                                    if (update) {
+                                        update.statsAfter = parsed;
+                                        savePendingUpdates(pending);
+                                        console.log("[RST] Fallback saved for:", charUpdate.characterName, parsed);
+                                        const $pane = $("#rst-p-home");
+                                        refreshPending($pane);
+                                        toastr?.success?.(charUpdate.characterName + " stats updated manually.");
+                                    }
+                                }
+                            } catch {
+                                toastr?.error?.("Invalid JSON. Changes discarded.");
+                            }
+                        },
+                    },
+                ],
             });
 
-            fallbackPopup.onConfirmed(async () => {
-                const newVal = $(fallbackPopup.element).find("#rst-fallback-edit").val();
-                try {
-                    const parsed = JSON.parse(newVal);
-                    const pending = getPendingUpdates();
-                    if (pending && pending.characterUpdates) {
-                        const update = pending.characterUpdates.find((u) => u.characterId === charUpdate.characterId);
-                        if (update) {
-                            update.statsAfter = parsed;
-                            savePendingUpdates(pending);
-                            const $pane = $("#rst-p-home");
-                            refreshPending($pane);
-                            toastr?.success?.(charUpdate.characterName + " stats updated manually.");
-                        }
-                    }
-                } catch {
-                    toastr?.error?.("Invalid JSON. Changes discarded.");
-                }
-            });
-
+            // Show popup — saving handled inside action callback
             await fallbackPopup.show();
         } catch (fallbackErr) {
             console.error("[RST] Fallback edit modal also failed:", fallbackErr);
