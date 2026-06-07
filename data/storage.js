@@ -128,6 +128,30 @@ export function saveAllCharacters(characters) {
     saveChatDebounced();
 }
 
+// ─── Folders (Per-Chat) ───────────────────────────────────
+
+/**
+ * Get all folders for the current chat.
+ * @returns {Array<{id: string, name: string, timestamp: number}>}
+ */
+export function getFolders() {
+    ensureChatNamespace();
+    if (!chat_metadata[NAMESPACE].folders) {
+        chat_metadata[NAMESPACE].folders = [];
+    }
+    return chat_metadata[NAMESPACE].folders;
+}
+
+/**
+ * Save the folders array.
+ * @param {Array<{id: string, name: string, timestamp: number}>} folders
+ */
+export function saveFolders(folders) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].folders = folders;
+    saveChatDebounced();
+}
+
 // ─── Per-Chat Data ────────────────────────────────────────
 
 /**
@@ -141,6 +165,7 @@ function ensureChatNamespace() {
             presentCharacters: [],
             messageCounter: 0,
             characters: {},
+            folders: [],
         };
     }
 }
@@ -212,6 +237,25 @@ export function savePresentCharacters(charIds) {
 }
 
 /**
+ * Get the per-chat name blacklist.
+ * @returns {Array<string>}
+ */
+export function getNameBlacklist() {
+    ensureChatNamespace();
+    return chat_metadata[NAMESPACE].nameBlacklist || [];
+}
+
+/**
+ * Save the per-chat name blacklist.
+ * @param {Array<string>} names
+ */
+export function saveNameBlacklist(names) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].nameBlacklist = names;
+    saveChatDebounced();
+}
+
+/**
  * Get the message counter for sidecar scan frequency.
  * @returns {number}
  */
@@ -263,6 +307,7 @@ export function getDefaultSettings() {
             autoGenLLM: "",
         },
 
+        messagesToScan: 10,
         scanFrequency: 5,
         newCharPopup: true,
         statChangeRange: { min: -5, max: 5 },
@@ -272,6 +317,12 @@ export function getDefaultSettings() {
         batchScan: {
             sceneDetectionMaxTokens: 4000,
             initialStatMaxTokens: 3000,
+            requestsPerMinute: 10,
+            maxRetries: 3,
+            baseRetryDelay: 1000,
+            perSceneDelay: 0,
+            interPhaseDelay: 0,
+            combineRanges: true,
         },
 
         injection: {

@@ -77,6 +77,8 @@ export function renderScenesTab($pane) {
             selectedScenes.clear();
             toastr?.info?.(`${count} scene${count > 1 ? "s" : ""} deleted.`);
             renderScenesTab($pane);
+            // Re-add scene buttons to all messages (ST may re-render, which destroys buttons)
+            $(document).trigger("rst:refresh-message-buttons");
         });
 
         $pane.append($toolbar);
@@ -293,10 +295,11 @@ function renderSceneEntry(scene, isOpen) {
             <div style="display:flex;align-items:baseline;gap:6px;margin-bottom:6px;margin-top:10px">
                 <div class="rst-lbl" style="margin-bottom:0">Summary</div>
                 <span style="font-size:11px;color:var(--rst-text-muted)">editable</span>
+                <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-scene-summary-${scene.id}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i>
             </div>
         `);
 
-        const $textarea = $(`<textarea rows="4">${scene.llmSummary || ""}</textarea>`);
+        const $textarea = $(`<textarea id="rst-scene-summary-${scene.id}" rows="4">${scene.llmSummary || ""}</textarea>`);
         $textarea.on("change", function () {
             updateSceneSummary(scene.id, $(this).val());
         });
@@ -325,6 +328,8 @@ function renderSceneEntry(scene, isOpen) {
             toastr?.info?.(`Scene ${sceneNum} deleted.`);
             const $pane = $("#rst-p-scenes");
             renderScenesTab($pane);
+            // Re-add scene buttons to all messages (ST may re-render, which destroys buttons)
+            $(document).trigger("rst:refresh-message-buttons");
         });
 
         $body.append($btnRow);

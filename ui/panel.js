@@ -27,7 +27,7 @@ export function createPanel() {
         <div id="rst_container" class="extension_container">
             <div class="inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header">
-                    <b>Relationship State Tracker</b>
+                    <b>Relationship Stat Tracker</b>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
@@ -64,6 +64,12 @@ export function createPanel() {
     // Append to ST's extension settings area
     $("#extensions_settings").append($container);
 
+    // ST's extensions.js listens on $('html') to close the extensions dropdown.
+    // It checks if the click target is closest to #sd_gen, #extensionsMenuButton,
+    // or #roll_dice — if not, it closes the dropdown. RST is not in that whitelist.
+    // Fix: intercept clicks on the html element in CAPTURE phase before ST's
+    // handler fires, and stop propagation if the click originated inside RST
+    // or any RST body-appended element (context menus, folder pickers).
     return $shell;
 }
 
@@ -152,7 +158,7 @@ export function renderHomeHeader($pane) {
     const $header = $(`
         <div id="rst-header-wrap" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
             <div>
-                <div style="font-size:14px;font-weight:500">Relationship state tracker</div>
+                <div style="font-size:14px;font-weight:500">Relationship Stat Tracker</div>
                 <div id="rst-ext-lbl" style="font-size:11px;color:var(--rst-text-muted)">${statusText}</div>
             </div>
             <label class="rst-toggle">
