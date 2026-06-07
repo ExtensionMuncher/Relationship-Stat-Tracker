@@ -1,6 +1,8 @@
-# Relationship Stat Tracker (RST)
+# Relationship State Tracker (RST)
 
 A SillyTavern extension that tracks relationship stats between characters across roleplay sessions. RST uses a lightweight sidecar LLM to detect which characters are present in your chat, and a main LLM to review closed scenes and generate nuanced stat updates — all without interrupting your primary AI or burning unnecessary tokens.
+
+> **Status: Alpha** — Core systems are functional. Some features are still being stabilized. Expect rough edges. Back up your ST data before use.
 
 ---
 
@@ -14,9 +16,12 @@ A SillyTavern extension that tracks relationship stats between characters across
 - **Scene summaries as LLM notepads** — private notes written by the stat LLM for its own reference between sessions, never injected into your main prompt
 - **System prompt injection** — when a character is detected as present, their full stat block is automatically injected into your system prompt and removed when they leave
 - **Character library** with manual creation, AI-assisted profile generation, and automatic blank-entry creation on new character detection
+- **Folder organization** — characters can be sorted into named folders, with right-click context menus for moving, renaming, and managing entries
+- **Profile pictures** — upload a custom image per character; displays in both the character list chip and the full display screen
+- **Name aliases** — define alternate names and variants per character so the sidecar detects them reliably across different name formats
 - **Update logs** — the last 5 stat change entries per character, with rollback and delete
-- **Batch scan** for long or pre-existing chats — auto-detects scenes and characters, generates profiles and summaries in one pass without compounding on existing data
-- **Fully configurable** — separate connection profiles for each LLM role, adjustable scan frequency, stat change range limits, and injection format controls
+- **Batch scan** with built-in rate limiting — scans pre-existing chats to auto-detect scenes and characters, with configurable rate limiting and retry settings to avoid hitting API provider limits
+- **Fully configurable** — separate connection profiles for each LLM role, adjustable scan frequency, stat change range limits, injection format controls, and passive library reference options
 
 ---
 
@@ -24,7 +29,7 @@ A SillyTavern extension that tracks relationship stats between characters across
 
 - SillyTavern (recent version with extension support)
 - At least one configured connection profile in ST's Connection Manager for stat updates
-- A second connection profile for sidecar detection (can be a smaller/faster/local model)
+- A second connection profile for sidecar detection (can be a smaller/faster/local model — Gemma 3 4b via Ollama works well)
 - Optional: a third profile for auto-generating character profiles
 
 ---
@@ -33,10 +38,10 @@ A SillyTavern extension that tracks relationship stats between characters across
 
 1. Download or clone this repository into your SillyTavern extensions folder:
    ```
-   SillyTavern/public/scripts/extensions/third-party/SillyTavern-Relationship Stat Tracker/
+   SillyTavern/public/scripts/extensions/third-party/Relationship-Stat-Tracker/
    ```
 2. Restart SillyTavern or reload the extensions panel
-3. The extension should appear in your Extensions menu as **Relationship State Tracker**
+3. The extension will appear in your Extensions menu as **Relationship Stat Tracker**
 4. Open the extension panel and go to **Settings** to configure your connection profiles before use
 
 ---
@@ -66,10 +71,11 @@ Under **Settings → Detection settings**:
 
 Under **Settings → Injection settings**:
 
-- **Inject stat block** — toggle the automatic system prompt injection on or off
+- **Inject stat block** — toggle automatic system prompt injection on or off
 - **Inject character profile** — also inject name, description, and notes alongside stats (uses more tokens)
-- **Injection format** — choose between Stats only or Stats + narrative summary
-- **Injection placement** — where in the system prompt the block appears (above character card, below character card, top, or bottom)
+- **Injection format** — Stats only or Stats + narrative summary
+- **Injection placement** — where in the system prompt the block appears
+- **Passive library reference** — allows the stat LLM to passively access all character profiles even when not present in the current scene (off by default — uses more tokens)
 
 ---
 
@@ -79,7 +85,7 @@ Under **Settings → Injection settings**:
 
 When a new scene begins in your chat, click the **▶ Scene start** button that appears in the message action bar. This marks the starting message index and opens a scene entry.
 
-Only one scene can be open at a time. If you try to start a new scene while one is already open, RST will warn you.
+Only one scene can be open at a time.
 
 ### Ending a Scene
 
@@ -93,21 +99,13 @@ When the scene ends, click the **■ Scene end** button on any message. RST will
 
 ### Reviewing Pending Updates
 
-After a scene closes the Home tab will show a Pending Updates section at the top. This contains:
+After a scene closes, the Home tab shows a Pending Updates section. For each character you can:
 
-- The proposed scene summary (editable before approval)
-- Per-character stat blocks showing before→after values for all 12 stats, with per-stat commentary, a dynamic title change, and a narrative summary
-
-For each character you can:
 - **Approve changes** — commits that character's stats permanently
 - **Regenerate** — re-runs the LLM, optionally with additional guidance you type in
 - **Edit manually** — adjust values directly before approving
 
-At the bottom:
-- **Approve all** — commits everything at once
-- **Dismiss all** — discards all pending changes without saving
-
-Nothing is written to your character data until you explicitly approve it.
+At the bottom: **Approve all** commits everything at once. **Dismiss all** discards all pending changes without saving. Nothing is written to your character data until you explicitly approve it.
 
 ---
 
@@ -115,29 +113,31 @@ Nothing is written to your character data until you explicitly approve it.
 
 ### Creating Characters
 
-There are three ways to add a character:
+**Manual** — Click **+ New character**. Fill in name, description, notes, and name aliases.
 
-**Manual** — Click **+ New character** at the top of the Character Library tab. Fill in the name, description, and notes fields yourself.
+**AI-assisted** — Open any character's display screen and click the **✦ wand** button. Optionally type a guidance prompt, then choose Generate from prompt or Generate from scene.
 
-**AI-assisted** — Open any character's display screen and click the **✦ wand** button. You can optionally type a guidance prompt, then choose:
-- **Generate from prompt** — uses your guidance to write the profile
-- **Generate from scene** — pulls from current scene context instead
+**Auto-detected** — When the sidecar finds an unknown name and the new character popup is enabled, a dialog asks whether to create a blank profile entry. Confirming creates the entry with only the name filled in — no tokens spent. Fill it in manually or use the wand later.
 
-**Auto-detected** — When the sidecar LLM finds a name it doesn't recognise and the new character popup is enabled, a dialog will ask: *"New character detected: [Name]. Create a profile?"* Confirming creates a blank entry with only the name filled in — no tokens are spent on generating details. You can fill it in manually or use the wand later.
+### Name Aliases
 
-### Character Display Screen
+Each character profile has a **Name Aliases** field for alternate names, nicknames, and name variants (comma-separated). The sidecar uses these when scanning for character presence, so characters with multiple name formats are detected correctly.
 
-Selecting a character from the list opens their display, which shows:
+### Folders
 
-- Name, source label, description, and notes (all editable)
-- The full stat block across all three categories — click any category to expand per-stat commentary
-- Dynamic title and narrative summary
-- **◷ Clock icon** — toggles the update log showing the last 5 stat change entries, each with message range references, commentary, and rollback/delete options
-- **✕ Delete** — removes the character profile entirely
+Characters can be organized into named folders. Click **+ New folder** to create one. Right-click any character chip to access Move to folder, Rename, Export profile, or Delete.
+
+The folder label shown under a character's name in the display screen is also clickable and opens the same folder picker.
+
+Deleting a folder never deletes characters — all characters inside are moved to Unfiled automatically.
+
+### Profile Pictures
+
+Click the avatar circle on any character's display screen to upload an image. The image is stored as base64 in the character's profile and replaces the initials display in both the character list and the display screen.
 
 ### Update Log
 
-Each log entry contains the complete before→after record for all 12 stats, including stats that did not change (logged as `0% → 0%` with an explanation). This gives the stat LLM full narrative continuity when reviewing future scenes.
+The ◷ clock icon on any character's display screen shows the last 5 stat update entries. Each entry includes the complete before→after record for all 12 stats (including zero-change entries with explanations), per-stat commentary, and the message range the update covers.
 
 **Rollback** restores the character's stats to their state before that entry. **Delete** removes only that log entry.
 
@@ -145,15 +145,7 @@ Each log entry contains the complete before→after record for all 12 stats, inc
 
 ## Scenes Tab
 
-The Scenes tab lists all closed scenes chronologically. Each entry shows the scene number, message range, characters present, and status.
-
-Expanding a scene reveals its **LLM summary** — the private notepad entry written by the stat LLM when the scene closed. This summary is:
-
-- Editable by you at any time
-- Used as reference context when the LLM reviews future scenes
-- **Never injected into your main ST prompt** — your primary AI does not see these
-
-Delete a scene to remove it and its summary entirely.
+Lists all closed scenes chronologically. Each entry is expandable and shows an editable LLM summary — the private notepad entry written by the stat LLM when the scene closed. These summaries are never injected into your main ST prompt. Delete a scene to remove it and its summary entirely.
 
 ---
 
@@ -164,8 +156,8 @@ Delete a scene to remove it and its summary entirely.
 | Stat update LLM | Connection profile for scene review and stat generation | — |
 | Sidecar detection LLM | Connection profile for character presence scanning | — |
 | Auto-gen profile LLM | Connection profile for profile generation | — |
-| Batch scan | One-time scan of full chat history to bootstrap characters, scenes, and stats | — |
-| Scene summary prompt | Editable prompt controlling how the LLM writes scene summaries | See below |
+| Batch scan | One-time scan of full chat history | — |
+| Scene summary prompt | Editable prompt for how the LLM writes scene summaries | See below |
 | Stat change range | Min/max points a stat can shift per scene close | -5 to +5 |
 | Scan frequency | Messages between sidecar detection calls | 5 |
 | New character popup | Prompt on unknown character detection | On |
@@ -173,47 +165,44 @@ Delete a scene to remove it and its summary entirely.
 | Inject character profile | Also inject name, description, notes | On |
 | Injection format | Stats only / Stats + narrative | Stats + narrative |
 | Injection placement | Position in system prompt | Above character card |
+| Passive library reference | LLM can access all profiles even when not present | Off |
 
 ### Default Scene Summary Prompt
 
 > Write a concise scene summary for internal reference. Include: key events, emotional turning points, characters present, and any significant relationship shifts. Keep it clinical and factual — this is a note for future analysis, not a narrative retelling.
 
-This is the only user-editable prompt in RST. All other internal prompts are fixed to ensure consistent stat generation.
-
 ---
 
 ## Batch Scan
 
-For long or pre-existing chats, the **Run batch scan** button in Settings will:
+For long or pre-existing chats, **Run batch scan** in Settings will:
 
 1. Scan your full chat history to detect scene boundaries and character names
 2. Create blank character profiles for any unrecognised names
 3. Generate an initial stat block per character based on the full history
 4. Generate scene summaries for detected scenes
 
-Batch scan runs once and does not compound — running it again on a chat that already has RST data will not overwrite or stack on top of existing records.
-
----
+Batch scan runs once and does not compound on existing data.
 
 ### Rate Limiting
- 
-Batch scan has built-in rate limiting and retry handling to avoid overwhelming your API provider during large scans. All values are configurable in Settings under the batch scan options:
- 
+
+Batch scan has built-in rate limiting and retry handling. All values are configurable under the batch scan options in Settings:
+
 | Setting | Description | Default |
 |---|---|---|
 | Requests per minute | Maximum LLM calls per minute during the scan | 10 |
 | Max retries | How many times to retry a failed request before giving up | 3 |
-| Base retry delay | Starting delay in milliseconds before the first retry (doubles on each subsequent attempt) | 1000ms |
+| Base retry delay | Starting delay in ms before the first retry (doubles on each attempt) | 1000ms |
 | Per-scene delay | Additional pause between scene processing steps | 0ms |
-| Inter-phase delay | Pause between major scan phases (detection → stat generation) | 0ms |
- 
-If you are on a provider with strict rate limits or a slower tier, increase the requests per minute limit downward and raise the base retry delay to give your provider more breathing room. If you are hitting 429 errors during a scan, lowering requests per minute is the first thing to adjust.
+| Inter-phase delay | Pause between major scan phases | 0ms |
+
+If you are hitting 429 errors during a scan, reduce requests per minute and increase the base retry delay.
 
 ---
 
 ## Stat Structure Reference
 
-Every character tracked by RST has exactly 12 stats across three fixed categories:
+Every character has exactly 12 stats across three fixed categories:
 
 ```
 Platonic  — Trust, Openness, Support, Affection
@@ -221,52 +210,52 @@ Romantic  — Trust, Openness, Support, Affection
 Sexual    — Trust, Openness, Support, Affection
 ```
 
-All values are percentages and can be negative. Positive values display in green, negative in red, zero in grey.
+All values are percentages and can be negative. Positive values display in green, negative in red, zero in grey. Stats are bounded to [-100, 100]. Per-scene changes are bounded by your configured stat change range (default -5 to +5).
 
-Stats are bounded to [-100, 100]. Per-scene changes are bounded by your configured stat change range (default -5 to +5 per scene close).
-
-Every stat change — including zero-change entries — is recorded in the update log with a written explanation. This ensures the stat LLM always has a complete narrative reference when reviewing the next scene.
+Every stat change — including zero-change entries — is recorded in the update log with a written explanation.
 
 ---
 
 ## Data Storage
 
-RST stores data in two places within SillyTavern:
+- **Global extension settings** (`extension_settings.rst`) — configuration, connection profiles, preferences. Shared across all chats.
+- **Per-chat metadata** (`chat_metadata.rst`) — character profiles, folders, scenes, stat history, and pending updates. Specific to each chat file.
 
-- **Global extension settings** (`extension_settings.rst`) — your configuration, connection profiles, and preferences. Shared across all chats.
-- **Per-chat metadata** (`chat_metadata.rst`) — character profiles, scenes, stat history, and pending updates. Specific to each chat file.
-
-This means character profiles and relationship stats are tied to the chat they were built in. Use the **Export** and **Import** options in the Character Library or Settings to move data between chats.
+Use the Export and Import options in the Character Library or Settings to move data between chats.
 
 ---
 
-## Import / Export
+## Planned Features
 
-- **Character Library → Export** — saves all character profiles for the current chat as a JSON file
-- **Character Library → Import** — imports character profiles, validating each entry before committing
-- **Settings → Export all / Import all** — saves or restores your full RST configuration including settings
+### Critical Stat Changes
+Certain significant moments within a roleplay scene will trigger a stat change at three times the normal configured range. These moments are determined by the stat update LLM based on narrative weight, making large relationship shifts feel earned rather than mechanical. The threshold multiplier and what qualifies as a critical moment are both RNG-influenced, keeping outcomes unpredictable.
+
+### Threshold Locks
+
+#### Hard Locks
+The stat update LLM will be able to set hard caps on individual stats based on a character's personality, psychology, and history. A heavily traumatized character who struggles with trust may have a hard lock on their Trust stats that prevents growth beyond a certain point regardless of what happens in scenes — keeping stat progression true to who the character is.
+
+#### Soft Locks (Unlockable)
+A softer cap that pauses growth in a specific stat until defined conditions are met. The user character may need to reach a certain threshold in another stat, perform specific actions, or meet narrative requirements before growth resumes. Soft locks are designed to be broken — they represent barriers to intimacy or connection that can be overcome through the story, not permanent ceilings.
+
+### Search and Filter
+Full text search across the character library, with filter controls for presence status, folder, and stats state.
+
+### Slash Commands
+Slash command support for triggering scene start/end and other RST actions directly from the ST chat input.
 
 ---
 
-## Tips
+## Known Limitations (Alpha)
 
-- Use a fast local model for the sidecar detection role — it runs frequently and only needs to return a list of names
-- The stat update LLM benefits from being your strongest available model — it needs to reason about emotional context, narrative arc, and relationship dynamics
-- Scene summaries are your LLM's memory between sessions. If something important happens that you want the stat LLM to remember, you can edit the summary directly in the Scenes tab
-- Stats can go negative — this is intentional. A character can have genuinely negative affection, openness, or trust toward the user character
-- The passive library reference (off by default in injection settings) lets the LLM passively know which characters exist even when they are not present in the current scene, at the cost of additional tokens per message
-
----
-
-## Known Limitations (Beta)
-
-- Slash command support is currently a placeholder and will be implemented in a future update
+- Slash command support is currently a placeholder — not yet functional
 - Batch scan performance on very long chats depends on your stat update LLM's context window
-- Character profiles are stored per-chat — a character appearing across multiple chat files will need separate profiles in each
+- Character profiles are stored per-chat — a character appearing across multiple chat files needs a separate profile in each
+- The stat approval flow does not yet support approving individual stat changes — approval is per character
 
 ---
 
 ## Version
 
-**0.1.0** — Beta release  
+**0.1.0** — Alpha release
 Author: ExtensionMuncher
