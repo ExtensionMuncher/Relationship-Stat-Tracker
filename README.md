@@ -19,3 +19,7 @@ This allows the AI to set caps on an NPC's stats based on their personality, psy
 ### Soft Locks (Unlockable)
 
 This is a softer cap that may require the {{user}} to perform certain actions or meet certain thresholds to continue relationship growth with the respective NPC. Stat growth will not be allowed in the locked stat until these thresholds are met.
+
+## Tool Calling
+
+Creating a new connection profile that will allow the LLM to have access to NPC stats even if they aren't actively present.
