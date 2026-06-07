@@ -238,6 +238,10 @@ The stat update LLM will be able to set hard caps on individual stats based on a
 #### Soft Locks (Unlockable)
 A softer cap that pauses growth in a specific stat until defined conditions are met. The user character may need to reach a certain threshold in another stat, perform specific actions, or meet narrative requirements before growth resumes. Soft locks are designed to be broken — they represent barriers to intimacy or connection that can be overcome through the story, not permanent ceilings.
 
+## Tool Calling
+
+Creating a new connection profile that will allow the LLM to have access to NPC stats even if they aren't actively present.
+
 ### Search and Filter
 Full text search across the character library, with filter controls for presence status, folder, and stats state.
 
