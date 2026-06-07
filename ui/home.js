@@ -363,10 +363,12 @@ function renderPresentCharacters($pane) {
             if (!profile) continue;
 
             const initials = getInitials(profile.name);
+            let avContent = initials;
+            if (profile.avatar) { avContent = `<img src="${profile.avatar}" alt="">`; }
             const $chip = $(`
                 <div class="rst-chip" style="cursor:pointer">
                     <div class="rst-dot"></div>
-                    <div class="rst-av">${initials}</div>
+                    <div class="rst-av">${avContent}</div>
                     <span style="font-weight:500">${profile.name}</span>
                     <span class="rst-present-remove" data-char-id="${charId}" style="cursor:pointer;color:var(--rst-danger);margin-left:4px;font-size:13px;line-height:1" title="Remove from presence">✕</span>
                 </div>
