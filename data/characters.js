@@ -48,7 +48,22 @@ export function createBlankStats() {
  * @returns {object} The new profile
  */
 export function createCharacter(name, options = {}) {
-    // Check for name collisions (same words, different order)
+    const id = generateCharacterId(name);
+
+    // GUARD: if a profile already exists at this deterministic ID, return it
+    // instead of overwriting. createCharacter() is called from detection/scan
+    // paths whenever the LLM names a character — without this guard, re-detecting
+    // an existing character clobbered its saved profile (aliases, stats, and
+    // update log were silently wiped). Returning the existing profile is
+    // backward-compatible: it only prevents destruction of saved data.
+    const existing = getStoredCharacter(id);
+    if (existing) {
+        return existing;
+    }
+
+    // Check for name collisions (same words, different order) — different ID,
+    // so not caught by the guard above. Warn but allow (user may genuinely want
+    // a distinct profile).
     const similar = findCharacterBySimilarName(name);
     if (similar) {
         console.warn(`[RST] Name collision detected: "${name}" is similar to existing character "${similar.name}" (id=${similar.id})`);
@@ -58,8 +73,6 @@ export function createCharacter(name, options = {}) {
             { timeOut: 8000, closeButton: true }
         );
     }
-
-    const id = generateCharacterId(name);
 
     const profile = {
         id,
@@ -350,6 +363,7 @@ export function addUpdateLogEntry(charId, logEntry) {
     const profile = getStoredCharacter(charId);
     if (!profile) return;
 
+    if (!Array.isArray(profile.updateLog)) profile.updateLog = [];
     profile.updateLog.unshift(logEntry);
     if (profile.updateLog.length > MAX_UPDATE_LOG) {
         profile.updateLog = profile.updateLog.slice(0, MAX_UPDATE_LOG);
@@ -367,6 +381,7 @@ export function removeUpdateLogEntry(charId, sceneId) {
     const profile = getStoredCharacter(charId);
     if (!profile) return;
 
+    if (!Array.isArray(profile.updateLog)) profile.updateLog = [];
     profile.updateLog = profile.updateLog.filter((entry) => entry.sceneId !== sceneId);
     saveCharacter(charId, profile);
 }
@@ -380,6 +395,7 @@ export function removeUpdateLogEntryByTimestamp(charId, timestamp) {
     const profile = getStoredCharacter(charId);
     if (!profile || !timestamp) return;
 
+    if (!Array.isArray(profile.updateLog)) profile.updateLog = [];
     profile.updateLog = profile.updateLog.filter((entry) => entry.timestamp !== timestamp);
     saveCharacter(charId, profile);
 }
@@ -556,9 +572,10 @@ function validateProfile(profile) {
         }
     }
 
-    // Required: updateLog must be an array
-    if (!Array.isArray(profile.updateLog)) {
-        errors.push("Missing or invalid 'updateLog' (must be an array)");
+    // updateLog should be an array; tolerate a legacy profile that predates it
+    // (treat absent as empty rather than rejecting valid old data on import).
+    if (profile.updateLog !== undefined && !Array.isArray(profile.updateLog)) {
+        errors.push("Invalid 'updateLog' (must be an array if present)");
     }
 
     // Optional fields: type checks
