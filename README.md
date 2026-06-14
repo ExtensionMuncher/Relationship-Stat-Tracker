@@ -27,7 +27,7 @@ A SillyTavern extension that tracks relationship stats between characters across
 
 ## Requirements
 
-- SillyTavern (recent version with extension support)
+- SillyTavern 1.18.0 (or higher)
 - At least one configured connection profile in ST's Connection Manager for stat updates
 - A second connection profile for sidecar detection (can be a smaller/faster/local model — Gemma 3 4b via Ollama works well)
 - Optional: a third profile for auto-generating character profiles
@@ -232,15 +232,17 @@ Certain significant moments within a roleplay scene will trigger a stat change a
 
 ### Threshold Locks
 
+To enhance the quality and realism of characters, I will introduce a stat lock/unlock system to provide more emotional depth to roleplays. This is a toggleable feature, meaning you do *not* have to use it if you don't want to. If you do decide to use it, the Personality section of the Character Profile is required to be filled in so the LLM has a reference point of the respective character's traits in order to make decisions on when/how to place locks and unlocks.
+
 #### Hard Locks
 The stat update LLM will be able to set hard caps on individual stats based on a character's personality, psychology, and history. A heavily traumatized character who struggles with trust may have a hard lock on their Trust stats that prevents growth beyond a certain point regardless of what happens in scenes — keeping stat progression true to who the character is.
 
 #### Soft Locks (Unlockable)
 A softer cap that pauses growth in a specific stat until defined conditions are met. The user character may need to reach a certain threshold in another stat, perform specific actions, or meet narrative requirements before growth resumes. Soft locks are designed to be broken — they represent barriers to intimacy or connection that can be overcome through the story, not permanent ceilings.
 
-## Tool Calling
+## Function Calling
 
-Creating a new connection profile that will allow the LLM to have access to NPC stats even if they aren't actively present.
+Allowing your main LLM to use tool-calling features (if the LLM supports it) to have access to NPC stats even if they aren't actively present.
 
 ### Search and Filter
 Full text search across the character library, with filter controls for presence status, folder, and stats state.
