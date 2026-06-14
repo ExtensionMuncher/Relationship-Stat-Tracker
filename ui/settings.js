@@ -103,11 +103,61 @@ function renderConnectionProfiles($card, settings) {
     $card.append($twoCol);
     $card.append($autoGen);
 
+    // No-think (per connection profile)
+    const $noThink = $(`
+        <div style="margin-top:14px;font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--rst-text-muted)">No-think (per profile)</div>
+        <div style="font-size:11px;color:var(--rst-text-faint,#999);margin:4px 0 8px;line-height:1.4">
+            Soft appends <code>/no_think</code> (safe, ignored if unsupported). Hard also sends API params (<code>think</code>/<code>enable_thinking=false</code>) — turn off if your backend errors.
+        </div>
+        <div id="rst-nothink-rows"></div>
+    `);
+    $card.append($noThink);
+
+    const RST_NT_ROLES = {
+        statUpdateLLM: "Stat update",
+        sidecarLLM: "Sidecar detection",
+        autoGenLLM: "Auto-gen profile",
+    };
+    function rstRenderNoThinkRows() {
+        const $rows = $card.find("#rst-nothink-rows");
+        if (!$rows.length) return;
+        const conns = settings.connections || {};
+        const softMap = (settings.noThinkProfiles && typeof settings.noThinkProfiles === "object") ? settings.noThinkProfiles : {};
+        const hardMap = (settings.noThinkHardProfiles && typeof settings.noThinkHardProfiles === "object") ? settings.noThinkHardProfiles : {};
+        $rows.empty();
+        Object.keys(RST_NT_ROLES).forEach(roleKey => {
+            const pid = conns[roleKey] || "";
+            const dis = pid ? "" : "disabled";
+            const label = pid ? RST_NT_ROLES[roleKey] : `${RST_NT_ROLES[roleKey]} <span style="color:#a66">(no profile)</span>`;
+            const $row = $(`
+                <div style="display:flex;align-items:center;gap:14px;padding:5px 0;border-bottom:0.5px solid #2a2a2a">
+                    <span style="flex:1;font-size:12px;color:var(--rst-text-muted)">${label}</span>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--rst-text-faint,#999);cursor:pointer"><input type="checkbox" class="rst-nt-soft" ${softMap[pid] ? "checked" : ""} ${dis}> soft</label>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--rst-text-faint,#999);cursor:pointer"><input type="checkbox" class="rst-nt-hard" ${hardMap[pid] ? "checked" : ""} ${dis}> hard</label>
+                </div>
+            `);
+            $row.find(".rst-nt-soft").on("change", function () {
+                const m = (settings.noThinkProfiles && typeof settings.noThinkProfiles === "object") ? settings.noThinkProfiles : {};
+                if (this.checked) m[pid] = true; else delete m[pid];
+                settings.noThinkProfiles = m;
+                saveSetting("noThinkProfiles", m);
+            });
+            $row.find(".rst-nt-hard").on("change", function () {
+                const m = (settings.noThinkHardProfiles && typeof settings.noThinkHardProfiles === "object") ? settings.noThinkHardProfiles : {};
+                if (this.checked) m[pid] = true; else delete m[pid];
+                settings.noThinkHardProfiles = m;
+                saveSetting("noThinkHardProfiles", m);
+            });
+            $rows.append($row);
+        });
+    }
+    rstRenderNoThinkRows();
+
     try {
         ConnectionManagerRequestService.handleDropdown(
             "#rst-conn-stat",
             settings.connections?.statUpdateLLM || "",
-            (profile) => { saveSetting("connections.statUpdateLLM", profile?.id || ""); },
+            (profile) => { saveSetting("connections.statUpdateLLM", profile?.id || ""); if (settings.connections) settings.connections.statUpdateLLM = profile?.id || ""; rstRenderNoThinkRows(); },
         );
     } catch (err) {
         console.warn("[RST] Connection Manager not available for stat update LLM:", err);
@@ -117,7 +167,7 @@ function renderConnectionProfiles($card, settings) {
         ConnectionManagerRequestService.handleDropdown(
             "#rst-conn-sidecar",
             settings.connections?.sidecarLLM || "",
-            (profile) => { saveSetting("connections.sidecarLLM", profile?.id || ""); },
+            (profile) => { saveSetting("connections.sidecarLLM", profile?.id || ""); if (settings.connections) settings.connections.sidecarLLM = profile?.id || ""; rstRenderNoThinkRows(); },
         );
     } catch (err) {
         console.warn("[RST] Connection Manager not available for sidecar LLM:", err);
@@ -127,7 +177,7 @@ function renderConnectionProfiles($card, settings) {
         ConnectionManagerRequestService.handleDropdown(
             "#rst-conn-autogen",
             settings.connections?.autoGenLLM || "",
-            (profile) => { saveSetting("connections.autoGenLLM", profile?.id || ""); },
+            (profile) => { saveSetting("connections.autoGenLLM", profile?.id || ""); if (settings.connections) settings.connections.autoGenLLM = profile?.id || ""; rstRenderNoThinkRows(); },
         );
     } catch (err) {
         console.warn("[RST] Connection Manager not available for auto-gen LLM:", err);

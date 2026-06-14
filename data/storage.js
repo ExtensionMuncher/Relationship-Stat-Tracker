@@ -301,6 +301,17 @@ export function getDefaultSettings() {
     return {
         enabled: true,
 
+        // No-think soft switch: append "/no_think" to each LLM call to disable
+        // reasoning on supporting models (Qwen3, etc.). Harmless to others.
+        noThink: false,
+        // No-think hard switch: also send API params (think/enable_thinking=false).
+        // Off by default — some backends error on unknown body keys.
+        noThinkHard: false,
+        // Per-profile no-think, keyed by connection profile ID. Take precedence
+        // over the blanket booleans above when present.
+        noThinkProfiles: {},
+        noThinkHardProfiles: {},
+
         connections: {
             statUpdateLLM: "",
             sidecarLLM: "",

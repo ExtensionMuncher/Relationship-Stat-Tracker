@@ -13,6 +13,7 @@
 import { getContext } from "../../../../extensions.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 import { setRSTInternalGen } from "../inject/promptInjector.js";
+import { getSetting } from "../settings.js";
 
 // ─── Rate Limiter ───────────────────────────────────────────
 
@@ -226,6 +227,14 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
     // Mark internal generation to suppress passive library reference self-injection
     setRSTInternalGen(true);
 
+    // Per-profile no-think resolution, keyed by profile ID. Backward-compat: the
+    // old blanket booleans (noThink / noThinkHard), if true, apply to all
+    // profiles until a per-profile map is set.
+    const softMap = getSetting("noThinkProfiles", null);
+    const hardMap = getSetting("noThinkHardProfiles", null);
+    const softOn = (softMap && typeof softMap === "object") ? !!softMap[profileId] : getSetting("noThink", false);
+    const hardOn = (hardMap && typeof hardMap === "object") ? !!hardMap[profileId] : getSetting("noThinkHard", false);
+
     try {
         // Wrap the actual API call with rate limiter + retry logic
         const response = await rateLimiter.executeWithRetry(profileId, async () => {
@@ -237,7 +246,14 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
                 messages.push({ role: 'system', content: systemPrompt });
             }
             if (userPrompt) {
-                messages.push({ role: 'user', content: userPrompt });
+                // No-think soft switch: append "/no_think" to the user message
+                // when enabled for this profile. Reliable in the user turn;
+                // harmless to other models.
+                let finalUser = userPrompt;
+                if (softOn) {
+                    finalUser = finalUser + "\n\n/no_think";
+                }
+                messages.push({ role: 'user', content: finalUser });
             }
 
             // Build override payload with max_tokens and optional temperature override
@@ -246,6 +262,17 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
             };
             if (temperature !== null) {
                 overridePayload.temperature = temperature;
+            }
+
+            // No-think HARD switch (per-profile, opt-in). Some backends ERROR on
+            // unknown body keys, so this is only sent when enabled for this
+            // profile. Tolerant backends ignore keys they don't recognize.
+            if (hardOn) {
+                overridePayload.think = false;
+                overridePayload.enable_thinking = false;
+                overridePayload.chat_template_kwargs = Object.assign(
+                    {}, overridePayload.chat_template_kwargs, { enable_thinking: false }
+                );
             }
 
             return await ConnectionManagerRequestService.sendRequest(
