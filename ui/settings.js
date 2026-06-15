@@ -75,6 +75,32 @@ export function renderSettingsTab($pane) {
     renderAccordion($pane, "Data", ($body) => {
         renderDataSection($body);
     });
+
+    renderAccordion($pane, "Debug", ($body) => {
+        renderDebugSettings($body, settings);
+    });
+}
+
+// ─── Debug Settings ───────────────────────────────────────
+
+function renderDebugSettings($pane, settings) {
+    const $card = $('<div class="rst-card"></div>');
+    $card.append(`
+        <div class="rst-setting-row" style="border-bottom:none">
+            <div>
+                <div class="rst-setting-label">Debug F12 logging</div>
+                <div class="rst-setting-sub">Show RST activity logs in the browser console · warnings and errors always show</div>
+            </div>
+            <label class="rst-toggle"><input type="checkbox" id="rst-debug-toggle" ${settings.debug ? "checked" : ""}><span class="rst-slider"></span></label>
+        </div>
+    `);
+    $pane.append($card);
+
+    $("#rst-debug-toggle").on("change", function () {
+        const on = $(this).prop("checked");
+        saveSetting("debug", on);
+        toastr?.info?.(`Debug logging ${on ? "enabled" : "disabled"}.`, "Relationship Stat Tracker");
+    });
 }
 
 // ─── Connection Profiles ──────────────────────────────────

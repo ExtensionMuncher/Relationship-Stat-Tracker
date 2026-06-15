@@ -10,6 +10,7 @@ import { makeRequest } from "./connections.js";
 import { getSettings, getNameBlacklist } from "../data/storage.js";
 import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneTitle } from "../data/scenes.js";
+import { dlog } from "../lib/debug.js";
 
 // ─── Auto-created Character Tracking ──────────────────────
 // Tracks which character IDs were auto-created during a generation cycle
@@ -52,13 +53,13 @@ export async function generateStatUpdate(sceneId, guidance = "") {
     if (!scene) throw new Error(`Scene ${sceneId} not found`);
 
     const profileName = settings.connections.statUpdateLLM;
-    console.log("[RST] generateStatUpdate using profileName:", JSON.stringify(profileName), "sceneId:", sceneId);
+    dlog("[RST] generateStatUpdate using profileName:", JSON.stringify(profileName), "sceneId:", sceneId);
 
     const sceneMessages = getSceneMessages(scene);
     const characters = getSceneCharacters(scene);
     const pastSummaries = getAllSceneSummaries();
 
-    console.log("[RST] generateStatUpdate scene messages:", sceneMessages.length, "characters:", characters.length, "pastSummaries:", pastSummaries.length);
+    dlog("[RST] generateStatUpdate scene messages:", sceneMessages.length, "characters:", characters.length, "pastSummaries:", pastSummaries.length);
 
     if (characters.length === 0) {
         console.warn("[RST] No characters found in scene — cannot generate stat update");
@@ -70,7 +71,7 @@ export async function generateStatUpdate(sceneId, guidance = "") {
         const newChars = characters.filter((c) => isNewCharacter(c));
         const existingChars = characters.filter((c) => !isNewCharacter(c));
 
-        console.log("[RST] New characters:", newChars.length, "Existing characters:", existingChars.length);
+        dlog("[RST] New characters:", newChars.length, "Existing characters:", existingChars.length);
 
         let sceneSummary = "";
         let sceneTitle = "";
@@ -277,7 +278,7 @@ function parseStatUpdateResponse(response, characters) {
     if (!parsed) {
         const fallbackResult = parseStatUpdateAnalysisText(response, characters);
         if (fallbackResult) {
-            console.log("[RST] Parsed stat update response using analysis-text fallback");
+            dlog("[RST] Parsed stat update response using analysis-text fallback");
             return fallbackResult;
         }
     }
@@ -371,7 +372,7 @@ function parseStatUpdateResponse(response, characters) {
                 });
                 if (matchedExisting) {
                     // Name matches existing character — create update entry instead of duplicate
-                    console.log(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating update entry`);
+                    dlog(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating update entry`);
                     const statsBefore = cloneStats(matchedExisting.stats);
                     const settings = getSettings();
                     const range = settings.statChangeRange || { min: -5, max: 5 };
@@ -401,7 +402,7 @@ function parseStatUpdateResponse(response, characters) {
                     });
                 } else {
                     // Truly new character — create new profile
-                    console.log("[RST] LLM discovered additional character:", llmName);
+                    dlog("[RST] LLM discovered additional character:", llmName);
                     const newChar = createCharacter(llmName, { source: "auto_generated" });
                     if (newChar) {
                         _autoCreatedIds.add(newChar.id);
@@ -834,7 +835,7 @@ function getSceneCharacters(scene) {
         }
     }
     const isMultiCharRP = uniqueSpeakers.size <= 1 && charIds.length > 1;
-    console.log(`[RST] getSceneCharacters: uniqueSpeakers=${uniqueSpeakers.size}, sceneHasChars=${charIds.length}, isMultiCharRP=${isMultiCharRP}`);
+    dlog(`[RST] getSceneCharacters: uniqueSpeakers=${uniqueSpeakers.size}, sceneHasChars=${charIds.length}, isMultiCharRP=${isMultiCharRP}`);
 
     if (!isMultiCharRP) {
         // Step 2 (single-character RP): Scan scene message speakers for additional characters.
@@ -852,7 +853,7 @@ function getSceneCharacters(scene) {
             }
         }
     } else {
-        console.log("[RST] Multi-character RP detected — trusting scene.charactersPresent, skipping speaker-name scan.");
+        dlog("[RST] Multi-character RP detected — trusting scene.charactersPresent, skipping speaker-name scan.");
     }
 
     // Step 3: Build character list from found IDs + auto-create unknowns
@@ -864,7 +865,7 @@ function getSceneCharacters(scene) {
 
     // Auto-create characters for unknown non-user speakers (single-character RP only)
     if (unknownSpeakers.size > 0) {
-        console.log("[RST] Auto-creating", unknownSpeakers.size, "character(s) from scene speakers:", [...unknownSpeakers]);
+        dlog("[RST] Auto-creating", unknownSpeakers.size, "character(s) from scene speakers:", [...unknownSpeakers]);
         for (const name of unknownSpeakers) {
             const char = createCharacter(name, { source: "auto_generated" });
             if (char) {
@@ -888,10 +889,10 @@ function getSceneCharacters(scene) {
     const filteredChars = chars.filter(c => c && !isExcluded(c.name));
     const removedCount = chars.length - filteredChars.length;
     if (removedCount > 0) {
-        console.log(`[RST] getSceneCharacters: removed ${removedCount} excluded character(s) from scene character list`);
+        dlog(`[RST] getSceneCharacters: removed ${removedCount} excluded character(s) from scene character list`);
     }
 
-    console.log("[RST] getSceneCharacters: found", filteredChars.length, "characters (scene had", charIds.length, "registered)");
+    dlog("[RST] getSceneCharacters: found", filteredChars.length, "characters (scene had", charIds.length, "registered)");
     return filteredChars;
 }
 
@@ -1267,7 +1268,7 @@ function parseInitialStatResponse(response, characters) {
         // Try analysis-text fallback before giving up on character data
         const fallbackResult = parseStatUpdateAnalysisText(response, characters);
         if (fallbackResult) {
-            console.log("[RST] Parsed initial stat response using analysis-text fallback");
+            dlog("[RST] Parsed initial stat response using analysis-text fallback");
             return fallbackResult;
         }
         const partial = extractPartialData(response);
@@ -1368,7 +1369,7 @@ function parseInitialStatResponse(response, characters) {
                 });
                 if (matchedExisting) {
                     // Name matches existing character — create update entry instead of duplicate
-                    console.log(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating initial stat update entry`);
+                    dlog(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating initial stat update entry`);
                     const statsAfter = {};
                     for (const cat of STAT_CATEGORIES) {
                         statsAfter[cat] = {};
@@ -1406,7 +1407,7 @@ function parseInitialStatResponse(response, characters) {
                     });
                 } else {
                     // Truly new character — create new profile
-                    console.log("[RST] LLM discovered additional character (initial stat):", llmName);
+                    dlog("[RST] LLM discovered additional character (initial stat):", llmName);
                     const newChar = createCharacter(llmName, { source: "auto_generated" });
                     if (newChar) {
                         _autoCreatedIds.add(newChar.id);

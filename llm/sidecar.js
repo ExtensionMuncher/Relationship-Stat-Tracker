@@ -8,6 +8,7 @@ import { getContext } from "../../../../extensions.js";
 import { makeRequest } from "./connections.js";
 import { getSettings, getNameBlacklist } from "../data/storage.js";
 import { getAllCharacters, getCharacterNameVariants, findCharacterByFuzzyName } from "../data/characters.js";
+import { dlog } from "../lib/debug.js";
 
 // ─── Sidecar Detection ────────────────────────────────────
 
@@ -32,7 +33,7 @@ export async function detectCharacters(messageCount = null) {
     const systemPrompt = buildSidecarSystemPrompt();
     const requestPrompt = buildSidecarRequestPrompt(messages, knownNames);
 
-    console.log("[RST] detectCharacters: using profile=" + profileName + ", messages=" + messages.length + ", knownNames=" + knownNames.length);
+    dlog("[RST] detectCharacters: using profile=" + profileName + ", messages=" + messages.length + ", knownNames=" + knownNames.length);
 
     try {
         const result = await makeRequest(
@@ -42,12 +43,12 @@ export async function detectCharacters(messageCount = null) {
             3000,
         );
 
-        console.log("[RST] detectCharacters: LLM response received, len=" + (result ? result.length : 0) + ", preview=" + (result ? result.substring(0, 200) : "null"));
+        dlog("[RST] detectCharacters: LLM response received, len=" + (result ? result.length : 0) + ", preview=" + (result ? result.substring(0, 200) : "null"));
 
         if (!result) return { detected: [], unknown: [] };
 
         const detectedNames = parseDetectedNames(result);
-        console.log("[RST] detectCharacters: parsed names:", JSON.stringify(detectedNames));
+        dlog("[RST] detectCharacters: parsed names:", JSON.stringify(detectedNames));
 
         // ── Post-filter: verify names against actual message content ──
         // LLMs often include characters who are only mentioned or described
@@ -56,9 +57,9 @@ export async function detectCharacters(messageCount = null) {
         const verifiedNames = filterByMessagePresence(detectedNames, messages);
         const removedNames = detectedNames.filter(n => !verifiedNames.includes(n));
         if (removedNames.length > 0) {
-            console.log("[RST] detectCharacters: post-filter removed (mentioned-only or narration-only):", JSON.stringify(removedNames));
+            dlog("[RST] detectCharacters: post-filter removed (mentioned-only or narration-only):", JSON.stringify(removedNames));
         }
-        console.log("[RST] detectCharacters: post-filter kept:", JSON.stringify(verifiedNames));
+        dlog("[RST] detectCharacters: post-filter kept:", JSON.stringify(verifiedNames));
 
         return categorizeNames(verifiedNames, knownNames);
     } catch (err) {
@@ -140,7 +141,7 @@ function parseDetectedNames(response) {
 
     const raw = response.trim();
 
-    console.log("[RST] parseDetectedNames: input len=" + raw.length + " preview=" + raw.substring(0, 250));
+    dlog("[RST] parseDetectedNames: input len=" + raw.length + " preview=" + raw.substring(0, 250));
 
     // ── Guard: if the entire response is clearly thinking prose with no JSON,
     //    skip the line-based fallback. JSON extraction strategies are still tried,
@@ -161,20 +162,20 @@ function parseDetectedNames(response) {
         // Multiple markdown bold sections (common in reasoning)
         (raw.match(/\*\*[^*]+\*\*/g) || []).length >= 2
     );
-    console.log("[RST] parseDetectedNames: startsLikeJSON=" + startsLikeJSON + " looksLikePureProse=" + looksLikePureProse +
+    dlog("[RST] parseDetectedNames: startsLikeJSON=" + startsLikeJSON + " looksLikePureProse=" + looksLikePureProse +
         " headingCount=" + ((raw.match(/^#+\s+/gm) || []).length) +
         " hasNumberedBold=" + /^\d+\.\s+\*\*/m.test(raw) +
         " numberedStepCount=" + ((raw.match(/^\d+\.\s/mg) || []).length) +
         " boldSectionCount=" + ((raw.match(/\*\*[^*]+\*\*/g) || []).length));
     if (looksLikePureProse) {
-        console.log("[RST] parseDetectedNames: response looks like pure thinking prose, will skip line-based fallback if no JSON found");
+        dlog("[RST] parseDetectedNames: response looks like pure thinking prose, will skip line-based fallback if no JSON found");
     }
 
     // ── Strategy 0: Try the raw response as JSON first (before stripping fences) ──
     try {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
-            console.log("[RST] parseDetectedNames: Strategy 0 (raw JSON.parse) SUCCESS, count=" + parsed.length);
+            dlog("[RST] parseDetectedNames: Strategy 0 (raw JSON.parse) SUCCESS, count=" + parsed.length);
             return parsed.filter((n) => typeof n === "string" && n.trim().length > 0);
         }
     } catch {
@@ -191,7 +192,7 @@ function parseDetectedNames(response) {
     try {
         const parsed = JSON.parse(cleaned);
         if (Array.isArray(parsed)) {
-            console.log("[RST] parseDetectedNames: Strategy 1 (cleaned JSON.parse) SUCCESS, count=" + parsed.length);
+            dlog("[RST] parseDetectedNames: Strategy 1 (cleaned JSON.parse) SUCCESS, count=" + parsed.length);
             return parsed.filter((n) => typeof n === "string" && n.trim().length > 0);
         }
     } catch {
@@ -206,7 +207,7 @@ function parseDetectedNames(response) {
         try {
             const parsed = JSON.parse(arrayMatch[0]);
             if (Array.isArray(parsed)) {
-                console.log("[RST] parseDetectedNames: Strategy 2 (greedy regex on cleaned) SUCCESS, count=" + parsed.length);
+                dlog("[RST] parseDetectedNames: Strategy 2 (greedy regex on cleaned) SUCCESS, count=" + parsed.length);
                 return parsed.filter((n) => typeof n === "string" && n.trim().length > 0);
             }
         } catch {
@@ -234,7 +235,7 @@ function parseDetectedNames(response) {
         if (allNames.length > 0) {
             // Deduplicate while preserving order
             const deduped = [...new Set(allNames)];
-            console.log("[RST] parseDetectedNames: Strategy 2b (inner arrays) SUCCESS, count=" + deduped.length);
+            dlog("[RST] parseDetectedNames: Strategy 2b (inner arrays) SUCCESS, count=" + deduped.length);
             return deduped;
         }
     }
@@ -247,7 +248,7 @@ function parseDetectedNames(response) {
             try {
                 const parsed = JSON.parse(rawArrayMatch[0]);
                 if (Array.isArray(parsed)) {
-                    console.log("[RST] parseDetectedNames: Strategy 2c (raw greedy regex) SUCCESS, count=" + parsed.length);
+                    dlog("[RST] parseDetectedNames: Strategy 2c (raw greedy regex) SUCCESS, count=" + parsed.length);
                     return parsed.filter((n) => typeof n === "string" && n.trim().length > 0);
                 }
             } catch {
@@ -259,13 +260,13 @@ function parseDetectedNames(response) {
     // ── If the response looks like pure thinking prose, return empty ──
     // (don't fall through to the line-based fallback which would extract garbage)
     if (looksLikePureProse) {
-        console.log("[RST] parseDetectedNames: no JSON found in thinking prose, returning empty");
+        dlog("[RST] parseDetectedNames: no JSON found in thinking prose, returning empty");
         return [];
     }
 
     // Strategy 3: Line-based fallback with strict filtering
     // Only use this if all JSON strategies failed
-    console.log("[RST] parseDetectedNames: WARNING — falling through to Strategy 3 (line-based fallback)");
+    dlog("[RST] parseDetectedNames: WARNING — falling through to Strategy 3 (line-based fallback)");
     const fallbackResult = cleaned
         .split(/[,|\n]+/)
         .map((s) => s.trim().replace(/^["'\d.\s]+/, "").replace(/["']$/, "").trim())
@@ -286,7 +287,7 @@ function parseDetectedNames(response) {
             if (/^(include|exclude|identify|critical|important|already-known|known characters)/i.test(s)) return false;
             return true;
         });
-    console.log("[RST] parseDetectedNames: Strategy 3 result count=" + fallbackResult.length);
+    dlog("[RST] parseDetectedNames: Strategy 3 result count=" + fallbackResult.length);
     return fallbackResult;
 }
 

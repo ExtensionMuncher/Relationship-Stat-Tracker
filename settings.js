@@ -5,6 +5,7 @@
 
 import { saveSettingsDebounced } from "../../../../script.js";
 import { getSettings, getDefaultSettings, saveSetting, saveAllSettings, persistSettings } from "./data/storage.js";
+import { dlog } from "./lib/debug.js";
 
 // ─── Initialization ───────────────────────────────────────
 
@@ -20,7 +21,7 @@ export async function initSettings() {
     const merged = deepMerge(defaults, current);
     saveAllSettings(merged);
 
-    console.log("[RST] Settings initialized");
+    dlog("[RST] Settings initialized");
 }
 
 // ─── Public API ───────────────────────────────────────────
@@ -148,7 +149,7 @@ export async function importAllData(jsonString) {
             saveAllCharacters(data.characters);
         }
 
-        console.log("[RST] Data imported successfully");
+        dlog("[RST] Data imported successfully");
         return true;
     } catch (err) {
         console.error("[RST] Failed to import data:", err);

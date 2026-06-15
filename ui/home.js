@@ -11,6 +11,7 @@ import { renderScenesTab } from "./scenes.js";
 import { renderLibraryTab } from "./library.js";
 import { switchTab, getPane, showPanelLoading, hidePanelLoading } from "./panel.js";
 import { Popup, POPUP_RESULT, POPUP_TYPE } from "../../../../../scripts/popup.js";
+import { dlog } from "../lib/debug.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -476,13 +477,13 @@ function renderNoPending($pane) {
  * @param {object} charUpdate
  */
 async function approveCharacterUpdate(charUpdate, sceneId) {
-    console.log("[RST] Approving update for:", charUpdate.characterName, { sceneId, statsBefore: charUpdate.statsBefore, statsAfter: charUpdate.statsAfter, commentary: charUpdate.commentary });
+    dlog("[RST] Approving update for:", charUpdate.characterName, { sceneId, statsBefore: charUpdate.statsBefore, statsAfter: charUpdate.statsAfter, commentary: charUpdate.commentary });
     try {
         const { updateCharacterStats, updateCharacterProfile, addUpdateLogEntry } = await import("../data/characters.js");
         const { updateSceneSummary } = await import("../data/scenes.js");
 
         // Commit stats
-        console.log("[RST] Committing stats for:", charUpdate.characterName, charUpdate.statsAfter);
+        dlog("[RST] Committing stats for:", charUpdate.characterName, charUpdate.statsAfter);
         updateCharacterStats(charUpdate.characterId, charUpdate.statsAfter);
 
         // Update dynamic title and narrative
@@ -498,7 +499,7 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
             : null; // No scene available — skip message range in log entry
 
         // Create update log entry
-        console.log("[RST] Adding update log entry for:", charUpdate.characterName, { statsBefore: charUpdate.statsBefore, statsAfter: charUpdate.statsAfter, commentary: charUpdate.commentary });
+        dlog("[RST] Adding update log entry for:", charUpdate.characterName, { statsBefore: charUpdate.statsBefore, statsAfter: charUpdate.statsAfter, commentary: charUpdate.commentary });
         addUpdateLogEntry(charUpdate.characterId, {
             sceneId: sceneId || "",
             messageRange,
@@ -524,7 +525,7 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
                 savePendingUpdates(pending);
             }
         }
-        console.log("[RST] Removed from pending:", charUpdate.characterName);
+        dlog("[RST] Removed from pending:", charUpdate.characterName);
 
         toastr?.success?.(`${charUpdate.characterName} stat changes approved and saved.`);
 
@@ -734,7 +735,7 @@ async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
  * @param {string} sceneId - The scene ID
  */
 async function showEditStatsModal(charUpdate, sceneId) {
-    console.log("[RST] Opening edit modal for:", charUpdate.characterName, charUpdate);
+    dlog("[RST] Opening edit modal for:", charUpdate.characterName, charUpdate);
     // Load character profile for editable fields
     const profile = getCharacterProfile(charUpdate.characterId) || {};
     const editedStats = JSON.parse(JSON.stringify(charUpdate.statsAfter || {}));
@@ -853,7 +854,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
                     text: "Save changes",
                     result: POPUP_RESULT.AFFIRMATIVE,
                     action: () => {
-                        console.log("[RST] Save changes clicked for:", charUpdate.characterName);
+                        dlog("[RST] Save changes clicked for:", charUpdate.characterName);
                         // Read all edited values from the DOM while it's still present
                         const newStats = JSON.parse(JSON.stringify(charUpdate.statsAfter || {}));
                         $(popup.dlg).find(".rst-edit-stat").each(function () {
@@ -865,7 +866,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
                                 newStats[cat][stat] = Math.max(-100, Math.min(100, val));
                             }
                         });
-                        console.log("[RST] Edited stats:", JSON.stringify(newStats));
+                        dlog("[RST] Edited stats:", JSON.stringify(newStats));
 
                         const newCommentary = JSON.parse(JSON.stringify(charUpdate.commentary || {}));
                         $(popup.dlg).find(".rst-edit-commentary").each(function () {
@@ -874,7 +875,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
                             if (!newCommentary[cat]) newCommentary[cat] = {};
                             newCommentary[cat][stat] = $(this).val() || "";
                         });
-                        console.log("[RST] Edited commentary:", JSON.stringify(newCommentary));
+                        dlog("[RST] Edited commentary:", JSON.stringify(newCommentary));
 
                         const newTitle = $(popup.dlg).find("#rst-edit-title").val() || "";
                         const newNarrative = $(popup.dlg).find("#rst-edit-narrative").val() || "";
@@ -914,7 +915,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
                                 }
                                 update.changeCount = changeCount;
                                 savePendingUpdates(pending);
-                                console.log("[RST] Saved pending updates for:", newName, { statsAfter: newStats, commentary: newCommentary });
+                                dlog("[RST] Saved pending updates for:", newName, { statsAfter: newStats, commentary: newCommentary });
 
                                 // Refresh the UI
                                 const $pane = $("#rst-p-home");
@@ -973,18 +974,18 @@ async function showEditStatsModal(charUpdate, sceneId) {
                         text: "Save",
                         result: POPUP_RESULT.AFFIRMATIVE,
                         action: () => {
-                            console.log("[RST] Fallback save triggered for:", charUpdate.characterName);
+                            dlog("[RST] Fallback save triggered for:", charUpdate.characterName);
                             const newVal = $(fallbackPopup.dlg).find("#rst-fallback-edit").val();
                             try {
                                 const parsed = JSON.parse(newVal);
-                                console.log("[RST] Fallback parsed stats:", JSON.stringify(parsed));
+                                dlog("[RST] Fallback parsed stats:", JSON.stringify(parsed));
                                 const pending = getPendingUpdates();
                                 if (pending && pending.characterUpdates) {
                                     const update = pending.characterUpdates.find((u) => u.characterId === charUpdate.characterId);
                                     if (update) {
                                         update.statsAfter = parsed;
                                         savePendingUpdates(pending);
-                                        console.log("[RST] Fallback saved for:", charUpdate.characterName, parsed);
+                                        dlog("[RST] Fallback saved for:", charUpdate.characterName, parsed);
                                         const $pane = $("#rst-p-home");
                                         refreshPending($pane);
                                         toastr?.success?.(charUpdate.characterName + " stats updated manually.");

@@ -14,6 +14,7 @@ import { getContext } from "../../../../extensions.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 import { setRSTInternalGen } from "../inject/promptInjector.js";
 import { getSetting } from "../settings.js";
+import { dlog } from "../lib/debug.js";
 
 // ─── Rate Limiter ───────────────────────────────────────────
 
@@ -51,7 +52,7 @@ export class RateLimiter {
             // Wait until the oldest timestamp expires + 100ms safety buffer
             const waitMs = timestamps[0] + 60000 - now + 100;
             if (waitMs > 0) {
-                console.log(`[RST] Rate limit reached for "${profileId}". Waiting ${Math.ceil(waitMs)}ms...`);
+                dlog(`[RST] Rate limit reached for "${profileId}". Waiting ${Math.ceil(waitMs)}ms...`);
                 await new Promise(r => setTimeout(r, waitMs));
                 // Re-acquire after waiting (recursive but depth-limited to 1)
                 return this.acquire(profileId);
@@ -82,7 +83,7 @@ export class RateLimiter {
                     this.baseDelayMs * Math.pow(2, attempt) + Math.random() * 1000,
                     this.maxDelayMs
                 );
-                console.log(`[RST] Retry ${attempt + 1}/${this.maxRetries} for "${profileId}" in ${Math.ceil(delay)}ms: ${err.message || err}`);
+                dlog(`[RST] Retry ${attempt + 1}/${this.maxRetries} for "${profileId}" in ${Math.ceil(delay)}ms: ${err.message || err}`);
                 await new Promise(r => setTimeout(r, delay));
             }
         }
@@ -211,7 +212,7 @@ export function getConnectionProfile(profileName) {
  * @returns {Promise<string|null>} The response text, or null on failure
  */
 export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens = 500, temperature = null) {
-    console.log("[RST] makeRequest called — profileId:", JSON.stringify(profileId), "hasSystemPrompt:", !!systemPrompt, "hasUserPrompt:", !!userPrompt, "maxTokens:", maxTokens, "temperature:", temperature);
+    dlog("[RST] makeRequest called — profileId:", JSON.stringify(profileId), "hasSystemPrompt:", !!systemPrompt, "hasUserPrompt:", !!userPrompt, "maxTokens:", maxTokens, "temperature:", temperature);
 
     if (!profileId) {
         console.warn("[RST] No connection profile specified for LLM request (profileId was:", JSON.stringify(profileId), ")");
@@ -238,7 +239,7 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
     try {
         // Wrap the actual API call with rate limiter + retry logic
         const response = await rateLimiter.executeWithRetry(profileId, async () => {
-            console.log(`[RST] Sending LLM request to profile "${profileId}"...`);
+            dlog(`[RST] Sending LLM request to profile "${profileId}"...`);
 
             // Build messages array in ST-compatible format (matching timeline-memory pattern)
             const messages = [];
@@ -299,7 +300,7 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
                 const content = response.choices[0].message.content;
                 const reasoning = response.choices[0].message.reasoning;
                 const finishReason = response.choices[0].finish_reason;
-                console.log("[RST] makeRequest raw — hasContent:", !!content, "hasReasoning:", !!reasoning,
+                dlog("[RST] makeRequest raw — hasContent:", !!content, "hasReasoning:", !!reasoning,
                     "contentLen:", (content || "").length, "reasoningLen:", (reasoning || "").length,
                     "finishReason:", finishReason,
                     "contentPreview:", (content || "").substring(0, 120));
@@ -308,7 +309,7 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
                 // AND may contain the answer. Pass it through — parseDetectedNames will
                 // safely handle it (JSON extraction first, bail out if pure prose).
                 if (!content && reasoning) {
-                    console.log("[RST] makeRequest: content empty, returning reasoning (len=" + (reasoning || "").length +
+                    dlog("[RST] makeRequest: content empty, returning reasoning (len=" + (reasoning || "").length +
                         ", finishReason=" + finishReason + ")");
                     return reasoning;
                 }
@@ -324,13 +325,13 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
                     const contentLooksLikeJSON = /^\s*[\[{]/.test(trimmedContent);
                     const reasoningLooksLikeJSON = /^\s*[\[{]/.test(trimmedReasoning);
                     if (!contentLooksLikeJSON && reasoningLooksLikeJSON) {
-                        console.log("[RST] makeRequest: content appears to be thinking prose, preferring reasoning field as answer");
+                        dlog("[RST] makeRequest: content appears to be thinking prose, preferring reasoning field as answer");
                         return trimmedReasoning;
                     }
                     // If both are prose but reasoning is shorter (likely the answer),
                     // still prefer reasoning as it's less likely to be the thinking trace.
                     if (!contentLooksLikeJSON && !reasoningLooksLikeJSON && trimmedReasoning.length < trimmedContent.length) {
-                        console.log("[RST] makeRequest: both fields are prose, preferring shorter reasoning field as answer");
+                        dlog("[RST] makeRequest: both fields are prose, preferring shorter reasoning field as answer");
                         return trimmedReasoning;
                     }
                 }

@@ -26,6 +26,7 @@ import { renderHomeTab } from "./ui/home.js";
 import { renderLibraryTab, selectCharacter, showNewCharacterDetected } from "./ui/library.js";
 import { renderScenesTab } from "./ui/scenes.js";
 import { renderSettingsTab } from "./ui/settings.js";
+import { dlog } from "./lib/debug.js";
 
 // ─── Extension Constants ──────────────────────────────────
 
@@ -51,7 +52,7 @@ const _rejectedNames = new Set();
  * Main entry point — called by SillyTavern when the extension loads.
  */
 jQuery(async () => {
-    console.log("[RST] Relationship Stat Tracker loading...");
+    dlog("[RST] Relationship Stat Tracker loading...");
 
     try {
         // 1. Initialize settings
@@ -146,7 +147,7 @@ jQuery(async () => {
             }
         });
 
-        console.log("[RST] Relationship Stat Tracker loaded successfully.");
+        dlog("[RST] Relationship Stat Tracker loaded successfully.");
     } catch (err) {
         console.error("[RST] Failed to load:", err);
     }
@@ -192,7 +193,7 @@ function registerEventHandlers() {
                 addSceneButtons(mesIdNum);
                 added++;
             });
-            if (added > 0) console.log(`[RST] Added scene buttons to ${added} message(s)`);
+            if (added > 0) dlog(`[RST] Added scene buttons to ${added} message(s)`);
         }, 300);
     });
 }
@@ -205,13 +206,13 @@ function registerEventHandlers() {
  */
 async function onMessageReceived(mesId, skipSidecar = false) {
     if (!isEnabled()) {
-        console.log("[RST] onMessageReceived: RST disabled, skipping (mesId=" + mesId + ")");
+        dlog("[RST] onMessageReceived: RST disabled, skipping (mesId=" + mesId + ")");
         return;
     }
 
     // ── Deduplication: skip if this mesId was already processed ──
     if (mesId !== undefined && _processedMesIds.has(mesId)) {
-        console.log("[RST] onMessageReceived: skipping duplicate mesId=" + mesId);
+        dlog("[RST] onMessageReceived: skipping duplicate mesId=" + mesId);
         return;
     }
     if (mesId !== undefined) {
@@ -233,7 +234,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
     const counter = incrementMessageCounter();
     const frequency = settings.scanFrequency || 5;
 
-    console.log("[RST] onMessageReceived: mesId=" + mesId + " counter=" + counter + " frequency=" + frequency +
+    dlog("[RST] onMessageReceived: mesId=" + mesId + " counter=" + counter + " frequency=" + frequency +
         " shouldFire=" + (counter % frequency === 0));
 
     if (counter % frequency === 0) {
@@ -245,12 +246,12 @@ async function onMessageReceived(mesId, skipSidecar = false) {
 
         _sidecarRunning = true;
         const profileName = settings.connections?.sidecarLLM || "(none)";
-        console.log("[RST] Sidecar detection start (counter=" + counter + ", frequency=" + frequency + ", profile=" + profileName + ")");
+        dlog("[RST] Sidecar detection start (counter=" + counter + ", frequency=" + frequency + ", profile=" + profileName + ")");
 
         try {
             const result = await detectCharacters();
 
-            console.log("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length);
+            dlog("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length);
 
             // Build exclusion set from ST user persona name + hardcoded placeholders + per-chat blacklist
             const personaName = (name1 || "").toLowerCase().trim();
@@ -312,7 +313,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
                     } else {
                         // User clicked "Ignore" — track to prevent repeat popups this session
                         _rejectedNames.add(unknownName.toLowerCase().trim());
-                        console.log("[RST] Name rejected by user, added to session rejection set:", unknownName);
+                        dlog("[RST] Name rejected by user, added to session rejection set:", unknownName);
                     }
                 }
             }
@@ -323,12 +324,12 @@ async function onMessageReceived(mesId, skipSidecar = false) {
                 !newDetected.every((id) => currentPresent.includes(id));
 
             if (changed) {
-                console.log("[RST] Present characters changed — old:", currentPresent.length, "new:", newDetected.length, ". Updating.");
+                dlog("[RST] Present characters changed — old:", currentPresent.length, "new:", newDetected.length, ". Updating.");
                 // Always save — if empty, clears the present list; if non-empty, updates it
                 savePresentCharacters(newDetected);
                 updateInjection();
             } else {
-                console.log("[RST] Present characters unchanged — skipping injection update.");
+                dlog("[RST] Present characters unchanged — skipping injection update.");
             }
 
             // Refresh both Home and Library tabs if visible so present-indicator UI stays in sync
@@ -344,7 +345,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
             console.error("[RST] Sidecar detection error:", err);
         } finally {
             _sidecarRunning = false;
-            console.log("[RST] Sidecar detection complete");
+            dlog("[RST] Sidecar detection complete");
         }
     }
 }
@@ -366,7 +367,7 @@ function onChatChanged() {
                 if (scene.summary) totalUpdates++;
                 if (scene.characters) totalUpdates += Object.keys(scene.characters).length;
             }
-            console.log(`[RST] Chat switched with ${totalUpdates} pending update(s) across ${pendingScenes.length} scene(s).`);
+            dlog(`[RST] Chat switched with ${totalUpdates} pending update(s) across ${pendingScenes.length} scene(s).`);
             toastr?.warning?.(
                 `This chat has ${totalUpdates} unapproved stat update(s) in ${pendingScenes.length} scene(s). Switch to the Home tab to review them.`,
                 "Pending Updates",
@@ -414,7 +415,7 @@ function migrateGlobalCharacters() {
         // Only migrate if per-chat storage is empty (don't overwrite existing chat data)
         const chatChars = chat_metadata[NAMESPACE]?.characters;
         if (!chatChars || Object.keys(chatChars).length === 0) {
-            console.log("[RST] Migrating", Object.keys(globalChars).length, "character(s) from global to per-chat storage");
+            dlog("[RST] Migrating", Object.keys(globalChars).length, "character(s) from global to per-chat storage");
             if (!chat_metadata[NAMESPACE]) {
                 chat_metadata[NAMESPACE] = {};
             }
@@ -579,7 +580,7 @@ let $rstPopout = null;
 function registerMagicWandMenuEntry() {
     const menu = document.getElementById('extensionsMenu');
     if (!menu) {
-        console.log('[RST] Magic wand menu (#extensionsMenu) not found — cannot register wand entry.');
+        dlog('[RST] Magic wand menu (#extensionsMenu) not found — cannot register wand entry.');
         return;
     }
 
@@ -611,7 +612,7 @@ function registerMagicWandMenuEntry() {
     });
 
     menu.appendChild(entry);
-    console.log('[RST] Magic wand menu entry registered.');
+    dlog('[RST] Magic wand menu entry registered.');
 }
 
 /**
@@ -636,7 +637,7 @@ function openRstPopout() {
 
     const $drawerContent = $('#rst_container .inline-drawer-content');
     if ($drawerContent.length === 0) {
-        console.log('[RST] Drawer content not found — cannot open popout.');
+        dlog('[RST] Drawer content not found — cannot open popout.');
         return;
     }
 
@@ -686,7 +687,7 @@ function openRstPopout() {
     // Fade in
     $rstPopout.fadeIn(200);
     rstPopoutVisible = true;
-    console.log('[RST] Popout opened.');
+    dlog('[RST] Popout opened.');
 }
 
 function closeRstPopout() {
@@ -714,7 +715,7 @@ function closeRstPopout() {
 
     rstPopoutVisible = false;
     $(document).off('keydown.rst_popout');
-    console.log('[RST] Popout closed.');
+    dlog('[RST] Popout closed.');
 }
 
 // ─── Slash Commands ───────────────────────────────────────
@@ -725,5 +726,5 @@ function closeRstPopout() {
 function registerSlashCommands() {
     // These would use ST's SlashCommandParser if available
     // For now, we'll add them as a TODO since the exact API depends on ST version
-    console.log("[RST] Slash commands registered (placeholder)");
+    dlog("[RST] Slash commands registered (placeholder)");
 }

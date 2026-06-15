@@ -301,6 +301,10 @@ export function getDefaultSettings() {
     return {
         enabled: true,
 
+        // Debug F12 logging: when true, routine [RST] activity logs appear in the
+        // browser console. Warnings and errors always show regardless. Off by default.
+        debug: false,
+
         // No-think soft switch: append "/no_think" to each LLM call to disable
         // reasoning on supporting models (Qwen3, etc.). Harmless to others.
         noThink: false,
