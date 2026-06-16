@@ -342,19 +342,28 @@ function renderRegenBox(id, onRegenerate) {
  */
 function renderPresentCharacters($pane) {
     const $section = $(`<div id="rst-present-section"></div>`);
-    $section.append('<div class="rst-lbl">Characters currently present</div>');
+    const $secHdr = $(`
+        <div class="rst-sec-h">
+            <span class="rst-sec-title">Currently present</span>
+            <span class="rst-sec-count" id="rst-present-count">0</span>
+            <div class="rst-sec-line"></div>
+        </div>
+    `);
+    $section.append($secHdr);
 
-    // Chip container
-    const $chipContainer = $(`<div id="rst-present-chips" style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px"></div>`);
+    // Card container
+    const $chipContainer = $(`<div id="rst-present-chips" class="rst-present-grid"></div>`);
     $section.append($chipContainer);
 
     function renderChips() {
         $chipContainer.empty();
         const presentIds = getPresentCharacters();
 
+        $("#rst-present-count").text(presentIds.length);
+
         if (presentIds.length === 0) {
             $chipContainer.append(
-                '<div style="font-size:12px;color:var(--rst-text-muted);padding:6px 2px">No characters detected in current context.</div>'
+                '<div class="rst-empty">No characters detected in the current context.</div>'
             );
             return;
         }
@@ -366,12 +375,28 @@ function renderPresentCharacters($pane) {
             const initials = getInitials(profile.name);
             let avContent = initials;
             if (profile.avatar) { avContent = `<img src="${profile.avatar}" alt="">`; }
+            const dyn = profile.dynamicTitle || "No dynamic yet";
+            const topStat = (cat) => {
+                const stats = profile.stats?.[cat] || {};
+                let best = 0;
+                for (const k of STAT_NAMES) { const v = stats[k] ?? 0; if (Math.abs(v) > Math.abs(best)) best = v; }
+                return best;
+            };
+            const plat = topStat("platonic"), rom = topStat("romantic"), sex = topStat("sexual");
+            const hcls = (v) => Math.abs(v) >= 40 ? "hi" : "";
             const $chip = $(`
-                <div class="rst-chip" style="cursor:pointer">
-                    <div class="rst-dot"></div>
+                <div class="rst-pcard" style="cursor:pointer">
                     <div class="rst-av">${avContent}</div>
-                    <span style="font-weight:500">${profile.name}</span>
-                    <span class="rst-present-remove" data-char-id="${charId}" style="cursor:pointer;color:var(--rst-danger);margin-left:4px;font-size:13px;line-height:1" title="Remove from presence">✕</span>
+                    <div class="rst-pinfo">
+                        <div class="rst-pname">${profile.name}</div>
+                        <div class="rst-pdyn">${dyn}</div>
+                    </div>
+                    <div class="rst-pstat">
+                        <div class="rst-pstat-item"><div class="rst-pstat-val ${hcls(plat)}">${plat}%</div><div class="rst-pstat-lbl">Plat</div></div>
+                        <div class="rst-pstat-item"><div class="rst-pstat-val ${hcls(rom)}">${rom}%</div><div class="rst-pstat-lbl">Rom</div></div>
+                        <div class="rst-pstat-item"><div class="rst-pstat-val ${hcls(sex)}">${sex}%</div><div class="rst-pstat-lbl">Sex</div></div>
+                    </div>
+                    <span class="rst-present-remove" data-char-id="${charId}" title="Remove from presence"><i class="fa-solid fa-xmark"></i></span>
                 </div>
             `);
 

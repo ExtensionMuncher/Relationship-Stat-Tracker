@@ -621,26 +621,24 @@ function renderCharacterCard($pane, profile) {
     $card.append($notes);
     $card.append('<hr class="rst-div">');
 
-    // Stats header
-    $card.append(`
-        <div style="display:flex;align-items:baseline;gap:6px;margin-bottom:4px">
-            <div class="rst-lbl" style="margin-bottom:0">Relationship stats</div>
-            <span style="font-size:11px;color:var(--rst-text-muted)">click a category for details</span>
-        </div>
-    `);
+    // ── Dossier: current dynamic (title + narrative) sits ABOVE the matrix ──
+    if (profile.dynamicTitle || profile.narrativeSummary) {
+        $card.append('<div class="rst-d-section-lbl">Current dynamic</div>');
+        if (profile.dynamicTitle) {
+            $card.append(`<div class="rst-d-title">${profile.dynamicTitle}</div>`);
+        }
+        if (profile.narrativeSummary) {
+            $card.append(`<div class="rst-d-narr">${profile.narrativeSummary}</div>`);
+        }
+    }
 
-    const $statGrid = $('<div class="rst-stat-grid"></div>');
+    // ── Dossier: relationship matrix ──
+    $card.append('<div class="rst-d-section-lbl" style="margin-top:14px">Relationship matrix</div>');
+    const $matrix = $('<div class="rst-d-matrix"></div>');
     for (const cat of STAT_CATEGORIES) {
-        $statGrid.append(renderStatCategoryForLibrary(cat, profile));
+        $matrix.append(renderStatCategoryForLibrary(cat, profile));
     }
-    $card.append($statGrid);
-
-    if (profile.dynamicTitle) {
-        $card.append(`<div class="rst-dyn">${profile.dynamicTitle}</div>`);
-    }
-    if (profile.narrativeSummary) {
-        $card.append(`<div class="rst-narr">${profile.narrativeSummary}</div>`);
-    }
+    $card.append($matrix);
 
     $pane.append($card);
 }
@@ -1239,26 +1237,38 @@ function findLatestCommentary(profile, cat, stat) {
 
 function renderStatCategoryForLibrary(cat, profile) {
     const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
-    const $cat = $(`<div class="rst-stat-cat"></div>`);
-    $cat.append(`<div class="rst-sct">${catTitle} <span style="font-weight:400;font-size:10px">▾</span></div>`);
+    const catIcon = cat === "platonic" ? "fa-user-group"
+        : cat === "romantic" ? "fa-heart"
+        : "fa-fire";
+    const $cat = $(`<div class="rst-d-cat"></div>`);
+    $cat.append(`<div class="rst-d-cat-h"><i class="fa-solid ${catIcon}"></i> ${catTitle}</div>`);
 
     for (const stat of STAT_NAMES) {
         const val = profile.stats[cat][stat];
         const cls = val > 0 ? "p" : val < 0 ? "n" : "z";
         const commentary = findLatestCommentary(profile, cat, stat);
+        const statLabel = stat.charAt(0).toUpperCase() + stat.slice(1);
+        const sign = val >= 0 ? "+" : "";
 
-        $cat.append(`
-            <div class="rst-sr">
-                <span class="rst-sn">${stat.charAt(0).toUpperCase() + stat.slice(1)}</span>
-                <span class="rst-sv ${cls}">${val}%</span>
+        // mini bar: grows right from center for positive, left for negative
+        const pct = Math.min(Math.abs(val) / 2, 50); // 100% maps to half the track
+        const fillStyle = val >= 0
+            ? `left:50%;width:${pct}%;background:var(--rst-pos,#1D9E75)`
+            : `right:50%;width:${pct}%;background:var(--rst-neg,#D85A30)`;
+        const barFill = val === 0 ? "" : `<div class="rst-d-track-fill" style="${fillStyle}"></div>`;
+
+        const $stat = $(`
+            <div class="rst-d-stat">
+                <div class="rst-d-stat-top">
+                    <span class="rst-d-stat-name">${statLabel}</span>
+                    <div class="rst-d-track">${barFill}</div>
+                    <span class="rst-d-stat-val ${cls}">${sign}${val}%</span>
+                </div>
+                ${commentary ? `<div class="rst-d-stat-com">${commentary}</div>` : ""}
             </div>
-            <div class="rst-sc">${commentary}</div>
         `);
+        $cat.append($stat);
     }
-
-    $cat.on("click", function () {
-        $(this).toggleClass("open");
-    });
 
     return $cat;
 }
