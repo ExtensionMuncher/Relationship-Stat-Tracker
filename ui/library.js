@@ -5,6 +5,7 @@
  */
 
 import { getPresentCharacters } from "../data/storage.js";
+import { getContext } from "../../../../extensions.js";
 import {
     getAllCharacters,
     getCharacterProfile,
@@ -1649,7 +1650,8 @@ function downloadExport() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "rst-characters.json";
+    const charName = String(getContext()?.name2 || "chat").replace(/[^a-zA-Z0-9 _-]/g, "").trim().replace(/\s+/g, "_") || "chat";
+    a.download = `rst-characters-${charName}-${Date.now()}.json`;
     a.click();
     URL.revokeObjectURL(url);
     toastr?.success?.("Character data exported.");

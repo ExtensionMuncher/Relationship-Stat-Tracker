@@ -7,6 +7,7 @@
 import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist } from "../data/storage.js";
 import { setSetting, isEnabled, exportAllData, importAllData } from "../settings.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
+import { getContext } from "../../../../extensions.js";
 
 // ─── Accordion Helper ─────────────────────────────────────
 
@@ -458,7 +459,8 @@ function renderSceneSummaryPrompt($pane, settings) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = "rst-summary-prompt.txt";
+        const _cn2 = String(getContext()?.name2 || "chat").replace(/[^a-zA-Z0-9 _-]/g, "").trim().replace(/\s+/g, "_") || "chat";
+        a.download = `rst-summary-prompt-${_cn2}.txt`;
         a.click();
         URL.revokeObjectURL(url);
     });
@@ -597,7 +599,8 @@ function renderDataSection($pane) {
         const data = await exportAllData();
         const blob = new Blob([data], { type: "application/json" });
         const url = URL.createObjectURL(blob);
-        const a = document.createElement("a"); a.href = url; a.download = "rst-data.json"; a.click();
+        const _cn = String(getContext()?.name2 || "chat").replace(/[^a-zA-Z0-9 _-]/g, "").trim().replace(/\s+/g, "_") || "chat";
+        const a = document.createElement("a"); a.href = url; a.download = `rst-data-${_cn}-${Date.now()}.json`; a.click();
         URL.revokeObjectURL(url);
         toastr?.success?.("All data exported.");
     });
