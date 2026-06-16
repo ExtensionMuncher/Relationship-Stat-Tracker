@@ -346,6 +346,7 @@ export function getDefaultSettings() {
             format: "stats_and_narrative",
             placement: "above_card",
             passiveLibraryRef: false,
+            statToolEnabled: true,
             libraryRefDepth: 2,
             libraryRefRole: "system",
         },

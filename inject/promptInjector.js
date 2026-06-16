@@ -219,7 +219,7 @@ function buildStatBlock(charIds, settings) {
  * @param {object} settings
  * @returns {string}
  */
-function buildCharacterBlock(profile, settings) {
+export function buildCharacterBlock(profile, settings) {
     const parts = [];
 
     // ── Header (always markdown) ──────────────────────────

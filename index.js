@@ -26,6 +26,7 @@ import { renderHomeTab } from "./ui/home.js";
 import { renderLibraryTab, selectCharacter, showNewCharacterDetected } from "./ui/library.js";
 import { renderScenesTab } from "./ui/scenes.js";
 import { renderSettingsTab } from "./ui/settings.js";
+import { registerStatLookupTool } from "./llm/statTool.js";
 import { dlog } from "./lib/debug.js";
 
 // ─── Extension Constants ──────────────────────────────────
@@ -101,6 +102,10 @@ jQuery(async () => {
 
         // 9a. Register the entry in ST's magic wand menu (chatbar dropdown)
         registerMagicWandMenuEntry();
+
+        // 9c. Register the relationship-stat lookup function tool so the main
+        // LLM can request stats for characters that aren't present in the scene.
+        registerStatLookupTool();
 
 
         // 9. Listen for tab switches to refresh content
