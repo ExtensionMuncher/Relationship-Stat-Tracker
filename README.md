@@ -27,5 +27,5 @@ This is a softer cap that may require the {{user}} to perform certain actions or
 Allowing your main LLM to use tool-calling features (if the LLM supports it) to have access to NPC stats even if they aren't actively present.
 
 ## UI Revamp
-
+### ✅ Updated as of 6/16/26
 The UI is basic and grody. Really shows it's obviously my first extension.
