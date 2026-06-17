@@ -10,7 +10,7 @@ No further updates planned at this time. Only for bug fixes and refinement.
 ### ✅ Updated as of 6/16/26
 Whenever a significant moment occurs within the roleplay scene, the respective stat(s) will increase/decrease thrice the amount set within the "Stat Change Range."
 
-These moments, like the amounts themselves, are RNG-based and hinge on the scene content.
+These moments, like the amounts themselves, are rare, RNG-based, and hinge on the scene content.
 
 ## Thresholds Locks
 ### ✅ Updated as of 6/17/26
@@ -20,9 +20,17 @@ To enhance the quality and realism of characters, I will introduce a stat lock/u
 
 This allows the AI to set caps on an NPC's stats based on their personality, psychology, and history. For example, if an NPC is heavily traumatized and not the trusting sort, there may be hard limits set on their Trust stats (ex. Max 60% Platonic Trust) to remain true to the NPC's psychology.
 
+#### Implementation Edits
+
+Critical Increases can repeatedly push the Hard Lock cap upward, a mechanic symbolizing a significant emotional breakthrough for the respective stat, until the max of +100% is reached.
+
 ### Soft Locks (Unlockable)
 
 This is a softer cap that may require the {{user}} to perform certain actions or meet certain thresholds to continue relationship growth with the respective NPC. (Ex. Romantic Affection 45% 🔒 -> Shared Meals 2/5 to unlock). Stat growth will not be allowed in the locked stat until these thresholds are met.
+
+#### Implementation Edits
+
+Maximum of 2-3 soft locks per character is allowed with a 5-scene per-character cooldown before another Soft Lock is considered and/or placed by the LLM.
 
 ## Function Calling
 ### ✅ Updated as of 6/16/26
