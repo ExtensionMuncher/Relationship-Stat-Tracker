@@ -41,6 +41,49 @@ export function createBlankStats() {
 }
 
 /**
+ * Create a blank hard-lock map mirroring the stats shape.
+ * Each entry is { cap: number|null, reason: string }.
+ *   cap = null  -> no lock on this stat
+ *   cap = N     -> this stat cannot rise above N through normal growth.
+ *                  A critical change can push past it and RAISE the cap to the
+ *                  new value (requiring a further critical to climb again).
+ * A lock may also have a negative-direction floor via capLow (optional).
+ */
+export function createBlankLocks() {
+    const locks = {};
+    for (const cat of STAT_CATEGORIES) {
+        locks[cat] = {};
+        for (const stat of STAT_NAMES) {
+            locks[cat][stat] = { cap: null, reason: "" };
+        }
+    }
+    return locks;
+}
+
+/**
+ * Create a blank SOFT-lock map mirroring the stats shape.
+ * Each entry is { cap: number|null, condition: string, progress: string, met: boolean }.
+ *   cap = null      -> no soft lock on this stat
+ *   cap = N         -> growth is blocked above N UNTIL the condition is met,
+ *                      then the stat AUTO-unlocks and normal growth resumes.
+ *   condition       -> the LLM-defined requirement to unlock (prose).
+ *   progress        -> the LLM's running prose notes toward the condition.
+ *   met             -> once true, the lock is satisfied and no longer gates growth.
+ * Unlike hard locks, a soft lock is not broken by a critical — it is removed by
+ * fulfilling its narrative condition.
+ */
+export function createBlankSoftLocks() {
+    const locks = {};
+    for (const cat of STAT_CATEGORIES) {
+        locks[cat] = {};
+        for (const stat of STAT_NAMES) {
+            locks[cat][stat] = { cap: null, condition: "", progress: "", met: false };
+        }
+    }
+    return locks;
+}
+
+/**
  * Create a new character profile.
  * Checks for name collisions (same words in different order) and warns.
  * @param {string} name - Character display name
@@ -85,6 +128,8 @@ export function createCharacter(name, options = {}) {
         avatar: options.avatar || null,
 
         stats: options.stats || createBlankStats(),
+        hardLocks: options.hardLocks || createBlankLocks(),
+        softLocks: options.softLocks || createBlankSoftLocks(),
 
         dynamicTitle: options.dynamicTitle || "",
         narrativeSummary: options.narrativeSummary || "",
@@ -135,7 +180,42 @@ function simpleHash(str) {
  * @returns {object|null}
  */
 export function getCharacterProfile(charId) {
-    return getStoredCharacter(charId);
+    return normalizeProfileLocks(getStoredCharacter(charId));
+}
+
+/**
+ * Ensure a profile has the hardLocks map (added in the locks feature). Older
+ * saved profiles predate this field; fill it in on read so the rest of the
+ * code can assume it exists. Non-destructive — only adds missing structure.
+ */
+function normalizeProfileLocks(profile) {
+    if (!profile) return profile;
+    if (!profile.hardLocks) {
+        profile.hardLocks = createBlankLocks();
+    } else {
+        for (const cat of STAT_CATEGORIES) {
+            if (!profile.hardLocks[cat]) profile.hardLocks[cat] = {};
+            for (const stat of STAT_NAMES) {
+                if (!profile.hardLocks[cat][stat]) {
+                    profile.hardLocks[cat][stat] = { cap: null, reason: "" };
+                }
+            }
+        }
+    }
+    // Soft locks (added later) — same backfill treatment.
+    if (!profile.softLocks) {
+        profile.softLocks = createBlankSoftLocks();
+    } else {
+        for (const cat of STAT_CATEGORIES) {
+            if (!profile.softLocks[cat]) profile.softLocks[cat] = {};
+            for (const stat of STAT_NAMES) {
+                if (!profile.softLocks[cat][stat]) {
+                    profile.softLocks[cat][stat] = { cap: null, condition: "", progress: "", met: false };
+                }
+            }
+        }
+    }
+    return profile;
 }
 
 /**
@@ -144,7 +224,7 @@ export function getCharacterProfile(charId) {
  */
 export function getAllCharacters() {
     const map = getCharacters();
-    return Object.values(map);
+    return Object.values(map).map(normalizeProfileLocks);
 }
 
 /**
@@ -343,7 +423,7 @@ export function updateCharacterProfile(charId, updates) {
     const profile = getStoredCharacter(charId);
     if (!profile) return;
 
-    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary", "folderId", "avatar"];
+    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary", "folderId", "avatar", "hardLocks", "softLocks"];
     for (const field of allowedFields) {
         if (updates[field] !== undefined) {
             profile[field] = updates[field];

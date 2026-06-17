@@ -8,6 +8,8 @@ import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist } from ".
 import { setSetting, isEnabled, exportAllData, importAllData } from "../settings.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 import { getContext } from "../../../../extensions.js";
+import { Popup } from "../../../../../scripts/popup.js";
+import { scanForLocks } from "../llm/lockScan.js";
 
 // ─── Accordion Helper ─────────────────────────────────────
 
@@ -87,12 +89,19 @@ export function renderSettingsTab($pane) {
 function renderDebugSettings($pane, settings) {
     const $card = $('<div class="rst-card"></div>');
     $card.append(`
-        <div class="rst-setting-row" style="border-bottom:none">
+        <div class="rst-setting-row">
             <div>
                 <div class="rst-setting-label">Debug F12 logging</div>
                 <div class="rst-setting-sub">Show RST activity logs in the browser console · warnings and errors always show</div>
             </div>
             <label class="rst-toggle"><input type="checkbox" id="rst-debug-toggle" ${settings.debug ? "checked" : ""}><span class="rst-slider"></span></label>
+        </div>
+        <div class="rst-setting-row" style="border-bottom:none">
+            <div>
+                <div class="rst-setting-label">Scan for Locks</div>
+                <div class="rst-setting-sub">Have the Stat Update LLM read each character's Personality, Notes, and past scenes to propose hard AND soft locks. Characters with an empty Personality are skipped. You review every proposal before anything is applied.</div>
+            </div>
+            <button id="rst-scan-locks-btn" class="rst-btn"><i class="fa-solid fa-lock"></i> Scan</button>
         </div>
     `);
     $pane.append($card);
@@ -101,6 +110,81 @@ function renderDebugSettings($pane, settings) {
         const on = $(this).prop("checked");
         saveSetting("debug", on);
         toastr?.info?.(`Debug logging ${on ? "enabled" : "disabled"}.`, "Relationship Stat Tracker");
+    });
+
+    $("#rst-scan-locks-btn").on("click", async function () {
+        const $btn = $(this);
+        $btn.prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Scanning...');
+        try {
+            const results = await scanForLocks();
+            if (!results || results.length === 0) {
+                toastr?.info?.("Scan complete — no new locks proposed.", "Relationship Stat Tracker");
+                return;
+            }
+            // Build a review summary for confirmation.
+            const lines = [];
+            let totalHard = 0, totalSoft = 0;
+            for (const r of results) {
+                lines.push(`\n${r.characterName}:`);
+                for (const l of (r.hardLocks || [])) {
+                    lines.push(`  \u2022 [HARD] ${l.stat} capped at ${l.cap}% \u2014 ${l.reason || "(no reason given)"}`);
+                    totalHard++;
+                }
+                for (const l of (r.softLocks || [])) {
+                    lines.push(`  \u2022 [SOFT] ${l.stat} capped at ${l.cap}% until: ${l.condition}`);
+                    totalSoft++;
+                }
+            }
+            const proceed = await Popup.show.confirm(
+                "Apply proposed locks?",
+                `The LLM proposed ${totalHard} hard lock${totalHard === 1 ? "" : "s"} and ${totalSoft} soft lock${totalSoft === 1 ? "" : "s"} across ${results.length} character${results.length === 1 ? "" : "s"}:\n${lines.join("\n")}\n\nApply these? Existing higher caps and active soft locks will not be overwritten.`
+            );
+            if (!proceed) {
+                toastr?.info?.("Scan discarded — no changes made.");
+                return;
+            }
+            // Apply: set caps on each character (never below current value; never lower an existing higher cap).
+            const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+            let appliedHard = 0, appliedSoft = 0;
+            for (const r of results) {
+                const prof = getCharacterProfile(r.characterId);
+                if (!prof) continue;
+                // Re-guard: skip if personality somehow empty.
+                if (!(prof.description && prof.description.trim())) continue;
+                // Hard locks
+                if (prof.hardLocks) {
+                    for (const l of (r.hardLocks || [])) {
+                        const [cat, stat] = String(l.stat).split(".");
+                        if (!prof.hardLocks[cat] || !prof.hardLocks[cat][stat]) continue;
+                        const cur = prof.hardLocks[cat][stat].cap;
+                        if (cur === null || l.cap > cur) {
+                            prof.hardLocks[cat][stat] = { cap: l.cap, reason: l.reason || "Lock scan" };
+                            appliedHard++;
+                        }
+                    }
+                    updateCharacterProfile(r.characterId, { hardLocks: prof.hardLocks });
+                }
+                // Soft locks — only set on stats without an active (unmet) soft lock already.
+                if (prof.softLocks) {
+                    for (const l of (r.softLocks || [])) {
+                        const [cat, stat] = String(l.stat).split(".");
+                        if (!prof.softLocks[cat] || !prof.softLocks[cat][stat]) continue;
+                        const existing = prof.softLocks[cat][stat];
+                        if (existing.cap === null || existing.met) {
+                            prof.softLocks[cat][stat] = { cap: l.cap, condition: l.condition || "", progress: l.progress || "", met: false };
+                            appliedSoft++;
+                        }
+                    }
+                    updateCharacterProfile(r.characterId, { softLocks: prof.softLocks });
+                }
+            }
+            toastr?.success?.(`Applied ${appliedHard} hard + ${appliedSoft} soft lock${(appliedHard + appliedSoft) === 1 ? "" : "s"}.`, "Relationship Stat Tracker");
+        } catch (err) {
+            console.error("[RST] Lock scan error:", err);
+            toastr?.error?.("Lock scan failed. Check the console and your connection settings.");
+        } finally {
+            $btn.prop("disabled", false).html('<i class="fa-solid fa-lock"></i> Scan');
+        }
     });
 }
 
@@ -517,6 +601,20 @@ function renderStatSettings($pane, settings) {
                     <span style="font-size:12px;color:var(--rst-text-muted)">%</span>
                 </div>
             </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Hard locks</div>
+                    <div class="rst-setting-sub">Enforce per-stat caps based on a character\'s psychology. Normal growth stops at the cap; only a critical can push past and raise it. <b>Requires the character\'s Personality field to be filled</b> \u2014 locks will not be set for a character whose Personality is empty.</div>
+                </div>
+                <label class="rst-toggle"><input type="checkbox" id="rst-hardlocks-enabled" ${(settings.hardLocks?.enabled !== false) ? "checked" : ""}><span class="rst-slider"></span></label>
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Soft locks</div>
+                    <div class="rst-setting-sub">Conditional caps that gate growth until an LLM-defined milestone is met, then auto-unlock. <b>Requires the character\'s Personality field to be filled.</b></div>
+                </div>
+                <label class="rst-toggle"><input type="checkbox" id="rst-softlocks-enabled" ${(settings.softLocks?.enabled !== false) ? "checked" : ""}><span class="rst-slider"></span></label>
+            </div>
         </div>
     `);
 
@@ -534,6 +632,12 @@ function renderStatSettings($pane, settings) {
         if (isNaN(v) || v < 0) v = 0; if (v > 100) v = 100;
         $(this).val(v);
         saveSetting("criticalChanges.chance", v);
+    });
+    $card.find("#rst-hardlocks-enabled").on("change", function () {
+        saveSetting("hardLocks.enabled", $(this).prop("checked"));
+    });
+    $card.find("#rst-softlocks-enabled").on("change", function () {
+        saveSetting("softLocks.enabled", $(this).prop("checked"));
     });
 
     $pane.append($card);

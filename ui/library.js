@@ -1267,27 +1267,114 @@ function renderStatCategoryForLibrary(cat, profile) {
         const statLabel = stat.charAt(0).toUpperCase() + stat.slice(1);
         const sign = val >= 0 ? "+" : "";
 
+        const lock = profile.hardLocks?.[cat]?.[stat];
+        const cap = (lock && typeof lock.cap === 'number') ? lock.cap : null;
+        const lockMarkup = cap !== null
+            ? `<span class="rst-lock on" title="Capped at ${cap}%${lock.reason ? ' \u2014 ' + lock.reason.replace(/"/g,'') : ''}" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-lock"></i> ${cap}%</span>`
+            : `<span class="rst-lock" title="Set a hard cap" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-lock-open"></i></span>`;
+
+        // Soft lock: conditional cap that auto-unlocks. Only shown when active & unmet.
+        const slock = profile.softLocks?.[cat]?.[stat];
+        const sActive = slock && typeof slock.cap === 'number' && !slock.met;
+        const softMarkup = sActive
+            ? `<span class="rst-softlock" title="Soft-capped at ${slock.cap}% until: ${(slock.condition||'').replace(/"/g,'')}${slock.progress ? '  |  Progress: ' + slock.progress.replace(/"/g,'') : ''}" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-hourglass-half"></i> ${slock.cap}%</span>`
+            : "";
+
         // mini bar: grows right from center for positive, left for negative
         const pct = Math.min(Math.abs(val) / 2, 50); // 100% maps to half the track
         const fillStyle = val >= 0
             ? `left:50%;width:${pct}%;background:var(--rst-pos,#1D9E75)`
             : `right:50%;width:${pct}%;background:var(--rst-neg,#D85A30)`;
         const barFill = val === 0 ? "" : `<div class="rst-d-track-fill" style="${fillStyle}"></div>`;
+        // cap marker on the track
+        const capMarker = (cap !== null && cap > 0)
+            ? `<div class="rst-d-track-cap" style="left:${Math.min(50 + cap / 2, 100)}%" title="cap ${cap}%"></div>`
+            : "";
 
         const $stat = $(`
             <div class="rst-d-stat">
                 <div class="rst-d-stat-top">
                     <span class="rst-d-stat-name">${statLabel}</span>
-                    <div class="rst-d-track">${barFill}</div>
+                    <div class="rst-d-track">${barFill}${capMarker}</div>
+                    ${softMarkup}
+                    ${lockMarkup}
                     <span class="rst-d-stat-val ${cls}">${sign}${val}%</span>
                 </div>
                 ${commentary ? `<div class="rst-d-stat-com">${commentary}</div>` : ""}
             </div>
         `);
+        // Lock click -> prompt to set/clear cap
+        $stat.find(".rst-lock").on("click", async function (e) {
+            e.stopPropagation();
+            await editHardLock(profile, cat, stat);
+        });
+        $stat.find(".rst-softlock").on("click", async function (e) {
+            e.stopPropagation();
+            await editSoftLock(profile, cat, stat);
+        });
         $cat.append($stat);
     }
 
     return $cat;
+}
+
+/**
+ * Prompt the user to set or clear a hard-lock cap on a stat.
+ */
+async function editHardLock(profile, cat, stat) {
+    const lock = profile.hardLocks?.[cat]?.[stat] || { cap: null, reason: "" };
+    const current = (typeof lock.cap === 'number') ? String(lock.cap) : "";
+    const input = await Popup.show.input(
+        `Hard lock \u2014 ${cat} ${stat}`,
+        `Enter a cap value (-100 to 100) this stat cannot exceed through normal growth. A critical can still push past and raise it. Leave blank and confirm to REMOVE the lock.`,
+        current
+    );
+    if (input === null) return; // cancelled
+    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    const prof = getCharacterProfile(profile.id);
+    if (!prof.hardLocks) return;
+    const trimmed = String(input).trim();
+    if (trimmed === "") {
+        prof.hardLocks[cat][stat] = { cap: null, reason: "" };
+    } else {
+        let v = parseInt(trimmed, 10);
+        if (isNaN(v)) { toastr?.warning?.("Enter a number, or leave blank to clear."); return; }
+        v = Math.max(-100, Math.min(100, v));
+        prof.hardLocks[cat][stat] = { cap: v, reason: "Set manually" };
+    }
+    updateCharacterProfile(profile.id, { hardLocks: prof.hardLocks });
+    toastr?.success?.(trimmed === "" ? "Lock removed." : `Cap set to ${prof.hardLocks[cat][stat].cap}%.`);
+    const $pane = $("#rst-p-lib");
+    reRenderCharacterList($pane);
+}
+
+/**
+ * View or clear a soft lock on a stat. Soft locks are normally created by the
+ * LLM (it defines the unlock condition), so this is mainly for inspecting the
+ * condition/progress or removing a lock manually. Editing the prose condition
+ * is also offered.
+ */
+async function editSoftLock(profile, cat, stat) {
+    const sl = profile.softLocks?.[cat]?.[stat] || { cap: null, condition: "", progress: "", met: false };
+    if (sl.cap === null) { toastr?.info?.("No soft lock on this stat."); return; }
+    const detail = [
+        `Soft lock on ${cat} ${stat}: capped at ${sl.cap}% until the condition is met.`,
+        "",
+        `Condition: ${sl.condition || "(none specified)"}`,
+        `Progress: ${sl.progress || "(no progress noted yet)"}`,
+        "",
+        "Click OK to REMOVE this soft lock, or Cancel to keep it.",
+    ].join("\n");
+    const remove = await Popup.show.confirm(`Soft lock \u2014 ${cat} ${stat}`, detail);
+    if (!remove) return;
+    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    const prof = getCharacterProfile(profile.id);
+    if (!prof.softLocks) return;
+    prof.softLocks[cat][stat] = { cap: null, condition: "", progress: "", met: false };
+    updateCharacterProfile(profile.id, { softLocks: prof.softLocks });
+    toastr?.success?.("Soft lock removed.");
+    const $pane = $("#rst-p-lib");
+    reRenderCharacterList($pane);
 }
 
 // ─── Update Log Panel ─────────────────────────────────────

@@ -514,6 +514,84 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
         dlog("[RST] Committing stats for:", charUpdate.characterName, charUpdate.statsAfter);
         updateCharacterStats(charUpdate.characterId, charUpdate.statsAfter);
 
+        // Apply any hard-lock caps that a critical raised this scene. The cap
+        // rises to the broken-through value so future normal growth can fill up
+        // to the new ceiling, and a further critical is needed to climb again.
+        const hasRaised = Array.isArray(charUpdate.raisedCaps) && charUpdate.raisedCaps.length > 0;
+        const hasProposed = Array.isArray(charUpdate.proposedHardLocks) && charUpdate.proposedHardLocks.length > 0;
+        if (hasRaised || hasProposed) {
+            const { getCharacterProfile } = await import("../data/characters.js");
+            const prof = getCharacterProfile(charUpdate.characterId);
+            if (prof && prof.hardLocks) {
+                // Critical-raised caps: cap rises to the broken-through value.
+                for (const rc of (charUpdate.raisedCaps || [])) {
+                    const [cat, stat] = String(rc.stat).split(".");
+                    if (prof.hardLocks[cat] && prof.hardLocks[cat][stat]) {
+                        prof.hardLocks[cat][stat].cap = rc.to;
+                    }
+                }
+                // Newly proposed locks from the LLM (approved alongside the update).
+                // Hard requirement: never apply LLM-proposed locks to a character
+                // whose Personality (description) is empty — the model would be
+                // guessing on a blank slate. Manual user-set locks are unaffected.
+                const personaFilled = !!(prof.description && prof.description.trim());
+                for (const pl of (personaFilled ? (charUpdate.proposedHardLocks || []) : [])) {
+                    if (!pl || typeof pl.cap !== 'number') continue;
+                    const [cat, stat] = String(pl.stat).split(".");
+                    if (prof.hardLocks[cat] && prof.hardLocks[cat][stat]) {
+                        const cur = prof.hardLocks[cat][stat].cap;
+                        // Don't lower an existing higher cap; only set/tighten when sensible.
+                        if (cur === null || pl.cap > cur) {
+                            prof.hardLocks[cat][stat] = { cap: pl.cap, reason: pl.reason || "" };
+                        }
+                    }
+                }
+                updateCharacterProfile(charUpdate.characterId, { hardLocks: prof.hardLocks });
+                dlog("[RST] Applied lock changes:", { raised: charUpdate.raisedCaps, proposed: charUpdate.proposedHardLocks });
+            }
+        }
+
+        // ── Soft lock application ──
+        const hasSoftProp = Array.isArray(charUpdate.proposedSoftLocks) && charUpdate.proposedSoftLocks.length > 0;
+        const hasUnlocked = Array.isArray(charUpdate.unlockedSoftLocks) && charUpdate.unlockedSoftLocks.length > 0;
+        const hasProgress = Array.isArray(charUpdate.softLockProgress) && charUpdate.softLockProgress.length > 0;
+        if (hasSoftProp || hasUnlocked || hasProgress) {
+            const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+            const prof = getCharacterProfile(charUpdate.characterId);
+            if (prof && prof.softLocks) {
+                const personaFilled = !!(prof.description && prof.description.trim());
+                // New proposed soft locks (eligible characters only).
+                for (const sl of (personaFilled ? (charUpdate.proposedSoftLocks || []) : [])) {
+                    if (!sl || typeof sl.cap !== 'number') continue;
+                    const [cat, stat] = String(sl.stat).split(".");
+                    if (prof.softLocks[cat] && prof.softLocks[cat][stat]) {
+                        const existing = prof.softLocks[cat][stat];
+                        // Don't overwrite an active, unmet soft lock that's already set.
+                        if (existing.cap === null || existing.met) {
+                            prof.softLocks[cat][stat] = { cap: sl.cap, condition: sl.condition || "", progress: sl.progress || "", met: false };
+                        }
+                    }
+                }
+                // Conditions met this scene -> mark as met (auto-unlock).
+                for (const key of (charUpdate.unlockedSoftLocks || [])) {
+                    const [cat, stat] = String(key).split(".");
+                    if (prof.softLocks[cat] && prof.softLocks[cat][stat] && prof.softLocks[cat][stat].cap !== null) {
+                        prof.softLocks[cat][stat].met = true;
+                    }
+                }
+                // Progress notes for still-locked soft locks.
+                for (const pr of (charUpdate.softLockProgress || [])) {
+                    if (!pr || !pr.stat) continue;
+                    const [cat, stat] = String(pr.stat).split(".");
+                    if (prof.softLocks[cat] && prof.softLocks[cat][stat] && !prof.softLocks[cat][stat].met) {
+                        prof.softLocks[cat][stat].progress = String(pr.progress || "").slice(0, 400);
+                    }
+                }
+                updateCharacterProfile(charUpdate.characterId, { softLocks: prof.softLocks });
+                dlog("[RST] Applied soft-lock changes:", { proposed: charUpdate.proposedSoftLocks, unlocked: charUpdate.unlockedSoftLocks });
+            }
+        }
+
         // Update dynamic title and narrative
         updateCharacterProfile(charUpdate.characterId, {
             dynamicTitle: charUpdate.dynamicTitleAfter,

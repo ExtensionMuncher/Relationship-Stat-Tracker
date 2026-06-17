@@ -331,6 +331,12 @@ export function getDefaultSettings() {
             chance: 7,        // % chance an LLM-flagged stat actually goes critical
             multiplier: 3,    // critical changes get this x the normal range ceiling
         },
+        hardLocks: {
+            enabled: true,   // enforce per-stat hard caps; criticals can raise them
+        },
+        softLocks: {
+            enabled: true,   // enforce conditional caps that auto-unlock when met
+        },
         sceneSummaryPrompt:
             "Write a concise scene summary for internal reference. Include: key events, emotional turning points, characters present, and any significant relationship shifts. Keep it clinical and factual — this is a note for future analysis, not a narrative retelling.",
 

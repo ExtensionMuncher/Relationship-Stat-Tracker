@@ -1608,3 +1608,57 @@ dialog.popup .editor_maximize:hover {
     gap: 3px;
 }
 .rst-log-crit i, .rst-crit-badge i { font-size: 8px; }
+
+/* Hard lock indicators on stat rows */
+.rst-lock {
+    font-size: 10px;
+    cursor: pointer;
+    color: var(--rst-text-muted);
+    padding: 1px 5px;
+    border-radius: 100px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex-shrink: 0;
+    transition: color 0.12s, background 0.12s;
+}
+.rst-lock:hover { color: var(--rst-text); background: color-mix(in srgb, var(--SmartThemeBodyColor, #888) 8%, transparent); }
+.rst-lock.on {
+    color: #B5742A;
+    background: color-mix(in srgb, #C9881F 15%, transparent);
+    border-color: color-mix(in srgb, #C9881F 35%, transparent);
+    font-weight: 600;
+}
+.rst-lock i { font-size: 9px; }
+/* Cap marker on the stat track */
+.rst-d-track-cap {
+    position: absolute;
+    top: -2px;
+    bottom: -2px;
+    width: 2px;
+    background: #C9881F;
+    border-radius: 1px;
+    transform: translateX(-1px);
+}
+
+/* Soft lock indicator (conditional, auto-unlocking) */
+.rst-softlock {
+    font-size: 10px;
+    cursor: pointer;
+    color: #4A7BA6;
+    background: color-mix(in srgb, #5B8FBF 15%, transparent);
+    border: 1px solid color-mix(in srgb, #5B8FBF 35%, transparent);
+    padding: 1px 5px;
+    border-radius: 100px;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex-shrink: 0;
+    font-weight: 600;
+    transition: background 0.12s;
+}
+.rst-softlock:hover { background: color-mix(in srgb, #5B8FBF 24%, transparent); }
+.rst-softlock i { font-size: 9px; }
