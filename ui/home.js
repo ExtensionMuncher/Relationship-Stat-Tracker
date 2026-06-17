@@ -590,7 +590,9 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
                 if (personaFilled) {
                     const avail = getSoftLockAvailability(prof, sceneCount);
                     if (avail.allowed) {
+                        let addedForChar = 0;
                         for (const sl of (charUpdate.proposedSoftLocks || [])) {
+                            if (addedForChar >= avail.slotsFree) break; // respect the configurable max
                             if (!sl || typeof sl.cap !== 'number') continue;
                             const [cat, stat] = String(sl.stat).split(".");
                             const slot = prof.softLocks[cat]?.[stat];
@@ -604,7 +606,7 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
                                     met: false,
                                     setAtScene: sceneCount,
                                 };
-                                break; // cap of 1 active — take only the first valid proposal
+                                addedForChar++;
                             }
                         }
                     } else {

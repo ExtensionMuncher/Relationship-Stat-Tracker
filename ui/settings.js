@@ -4,11 +4,11 @@
  * Connection Profiles are NOT accordion-wrapped to ensure ConnectionManager initializes properly
  */
 
-import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist } from "../data/storage.js";
+import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist, getPendingLockScan, savePendingLockScan } from "../data/storage.js";
 import { setSetting, isEnabled, exportAllData, importAllData } from "../settings.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 import { getContext } from "../../../../extensions.js";
-import { Popup } from "../../../../../scripts/popup.js";
+import { Popup, POPUP_TYPE, POPUP_RESULT } from "../../../../../scripts/popup.js";
 import { scanForLocks } from "../llm/lockScan.js";
 
 // ─── Accordion Helper ─────────────────────────────────────
@@ -101,7 +101,10 @@ function renderDebugSettings($pane, settings) {
                 <div class="rst-setting-label">Scan for Locks</div>
                 <div class="rst-setting-sub">Have the Stat Update LLM read each character's Personality, Notes, and past scenes to propose hard AND soft locks. Characters with an empty Personality are skipped. You review every proposal before anything is applied.</div>
             </div>
-            <button id="rst-scan-locks-btn" class="rst-btn"><i class="fa-solid fa-lock"></i> Scan</button>
+            <div style="display:flex;gap:6px;flex-shrink:0">
+                <button id="rst-review-scan-btn" class="rst-btn" style="display:${getPendingLockScan() ? 'inline-flex' : 'none'}"><i class="fa-solid fa-list-check"></i> Review</button>
+                <button id="rst-scan-locks-btn" class="rst-btn"><i class="fa-solid fa-lock"></i> Scan</button>
+            </div>
         </div>
     `);
     $pane.append($card);
@@ -110,6 +113,16 @@ function renderDebugSettings($pane, settings) {
         const on = $(this).prop("checked");
         saveSetting("debug", on);
         toastr?.info?.(`Debug logging ${on ? "enabled" : "disabled"}.`, "Relationship Stat Tracker");
+    });
+
+    $card.find("#rst-review-scan-btn").on("click", async function () {
+        const pending = getPendingLockScan();
+        if (!pending || pending.length === 0) {
+            toastr?.info?.("No pending scan to review.");
+            $card.find("#rst-review-scan-btn").hide();
+            return;
+        }
+        await reviewLockScanResults(pending);
     });
 
     $card.find("#rst-scan-locks-btn").on("click", async function () {
@@ -121,72 +134,11 @@ function renderDebugSettings($pane, settings) {
                 toastr?.info?.("Scan complete — no new locks proposed.", "Relationship Stat Tracker");
                 return;
             }
-            // Build a review summary for confirmation.
-            const lines = [];
-            let totalHard = 0, totalSoft = 0;
-            for (const r of results) {
-                lines.push(`\n${r.characterName}:`);
-                for (const l of (r.hardLocks || [])) {
-                    lines.push(`  \u2022 [HARD] ${l.stat} capped at ${l.cap}% \u2014 ${l.reason || "(no reason given)"}`);
-                    totalHard++;
-                }
-                for (const l of (r.softLocks || [])) {
-                    lines.push(`  \u2022 [SOFT] ${l.stat} capped at ${l.cap}% until: ${l.condition}`);
-                    totalSoft++;
-                }
-            }
-            const proceed = await Popup.show.confirm(
-                "Apply proposed locks?",
-                `The LLM proposed ${totalHard} hard lock${totalHard === 1 ? "" : "s"} and ${totalSoft} soft lock${totalSoft === 1 ? "" : "s"} across ${results.length} character${results.length === 1 ? "" : "s"}:\n${lines.join("\n")}\n\nApply these? Existing higher caps and active soft locks will not be overwritten.`
-            );
-            if (!proceed) {
-                toastr?.info?.("Scan discarded — no changes made.");
-                return;
-            }
-            // Apply: set caps on each character (never below current value; never lower an existing higher cap).
-            const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
-            let appliedHard = 0, appliedSoft = 0;
-            for (const r of results) {
-                const prof = getCharacterProfile(r.characterId);
-                if (!prof) continue;
-                // Re-guard: skip if personality somehow empty.
-                if (!(prof.description && prof.description.trim())) continue;
-                // Hard locks
-                if (prof.hardLocks) {
-                    for (const l of (r.hardLocks || [])) {
-                        const [cat, stat] = String(l.stat).split(".");
-                        if (!prof.hardLocks[cat] || !prof.hardLocks[cat][stat]) continue;
-                        const cur = prof.hardLocks[cat][stat].cap;
-                        if (cur === null || l.cap > cur) {
-                            prof.hardLocks[cat][stat] = { cap: l.cap, reason: l.reason || "Lock scan" };
-                            appliedHard++;
-                        }
-                    }
-                    updateCharacterProfile(r.characterId, { hardLocks: prof.hardLocks });
-                }
-                // Soft locks — enforce the same 1-active cap + cooldown as the
-                // normal path. At most ONE new soft lock per character per scan.
-                if (prof.softLocks) {
-                    const { getSoftLockAvailability } = await import("../data/characters.js");
-                    const { getClosedSceneCountForChar } = await import("../data/scenes.js");
-                    const sceneCount = getClosedSceneCountForChar(r.characterId);
-                    const avail = getSoftLockAvailability(prof, sceneCount);
-                    if (avail.allowed) {
-                        for (const l of (r.softLocks || [])) {
-                            const [cat, stat] = String(l.stat).split(".");
-                            const slot = prof.softLocks[cat]?.[stat];
-                            if (!slot) continue;
-                            if ((slot.cap === null || slot.met) && l.condition && String(l.condition).trim()) {
-                                prof.softLocks[cat][stat] = { cap: l.cap, condition: l.condition || "", progress: l.progress || "", met: false, setAtScene: sceneCount };
-                                appliedSoft++;
-                                break; // cap of 1 active per character
-                            }
-                        }
-                        updateCharacterProfile(r.characterId, { softLocks: prof.softLocks });
-                    }
-                }
-            }
-            toastr?.success?.(`Applied ${appliedHard} hard + ${appliedSoft} soft lock${(appliedHard + appliedSoft) === 1 ? "" : "s"}.`, "Relationship Stat Tracker");
+            // Persist results so dismissing the dialog (e.g. Esc) does not waste
+            // the scan — it can be reopened via the "Review pending scan" button.
+            savePendingLockScan(results);
+            $card.find("#rst-review-scan-btn").show();
+            await reviewLockScanResults(results);
         } catch (err) {
             console.error("[RST] Lock scan error:", err);
             toastr?.error?.("Lock scan failed. Check the console and your connection settings.");
@@ -194,6 +146,125 @@ function renderDebugSettings($pane, settings) {
             $btn.prop("disabled", false).html('<i class="fa-solid fa-lock"></i> Scan');
         }
     });
+}
+
+// ─── Lock-scan review (reopenable) ────────────────────────
+
+/**
+ * Render the lock-scan review dialog and apply the user's selection.
+ * Results are passed in (and are already persisted via savePendingLockScan),
+ * so dismissing the dialog with Esc/Cancel keeps them for re-review instead of
+ * wasting the scan. Pending results are cleared only when the user applies them
+ * or explicitly discards.
+ * @param {Array} results
+ */
+async function reviewLockScanResults(results) {
+    let totalHard = 0, totalSoft = 0;
+    const charBlocks = [];
+    for (const r of results) {
+        const hardRows = (r.hardLocks || []).map((l) => {
+            totalHard++;
+            const reason = (l.reason || "").toString().replace(/</g, "&lt;");
+            return `<div class="rst-scan-lock">
+                <span class="rst-scan-tag hard">HARD</span>
+                <span class="rst-scan-stat">${l.stat}</span>
+                <span class="rst-scan-cap">${l.cap}%</span>
+                ${reason ? `<div class="rst-scan-why">${reason}</div>` : ""}
+            </div>`;
+        }).join("");
+        const softRows = (r.softLocks || []).map((l) => {
+            totalSoft++;
+            const cond = (l.condition || "").toString().replace(/</g, "&lt;");
+            return `<div class="rst-scan-lock">
+                <span class="rst-scan-tag soft">SOFT</span>
+                <span class="rst-scan-stat">${l.stat}</span>
+                <span class="rst-scan-cap">${l.cap}%</span>
+                ${cond ? `<div class="rst-scan-why">until: ${cond}</div>` : ""}
+            </div>`;
+        }).join("");
+        const count = (r.hardLocks?.length || 0) + (r.softLocks?.length || 0);
+        charBlocks.push(`
+            <details class="rst-scan-char">
+                <summary><input type="checkbox" class="rst-scan-pick" data-charid="${r.characterId}" checked onclick="event.stopPropagation()"><span class="rst-scan-name">${$("<div>").text(r.characterName).html()}</span><span class="rst-scan-count">${count}</span></summary>
+                <div class="rst-scan-locks">${hardRows}${softRows}</div>
+            </details>`);
+    }
+    const html = `
+        <div class="rst-scan-review">
+            <div class="rst-scan-summary">Proposed <b>${totalHard}</b> hard and <b>${totalSoft}</b> soft lock${(totalHard + totalSoft) === 1 ? "" : "s"} across <b>${results.length}</b> character${results.length === 1 ? "" : "s"}. Untick any character to exclude it. Closing this keeps the scan so you can review it again later; tick "Discard" to throw it away.</div>
+            ${charBlocks.join("")}
+            <label class="rst-scan-discard"><input type="checkbox" id="rst-scan-discard-chk"> Discard this scan instead of keeping it</label>
+        </div>`;
+    const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Apply selected", cancelButton: "Close" });
+    const showPromise = popup.show();
+    const $dlg = $("dialog.popup").last();
+    const proceedResult = await showPromise;
+    const proceed = proceedResult === POPUP_RESULT.AFFIRMATIVE;
+
+    const discardChecked = !!($dlg.find("#rst-scan-discard-chk")[0]?.checked);
+
+    if (!proceed) {
+        // Closed/Esc. Honor an explicit discard; otherwise keep for re-review.
+        if (discardChecked) {
+            savePendingLockScan(null);
+            $("#rst-review-scan-btn").hide();
+            toastr?.info?.("Scan discarded.");
+        } else {
+            toastr?.info?.("Scan kept — reopen it any time with Review.");
+        }
+        return;
+    }
+
+    const selectedIds = new Set();
+    $dlg.find(".rst-scan-pick").each(function () {
+        if (this.checked && this.dataset.charid) selectedIds.add(this.dataset.charid);
+    });
+
+    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    let appliedHard = 0, appliedSoft = 0, skippedChars = 0;
+    for (const r of results) {
+        if (!selectedIds.has(r.characterId)) { skippedChars++; continue; }
+        const prof = getCharacterProfile(r.characterId);
+        if (!prof) continue;
+        if (!(prof.description && prof.description.trim())) continue;
+        if (prof.hardLocks) {
+            for (const l of (r.hardLocks || [])) {
+                const [cat, stat] = String(l.stat).split(".");
+                if (!prof.hardLocks[cat] || !prof.hardLocks[cat][stat]) continue;
+                const cur = prof.hardLocks[cat][stat].cap;
+                if (cur === null || l.cap > cur) {
+                    prof.hardLocks[cat][stat] = { cap: l.cap, reason: l.reason || "Lock scan" };
+                    appliedHard++;
+                }
+            }
+            updateCharacterProfile(r.characterId, { hardLocks: prof.hardLocks });
+        }
+        if (prof.softLocks) {
+            const { getSoftLockAvailability } = await import("../data/characters.js");
+            const { getClosedSceneCountForChar } = await import("../data/scenes.js");
+            const sceneCount = getClosedSceneCountForChar(r.characterId);
+            const avail = getSoftLockAvailability(prof, sceneCount);
+            if (avail.allowed) {
+                let addedForChar = 0;
+                for (const l of (r.softLocks || [])) {
+                    if (addedForChar >= avail.slotsFree) break;
+                    const [cat, stat] = String(l.stat).split(".");
+                    const slot = prof.softLocks[cat]?.[stat];
+                    if (!slot) continue;
+                    if ((slot.cap === null || slot.met) && l.condition && String(l.condition).trim()) {
+                        prof.softLocks[cat][stat] = { cap: l.cap, condition: l.condition || "", progress: l.progress || "", met: false, setAtScene: sceneCount };
+                        appliedSoft++;
+                        addedForChar++;
+                    }
+                }
+                updateCharacterProfile(r.characterId, { softLocks: prof.softLocks });
+            }
+        }
+    }
+    // Applied — clear the pending scan and hide the Review button.
+    savePendingLockScan(null);
+    $("#rst-review-scan-btn").hide();
+    toastr?.success?.(`Applied ${appliedHard} hard + ${appliedSoft} soft lock${(appliedHard + appliedSoft) === 1 ? "" : "s"}${skippedChars > 0 ? ` · ${skippedChars} character(s) skipped` : ""}.`, "Relationship Stat Tracker");
 }
 
 // ─── Connection Profiles ──────────────────────────────────
@@ -623,6 +694,13 @@ function renderStatSettings($pane, settings) {
                 </div>
                 <label class="rst-toggle"><input type="checkbox" id="rst-softlocks-enabled" ${(settings.softLocks?.enabled !== false) ? "checked" : ""}><span class="rst-slider"></span></label>
             </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Max active soft locks</div>
+                    <div class="rst-setting-sub">Ceiling on simultaneous active soft locks per character (1-3). A maximum, not a target \u2014 the LLM still uses judgment and often sets fewer or none.</div>
+                </div>
+                <input type="number" id="rst-softlocks-max" value="${settings.softLocks?.maxActive ?? 1}" min="1" max="3" style="width:56px;text-align:center;flex-shrink:0">
+            </div>
         </div>
     `);
 
@@ -646,6 +724,12 @@ function renderStatSettings($pane, settings) {
     });
     $card.find("#rst-softlocks-enabled").on("change", function () {
         saveSetting("softLocks.enabled", $(this).prop("checked"));
+    });
+    $card.find("#rst-softlocks-max").on("change", function () {
+        let v = parseInt($(this).val(), 10);
+        if (isNaN(v) || v < 1) v = 1; if (v > 3) v = 3;
+        $(this).val(v);
+        saveSetting("softLocks.maxActive", v);
     });
 
     $pane.append($card);

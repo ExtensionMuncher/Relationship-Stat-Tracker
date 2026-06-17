@@ -112,7 +112,10 @@ export function switchTab(tabId) {
     $(".rst-tab").removeClass("on");
     const tabIndex = TABS.findIndex((t) => t.id === tabId);
     if (tabIndex >= 0) {
-        $(".rst-tab").eq(tabIndex).addClass("on");
+        const $active = $(".rst-tab").eq(tabIndex);
+        $active.addClass("on");
+        // Bring the active tab fully into view if the bar is scrolled/overflowing.
+        try { $active[0]?.scrollIntoView({ inline: "nearest", block: "nearest" }); } catch (e) {}
     }
 
     // Update panes

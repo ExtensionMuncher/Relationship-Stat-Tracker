@@ -6,6 +6,7 @@
 
 import { chat } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
+import { getPersonaContext } from "./connections.js";
 import { makeRequest } from "./connections.js";
 import { getSettings, getNameBlacklist } from "../data/storage.js";
 import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter, getSoftLockAvailability } from "../data/characters.js";
@@ -104,7 +105,7 @@ export async function generateStatUpdate(sceneId, guidance = "") {
                 profileName,
                 systemPrompt,
                 requestPrompt,
-                4000,
+                20000,
                 0.3,
             );
 
@@ -192,8 +193,8 @@ function buildStatUpdateSystemPrompt(settings) {
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
         '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Still provide your normal stat value for it.',
-        '- proposedHardLocks: OPTIONAL. ONLY for characters marked "Hard-lock eligible: YES". If "NO", you MUST leave this empty for that character. When eligible, and if the character\'s defined personality/psychology/history makes a stat realistically incapable of exceeding a certain level (e.g. a deeply traumatized character who cannot trust past ~40%), propose a cap as {"stat":"category.stat","cap":NUMBER,"reason":"..."}. Propose ONLY when strongly justified by who the character is, grounded in their stated personality — never guess on a blank slate. Leave empty for most characters. Do NOT propose caps below the stat\'s current value.',
-        '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If the slot is CLOSED, propose NONE. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Provide at most one {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. This is NOT a quota — only propose when it is genuinely fitting; most scenes should add none.',
+        '- proposedHardLocks: OPTIONAL. ONLY for characters marked "Hard-lock eligible: YES". If "NO", you MUST leave this empty for that character. When eligible, and if the character\'s defined personality/psychology/history makes a stat realistically incapable of exceeding a certain level (e.g. a deeply traumatized character who cannot trust past ~40%), propose a cap as {"stat":"category.stat","cap":NUMBER,"reason":"..."}. Propose ONLY when strongly justified \u2014 a hard lock is exceptional, reserved for a true defining ceiling, never routine. Most scenes should propose ZERO. Do not lock a stat just because it is plausible or currently low. When in doubt, leave it empty. Grounded in their stated personality — never guess on a blank slate. Leave empty for most characters. Do NOT propose caps below the stat\'s current value.',
+        '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If no slots are open, propose NONE. The "Soft-lock slots OPEN" number is a CEILING, not a target — propose anywhere from zero up to that many, and zero or one is the typical, expected answer. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Each entry: {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. Never propose a lock just to use an available slot — only when it is genuinely warranted by the story.',
         '- unlockedSoftLocks: for any EXISTING soft lock listed in the character\'s data, if its condition was FULFILLED during this scene, list its "category.stat" here. The stat will then auto-unlock and resume normal growth. Only include locks that are genuinely satisfied by what happened.',
         '- softLockProgress: for existing soft locks that are NOT yet met, optionally provide an updated prose progress note reflecting movement toward the condition this scene.',
         '- Range: -100 to 100. 0 = neutral.',
@@ -283,7 +284,7 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
         try {
             const avail = getSoftLockAvailability(char, getClosedSceneCountForChar(char.id));
             if (avail.allowed) {
-                parts.push(`  Soft-lock slot: OPEN — you MAY propose at most ONE new soft lock for this character if narratively fitting (not required).`);
+                parts.push(`  Soft-lock slots OPEN: ${avail.slotsFree} (a CEILING). You MAY propose up to ${avail.slotsFree} new soft lock(s) for this character ONLY if narratively fitting — zero is a perfectly normal and common answer. Do not fill slots just because they exist.`);
             } else {
                 parts.push(`  Soft-lock slot: CLOSED (${avail.reason}) — do NOT propose a new soft lock for this character this scene. You may still update progress or mark an existing one met.`);
             }
@@ -291,8 +292,12 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
     }
 
     // Scene messages
-    const userName = getContext().name1 || "User";
-    parts.push(`\nSCENE MESSAGES ("${userName}" is the user/player, all other named speakers are characters):`);
+    const _persona = getPersonaContext();
+    const userName = _persona.name || getContext().name1 || "User";
+    if (_persona.description) {
+        parts.push(`\nABOUT ${userName} (the user/player): ${_persona.description}`);
+    }
+    parts.push(`\nSCENE MESSAGES ("${userName}" is the user/player, all other named speakers are characters). When writing soft-lock conditions, refer to the user as "${userName}":`);
     messages.forEach((m, i) => {
         const speaker = m.name || "Unknown";
         const text = m.mes || "";
@@ -1321,7 +1326,7 @@ async function generateInitialStatsForScene(messages, characters, profileName, s
     const systemPrompt = buildInitialStatSystemPrompt(settings);
     const requestPrompt = buildInitialStatRequestPrompt(messages, characters, settings);
 
-    const result = await makeRequest(profileName, systemPrompt, requestPrompt, 4000, 0.3);
+    const result = await makeRequest(profileName, systemPrompt, requestPrompt, 20000, 0.3);
     if (!result) {
         return { sceneSummary: "", characterUpdates: [] };
     }
@@ -1372,8 +1377,8 @@ function buildInitialStatSystemPrompt(settings) {
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
         '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Still provide your normal stat value for it.',
-        '- proposedHardLocks: OPTIONAL. ONLY for characters marked "Hard-lock eligible: YES". If "NO", you MUST leave this empty for that character. When eligible, and if the character\'s defined personality/psychology/history makes a stat realistically incapable of exceeding a certain level (e.g. a deeply traumatized character who cannot trust past ~40%), propose a cap as {"stat":"category.stat","cap":NUMBER,"reason":"..."}. Propose ONLY when strongly justified by who the character is, grounded in their stated personality — never guess on a blank slate. Leave empty for most characters. Do NOT propose caps below the stat\'s current value.',
-        '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If the slot is CLOSED, propose NONE. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Provide at most one {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. This is NOT a quota — only propose when it is genuinely fitting; most scenes should add none.',
+        '- proposedHardLocks: OPTIONAL. ONLY for characters marked "Hard-lock eligible: YES". If "NO", you MUST leave this empty for that character. When eligible, and if the character\'s defined personality/psychology/history makes a stat realistically incapable of exceeding a certain level (e.g. a deeply traumatized character who cannot trust past ~40%), propose a cap as {"stat":"category.stat","cap":NUMBER,"reason":"..."}. Propose ONLY when strongly justified \u2014 a hard lock is exceptional, reserved for a true defining ceiling, never routine. Most scenes should propose ZERO. Do not lock a stat just because it is plausible or currently low. When in doubt, leave it empty. Grounded in their stated personality — never guess on a blank slate. Leave empty for most characters. Do NOT propose caps below the stat\'s current value.',
+        '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If no slots are open, propose NONE. The "Soft-lock slots OPEN" number is a CEILING, not a target — propose anywhere from zero up to that many, and zero or one is the typical, expected answer. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Each entry: {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. Never propose a lock just to use an available slot — only when it is genuinely warranted by the story.',
         '- unlockedSoftLocks: for any EXISTING soft lock listed in the character\'s data, if its condition was FULFILLED during this scene, list its "category.stat" here. The stat will then auto-unlock and resume normal growth. Only include locks that are genuinely satisfied by what happened.',
         '- softLockProgress: for existing soft locks that are NOT yet met, optionally provide an updated prose progress note reflecting movement toward the condition this scene.',
         '- Range: -100 to 100. 0 = neutral.',

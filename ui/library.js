@@ -510,7 +510,8 @@ function renderCharacterCard($pane, profile) {
     }
 
     const $header = $(`
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+        <div style="margin-bottom:12px">
+        <div style="display:flex;align-items:center;gap:10px">
             <div style="display:flex;flex-direction:column;align-items:center;gap:4px">
                 <div class="rst-av-lg" id="rst-av-lg-${profile.id}" title="Click to upload photo">
                     ${avContent}
@@ -535,13 +536,15 @@ function renderCharacterCard($pane, profile) {
                     }
                 </div>
             </div>
-            <div style="margin-left:auto;display:flex;gap:6px">
+            </div>
+            <div class="rst-char-actions" style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;margin-top:10px">
                 <button class="rst-icon-btn rst-eye-btn ${(profile.suppressDescriptionInjection && profile.suppressNotesInjection) ? 'eye-off' : ((profile.suppressDescriptionInjection || profile.suppressNotesInjection) ? 'eye-partial' : '')}" title="${(profile.suppressDescriptionInjection && profile.suppressNotesInjection) ? 'Personality & Notes hidden from the main AI' : ((profile.suppressDescriptionInjection || profile.suppressNotesInjection) ? 'Some profile info hidden from the main AI' : 'Personality & Notes sent to the main AI')}"><i class="fa-solid ${(profile.suppressDescriptionInjection && profile.suppressNotesInjection) ? 'fa-eye-slash' : 'fa-eye'}"></i></button>
                 <button class="rst-icon-btn rst-wand-btn" title="Generate profile"><i class="fa-solid fa-wand-magic-sparkles"></i></button>
                 <button class="rst-icon-btn rst-edit-btn" title="Edit stats"><i class="fa-solid fa-pen"></i></button>
                 <button class="rst-icon-btn rst-log-btn" title="Update log"><i class="fa-solid fa-clock-rotate-left"></i></button>
                 <button class="rst-icon-btn rst-delete-btn" style="color:var(--rst-danger)" title="Delete character"><i class="fa-solid fa-xmark"></i></button>
             </div>
+        </div>
         </div>
     `);
 
@@ -1330,27 +1333,50 @@ function renderStatCategoryForLibrary(cat, profile) {
  */
 async function editHardLock(profile, cat, stat) {
     const lock = profile.hardLocks?.[cat]?.[stat] || { cap: null, reason: "" };
-    const current = (typeof lock.cap === 'number') ? String(lock.cap) : "";
-    const input = await Popup.show.input(
-        `Hard lock \u2014 ${cat} ${stat}`,
-        `Enter a cap value (-100 to 100) this stat cannot exceed through normal growth. A critical can still push past and raise it. Leave blank and confirm to REMOVE the lock.`,
-        current
-    );
-    if (input === null) return; // cancelled
+    const curCap = (typeof lock.cap === 'number') ? String(lock.cap) : "";
+    const curReason = (lock.reason || "").toString();
+    const statLabel = `${cat.charAt(0).toUpperCase() + cat.slice(1)} ${stat.charAt(0).toUpperCase() + stat.slice(1)}`;
+
+    const html = `
+        <div class="rst-lockedit">
+            <div class="rst-lockedit-title">Hard lock — ${statLabel}</div>
+            <div class="rst-lockedit-hint">Cap this stat cannot exceed through normal growth (-100 to 100). A critical can push past it and raise the cap. Clear the cap to remove the lock entirely.</div>
+            <label class="rst-lockedit-label">Cap %</label>
+            <input type="number" id="rst-hl-cap" class="rst-lockedit-cap" value="${curCap}" min="-100" max="100" placeholder="e.g. 40">
+            <label class="rst-lockedit-label">Reason</label>
+            <textarea id="rst-hl-reason" class="rst-lockedit-reason" rows="4" placeholder="Why this stat is capped — e.g. 'Due to a traumatic past involving betrayal, he is pathologically incapable of fully trusting anyone.'">${$("<div>").text(curReason).html()}</textarea>
+            <div class="rst-lockedit-hint" style="margin-top:6px">Tip: leave the Cap blank and Save to remove this lock.</div>
+        </div>`;
+
+    const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Save", cancelButton: "Cancel" });
+    const showPromise = popup.show();
+    const $dlg = $("dialog.popup").last();
+    const result = await showPromise;
+    if (result !== POPUP_RESULT.AFFIRMATIVE) return;
+
+    const capRaw = ($dlg.find("#rst-hl-cap").val() || "").toString().trim();
+    const reasonRaw = ($dlg.find("#rst-hl-reason").val() || "").toString().trim();
+
     const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
     const prof = getCharacterProfile(profile.id);
     if (!prof.hardLocks) return;
-    const trimmed = String(input).trim();
-    if (trimmed === "") {
+
+    if (capRaw === "") {
+        // Blank cap = remove the lock.
         prof.hardLocks[cat][stat] = { cap: null, reason: "" };
+        updateCharacterProfile(profile.id, { hardLocks: prof.hardLocks });
+        toastr?.success?.("Hard lock removed.");
     } else {
-        let v = parseInt(trimmed, 10);
-        if (isNaN(v)) { toastr?.warning?.("Enter a number, or leave blank to clear."); return; }
+        let v = parseInt(capRaw, 10);
+        if (isNaN(v)) { toastr?.warning?.("Enter a number for the cap, or leave it blank to remove the lock."); return; }
         v = Math.max(-100, Math.min(100, v));
-        prof.hardLocks[cat][stat] = { cap: v, reason: "Set manually" };
+        // Preserve the existing reason if the user left the box untouched/empty
+        // but a reason already existed; otherwise use what they typed.
+        const reason = reasonRaw || curReason || "Set manually";
+        prof.hardLocks[cat][stat] = { cap: v, reason };
+        updateCharacterProfile(profile.id, { hardLocks: prof.hardLocks });
+        toastr?.success?.(`Cap set to ${v}%.`);
     }
-    updateCharacterProfile(profile.id, { hardLocks: prof.hardLocks });
-    toastr?.success?.(trimmed === "" ? "Lock removed." : `Cap set to ${prof.hardLocks[cat][stat].cap}%.`);
     const $pane = $("#rst-p-lib");
     reRenderCharacterList($pane);
 }

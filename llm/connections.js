@@ -359,3 +359,23 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
         setRSTInternalGen(false);
     }
 }
+
+/**
+ * Resolve the user's persona context for prompts: their name (name1) and, if
+ * available, their persona description. Used to ground soft-lock conditions,
+ * which are inherently about what the USER must do — so the model needs to know
+ * who the user is rather than defaulting to a generic "the user".
+ * @returns {{ name: string, description: string }}
+ */
+export function getPersonaContext() {
+    let name = "User";
+    let description = "";
+    try {
+        const ctx = getContext();
+        if (ctx && ctx.name1) name = ctx.name1;
+        // Persona description lives in power_user in most ST builds; access defensively.
+        const pu = ctx?.powerUserSettings || (typeof window !== "undefined" ? window.power_user : null);
+        if (pu && typeof pu.persona_description === "string") description = pu.persona_description.trim();
+    } catch (e) { /* non-fatal — fall back to defaults */ }
+    return { name, description };
+}

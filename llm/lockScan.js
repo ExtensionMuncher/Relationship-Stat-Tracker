@@ -16,7 +16,7 @@
 import { getSettings } from "../data/storage.js";
 import { getAllCharacters, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { getAllSceneSummaries } from "../data/scenes.js";
-import { makeRequest } from "./connections.js";
+import { makeRequest, getPersonaContext } from "./connections.js";
 import { dlog } from "../lib/debug.js";
 
 /**
@@ -34,23 +34,49 @@ export async function scanForLocks() {
     }
 
     const all = getAllCharacters();
-    // Only scan characters whose Personality (description) is filled.
-    const eligible = all.filter((c) => c.description && c.description.trim().length > 0);
-    const skipped = all.length - eligible.length;
+    // Only scan characters whose Personality (description) is filled...
+    const withPersona = all.filter((c) => c.description && c.description.trim().length > 0);
+    const noPersonaCount = all.length - withPersona.length;
+
+    // ...AND that do not already have ANY lock set. Characters with existing
+    // hard or soft locks are excluded so a re-scan never overwrites or stacks
+    // onto what is already configured. Clear a character's locks manually if
+    // you want them reconsidered.
+    const alreadyLocked = (c) => {
+        const has = (map) => {
+            if (!map) return false;
+            for (const cat of STAT_CATEGORIES) for (const stat of STAT_NAMES) {
+                const e = map[cat]?.[stat];
+                if (e && typeof e.cap === "number") return true;
+            }
+            return false;
+        };
+        return has(c.hardLocks) || has(c.softLocks);
+    };
+    const eligible = withPersona.filter((c) => !alreadyLocked(c));
+    const lockedSkipped = withPersona.length - eligible.length;
 
     if (eligible.length === 0) {
-        toastr?.info?.("No characters have a Personality filled in — nothing to scan.");
+        const why = noPersonaCount > 0 && lockedSkipped > 0
+            ? "Every character either has no Personality filled in or already has locks set."
+            : lockedSkipped > 0
+                ? "Every eligible character already has locks set. Clear a character's locks to re-scan them."
+                : "No characters have a Personality filled in — nothing to scan.";
+        toastr?.info?.(why, "Relationship Stat Tracker");
         return [];
     }
 
-    dlog(`[RST] Lock scan: ${eligible.length} eligible, ${skipped} skipped (no personality)`);
+    dlog(`[RST] Lock scan: ${eligible.length} eligible, ${noPersonaCount} skipped (no personality), ${lockedSkipped} skipped (already locked)`);
 
     const pastSummaries = getAllSceneSummaries();
     const results = [];
+    let errorCount = 0;
+    let proposedNoneCount = 0;
 
     for (const char of eligible) {
         try {
             const proposed = await scanOneCharacter(char, pastSummaries, profileName);
+            if (proposed && proposed.error) { errorCount++; continue; }
             const hard = (proposed && proposed.hardLocks) || [];
             const soft = (proposed && proposed.softLocks) || [];
             if (hard.length > 0 || soft.length > 0) {
@@ -60,10 +86,20 @@ export async function scanForLocks() {
                     hardLocks: hard,
                     softLocks: soft,
                 });
+            } else {
+                proposedNoneCount++;
             }
         } catch (err) {
+            errorCount++;
             console.error(`[RST] Lock scan failed for ${char.name}:`, err);
         }
+    }
+
+    dlog(`[RST] Lock scan complete: ${eligible.length} scanned, ${results.length} with proposals, ${proposedNoneCount} returned none, ${errorCount} errored.`);
+    // If every character errored, that is a real failure (connection/parse), not
+    // a legitimate "no locks needed" result — tell the user so they can act.
+    if (errorCount > 0 && results.length === 0) {
+        toastr?.warning?.(`Lock scan hit errors on ${errorCount} character(s) and got no usable proposals. Check the console (F12) — likely a connection or response-format issue with the Stat Update LLM.`, "Relationship Stat Tracker", { timeOut: 9000 });
     }
 
     return results;
@@ -81,7 +117,9 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
         "Output ONLY a JSON object: { \"hardLocks\": [ { \"stat\": \"category.stat\", \"cap\": NUMBER, \"reason\": \"...\" } ], \"softLocks\": [ { \"stat\": \"category.stat\", \"cap\": NUMBER, \"condition\": \"...\", \"progress\": \"...\" } ] }",
         "Categories: platonic, romantic, sexual. Stats: trust, openness, support, affection.",
         "Rules:",
-        "- Propose locks ONLY when the character's stated personality/notes strongly justify them. Most characters need FEW or ZERO of either type.",
+        "- Be CONSERVATIVE. Locks are exceptional, not routine. A typical character warrants 0-3 locks TOTAL, reserved for the few stats where their psychology creates a genuine, defining ceiling. Do not lock a stat just because it could plausibly be limited — only when NOT locking it would misrepresent who they are.",
+        "- Never lock a stat merely because it is currently low; low stats can still grow naturally. Lock only true trait-level barriers.",
+        "- Prefer leaving a stat unlocked when in doubt. An empty result for a character is a perfectly valid and common outcome.",
         "- Ground every lock in the provided personality text. Never invent traits not present.",
         "- Use a HARD lock for fixed trait ceilings; use a SOFT lock when deeper growth should be earned through a specific milestone.",
         "- cap is -100 to 100. Do NOT set a cap below the stat's current value.",
@@ -92,6 +130,23 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
     parts.push(`CHARACTER: ${char.name}`);
     parts.push(`PERSONALITY: ${char.description}`);
     if (char.notes && char.notes.trim()) parts.push(`NOTES: ${char.notes}`);
+
+    // Persona context — soft-lock conditions are about what the USER must do,
+    // so name the user explicitly and include their persona description if set.
+    const persona = getPersonaContext();
+    parts.push(`\nTHE USER (the person this character relates to): ${persona.name}`);
+    if (persona.description) parts.push(`USER PERSONA: ${persona.description}`);
+    parts.push(`When writing soft-lock conditions, refer to the user as "${persona.name}" rather than a generic "the user".`);
+
+    // Current relationship dynamic — the title + narrative capture where this
+    // relationship stands right now, which grounds soft-lock conditions in the
+    // actual arc rather than personality alone.
+    if (char.dynamicTitle && char.dynamicTitle.trim()) {
+        parts.push(`\nCURRENT DYNAMIC: ${char.dynamicTitle}`);
+    }
+    if (char.narrativeSummary && char.narrativeSummary.trim()) {
+        parts.push(`CURRENT NARRATIVE: ${char.narrativeSummary}`);
+    }
 
     parts.push("\nCURRENT STATS:");
     for (const cat of STAT_CATEGORIES) {
@@ -123,11 +178,18 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
     parts.push("\nReturn JSON only.");
 
     const userPrompt = parts.join("\n");
-    const resultText = await makeRequest(profileName, systemPrompt, userPrompt, 400);
-    if (!resultText) return [];
+    const resultText = await makeRequest(profileName, systemPrompt, userPrompt, 20000, 0.3);
+    if (!resultText) {
+        dlog(`[RST] Lock scan: no response for ${char.name}`);
+        return { hardLocks: [], softLocks: [], error: "no_response" };
+    }
+    dlog(`[RST] Lock scan raw response for ${char.name}:`, resultText.slice(0, 500));
 
     const parsed = extractLockJson(resultText);
-    if (!parsed) return { hardLocks: [], softLocks: [] };
+    if (!parsed) {
+        dlog(`[RST] Lock scan: could not parse JSON for ${char.name}. Raw:`, resultText.slice(0, 300));
+        return { hardLocks: [], softLocks: [], error: "parse_failed" };
+    }
 
     // Back-compat: an older response may use { locks: [...] } for hard locks.
     const rawHard = Array.isArray(parsed.hardLocks) ? parsed.hardLocks

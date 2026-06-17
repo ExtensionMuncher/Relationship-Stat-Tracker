@@ -218,6 +218,29 @@ export function savePendingUpdates(pending) {
 }
 
 /**
+ * Pending lock-scan results (library-wide, so stored globally in
+ * extension_settings rather than per-chat). Persisted so that dismissing the
+ * review dialog does not throw away an expensive scan — it can be reopened.
+ * @returns {Array|null}
+ */
+export function getPendingLockScan() {
+    if (!extension_settings[NAMESPACE]) return null;
+    return extension_settings[NAMESPACE].pendingLockScan || null;
+}
+
+/**
+ * Save (or clear, with null) the pending lock-scan results.
+ * @param {Array|null} results
+ */
+export function savePendingLockScan(results) {
+    if (!extension_settings[NAMESPACE]) {
+        extension_settings[NAMESPACE] = {};
+    }
+    extension_settings[NAMESPACE].pendingLockScan = results || null;
+    saveSettingsDebounced();
+}
+
+/**
  * Get present characters for this chat.
  * @returns {Array<string>} Array of character IDs
  */
@@ -336,6 +359,7 @@ export function getDefaultSettings() {
         },
         softLocks: {
             enabled: true,   // enforce conditional caps that auto-unlock when met
+            maxActive: 1,    // max simultaneous active soft locks per character (1-3); a CEILING, not a target
         },
         sceneSummaryPrompt:
             "Write a concise scene summary for internal reference. Include: key events, emotional turning points, characters present, and any significant relationship shifts. Keep it clinical and factual — this is a note for future analysis, not a narrative retelling.",

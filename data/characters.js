@@ -96,25 +96,35 @@ export const SOFT_LOCK_COOLDOWN_SCENES = 5;
  * @returns {{ allowed: boolean, reason: string, activeStat: string|null }}
  */
 export function getSoftLockAvailability(profile, currentSceneCount) {
-    if (!profile || !profile.softLocks) return { allowed: false, reason: "no profile", activeStat: null };
+    if (!profile || !profile.softLocks) return { allowed: false, reason: "no profile", activeStat: null, slotsFree: 0 };
+    // Configurable ceiling: 1-3 simultaneous active soft locks per character.
+    // This is a MAX, not a target — the model is told to use 0..max as fitting.
+    let maxActive = 1;
+    try {
+        const s = getSettings();
+        if (s?.softLocks?.maxActive) maxActive = Math.max(1, Math.min(3, s.softLocks.maxActive));
+    } catch (e) { /* default 1 */ }
+
+    let activeCount = 0;
     let activeStat = null;
     let lastSetAt = 0;
     for (const cat of STAT_CATEGORIES) {
         for (const stat of STAT_NAMES) {
             const sl = profile.softLocks[cat]?.[stat];
             if (!sl || typeof sl.cap !== 'number') continue;
-            if (!sl.met) activeStat = `${cat}.${stat}`;          // an active lock exists
+            if (!sl.met) { activeCount++; activeStat = `${cat}.${stat}`; }
             if (typeof sl.setAtScene === 'number') lastSetAt = Math.max(lastSetAt, sl.setAtScene);
         }
     }
-    if (activeStat) {
-        return { allowed: false, reason: "an active soft lock already exists", activeStat };
+    const slotsFree = Math.max(0, maxActive - activeCount);
+    if (slotsFree <= 0) {
+        return { allowed: false, reason: `at the soft-lock limit (${maxActive})`, activeStat, slotsFree: 0 };
     }
     const elapsed = currentSceneCount - lastSetAt;
     if (lastSetAt > 0 && elapsed < SOFT_LOCK_COOLDOWN_SCENES) {
-        return { allowed: false, reason: `cooldown: ${SOFT_LOCK_COOLDOWN_SCENES - elapsed} more scene(s)`, activeStat: null };
+        return { allowed: false, reason: `cooldown: ${SOFT_LOCK_COOLDOWN_SCENES - elapsed} more scene(s)`, activeStat, slotsFree: 0 };
     }
-    return { allowed: true, reason: "", activeStat: null };
+    return { allowed: true, reason: "", activeStat: null, slotsFree };
 }
 
 /**

@@ -53,10 +53,16 @@
     display: flex;
     border-bottom: 0.5px solid var(--rst-border);
     background: var(--rst-bg-hover);
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;   /* momentum scroll on iOS */
+    scrollbar-width: none;               /* Firefox: hide scrollbar */
 }
+.rst-tabs::-webkit-scrollbar { height: 0; display: none; } /* hide scrollbar, keep scroll */
 
 .rst-tab {
     padding: 11px 15px;
+    flex: 0 0 auto;   /* do not shrink; allow the row to overflow & scroll */
     cursor: pointer;
     border-bottom: 2px solid transparent;
     color: var(--rst-text-muted);
@@ -1675,3 +1681,78 @@ dialog.popup .editor_maximize:hover {
 .rst-eye-btn.eye-off i { color: var(--rst-text-muted); }
 .rst-eye-btn.eye-partial i { color: #C9881F; }
 .rst-eye-btn.eye-partial { border-color: color-mix(in srgb, #C9881F 35%, transparent); }
+
+/* Character action buttons: own row, wrap cleanly, never compress */
+.rst-char-actions .rst-icon-btn { flex-shrink: 0; }
+
+/* Scan-for-locks review dialog — compact, scannable */
+.rst-scan-review { text-align: left; font-size: 13px; max-height: 60vh; overflow-y: auto; }
+.rst-scan-summary { font-size: 12px; color: var(--rst-text-muted); margin-bottom: 12px; line-height: 1.5; }
+.rst-scan-char { border: 0.5px solid var(--rst-border); border-radius: 8px; margin-bottom: 6px; overflow: hidden; }
+.rst-scan-char summary {
+    display: flex; align-items: center; gap: 8px; padding: 9px 12px;
+    cursor: pointer; list-style: none; user-select: none;
+}
+.rst-scan-char summary::-webkit-details-marker { display: none; }
+.rst-scan-char summary::before {
+    content: "\f105"; font-family: "Font Awesome 6 Free"; font-weight: 900;
+    color: var(--rst-text-muted); font-size: 12px; transition: transform 0.15s;
+}
+.rst-scan-char[open] summary::before { transform: rotate(90deg); }
+.rst-scan-char summary:hover { background: var(--rst-bg-hover); }
+.rst-scan-name { font-weight: 500; flex: 1; }
+.rst-scan-count {
+    font-size: 11px; color: var(--rst-text-muted);
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #888) 12%, transparent);
+    border-radius: 100px; padding: 1px 8px; min-width: 20px; text-align: center;
+}
+.rst-scan-locks { padding: 4px 12px 10px; }
+.rst-scan-lock {
+    display: grid; grid-template-columns: auto auto 1fr; align-items: center;
+    gap: 8px; padding: 6px 0; border-top: 0.5px solid color-mix(in srgb, var(--SmartThemeBodyColor, #888) 8%, transparent);
+}
+.rst-scan-lock:first-child { border-top: none; }
+.rst-scan-tag {
+    font-size: 9px; font-weight: 700; letter-spacing: 0.04em;
+    padding: 2px 6px; border-radius: 4px; white-space: nowrap;
+}
+.rst-scan-tag.hard { color: #C9881F; background: color-mix(in srgb, #C9881F 16%, transparent); }
+.rst-scan-tag.soft { color: #4A7BA6; background: color-mix(in srgb, #5B8FBF 16%, transparent); }
+.rst-scan-stat { font-size: 12px; color: var(--rst-text); }
+.rst-scan-cap { font-size: 12px; font-weight: 600; }
+.rst-scan-why {
+    grid-column: 1 / -1; font-size: 11px; color: var(--rst-text-muted);
+    line-height: 1.45; padding-left: 2px; margin-top: 2px;
+}
+
+/* Per-character pick checkbox in scan review */
+.rst-scan-pick { margin: 0 2px 0 0; flex-shrink: 0; cursor: pointer; }
+
+/* Hard-lock editor popup (cap + reason) */
+.rst-lockedit { text-align: left; font-size: 13px; }
+.rst-lockedit-title { font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.rst-lockedit-hint { font-size: 11px; color: var(--rst-text-muted); line-height: 1.5; margin-bottom: 10px; }
+.rst-lockedit-label {
+    display: block; font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+    text-transform: uppercase; color: var(--rst-text-muted); margin: 8px 0 4px;
+}
+.rst-lockedit-cap {
+    width: 90px; padding: 6px 10px; font-size: 14px;
+    border: 0.5px solid var(--rst-border); border-radius: 8px;
+    background: var(--rst-bg-input, transparent); color: var(--rst-text);
+}
+.rst-lockedit-reason {
+    width: 100%; padding: 8px 10px; font-size: 13px; line-height: 1.5;
+    border: 0.5px solid var(--rst-border); border-radius: 8px;
+    background: var(--rst-bg-input, transparent); color: var(--rst-text);
+    resize: vertical; font-family: inherit; box-sizing: border-box;
+}
+
+/* Discard checkbox in the scan review dialog */
+.rst-scan-discard {
+    display: flex; align-items: center; gap: 8px; cursor: pointer;
+    font-size: 12px; color: var(--rst-text-muted);
+    margin-top: 10px; padding-top: 10px;
+    border-top: 0.5px solid var(--rst-border);
+}
+.rst-scan-discard input { flex-shrink: 0; }
