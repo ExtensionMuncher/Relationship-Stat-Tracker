@@ -176,6 +176,7 @@ function buildStatUpdateSystemPrompt(settings) {
         '        },',
         '        "dynamicTitle": "...",',
         '        "milestoneReached": false,',
+        '        "criticalStats": ["category.stat for any stat where a narratively pivotal moment justifies an unusually large shift"],',
         '        "milestoneDetail": "...",',
         '        "narrativeSummary": "..."',
         '      }',
@@ -184,6 +185,9 @@ function buildStatUpdateSystemPrompt(settings) {
         '',
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
+        '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
+        '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
+        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Still provide your normal stat value for it.',
         '- Range: -100 to 100. 0 = neutral.',
         `- Each stat MUST stay within ${range.min} to ${range.max} points of its current (pre-scene) value. For example, if Trust is currently 30 and the range is -5 to +5, the new Trust must be between 25 and 35.`,
         '- Stats are ABSOLUTE values (not deltas), but each must respect the per-scene change limit above.',
@@ -324,7 +328,8 @@ function parseStatUpdateResponse(response, characters) {
         const range = settings.statChangeRange || { min: -5, max: 5 };
         // Merge LLM stats over existing stats so unmentioned ones don't default to 0
         const mergedStats = mergeWithExistingStats(statsBefore, charData.stats || {});
-        const statsAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range);
+        const statsAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range, charData.criticalStats, settings);
+        const firedCriticals = statsAfter.__criticals || [];
         // Use LLM commentary if provided, otherwise generate fallback
         // Pass char to preserve old commentary for unchanged stats
         let commentary = charData.commentary || null;
@@ -348,6 +353,7 @@ function parseStatUpdateResponse(response, characters) {
             milestoneReached: charData.milestoneReached || false,
             milestoneDetail: charData.milestoneDetail || "",
             narrativeSummary: charData.narrativeSummary || char.narrativeSummary || "",
+            criticalStats: firedCriticals,
             source: "llm",
             changeCount,
         });
@@ -378,7 +384,8 @@ function parseStatUpdateResponse(response, characters) {
                     const range = settings.statChangeRange || { min: -5, max: 5 };
                     // Merge LLM stats over existing stats so unmentioned ones don't default to 0
                     const mergedStats = mergeWithExistingStats(statsBefore, llmData.stats || {});
-                    const statsAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range);
+                    const statsAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range, llmData.criticalStats, settings);
+                    const firedCriticals = statsAfter.__criticals || [];
                     let commentary = llmData.commentary || null;
                     if (!commentary || hasEmptyCommentary(commentary)) {
                         commentary = generateFallbackCommentary(statsBefore, statsAfter, matchedExisting);
@@ -397,6 +404,7 @@ function parseStatUpdateResponse(response, characters) {
                         milestoneReached: llmData.milestoneReached || false,
                         milestoneDetail: llmData.milestoneDetail || "",
                         narrativeSummary: llmData.narrativeSummary || matchedExisting.narrativeSummary || "",
+                        criticalStats: firedCriticals,
                         source: "llm",
                         changeCount,
                     });
@@ -946,18 +954,54 @@ function clampStats(stats) {
  * @param {{min: number, max: number}} range - Allowed delta range from settings
  * @returns {object} Clamped statsAfter values
  */
-function applyDeltaRange(statsBefore, statsAfter, range) {
+function applyDeltaRange(statsBefore, statsAfter, range, criticalStats = null, settings = null) {
+    // Resolve critical-change config. A stat goes critical only if (a) the feature
+    // is enabled, (b) the LLM flagged it in criticalStats, AND (c) it wins an RNG
+    // roll against the configured chance. Winners get a multiplier x wider ceiling.
+    const crit = settings?.criticalChanges || {};
+    const critEnabled = crit.enabled !== false && Array.isArray(criticalStats) && criticalStats.length > 0;
+    const critChance = typeof crit.chance === 'number' ? crit.chance : 7;
+    const critMult = typeof crit.multiplier === 'number' ? crit.multiplier : 3;
+
+    // Normalize the flagged set to a quick lookup of "category.stat".
+    const flagged = new Set();
+    if (critEnabled) {
+        for (const entry of criticalStats) {
+            if (typeof entry === 'string') flagged.add(entry.toLowerCase().trim());
+        }
+    }
+
+    // Track which stats actually went critical, so the caller can log/badge them.
+    const firedCriticals = [];
+
     const result = {};
     for (const cat of STAT_CATEGORIES) {
         result[cat] = {};
         for (const stat of STAT_NAMES) {
             const before = statsBefore[cat]?.[stat] ?? 0;
             const after = statsAfter[cat]?.[stat] ?? 0;
-            const minVal = before + range.min;
-            const maxVal = before + range.max;
-            result[cat][stat] = Math.max(minVal, Math.min(maxVal, after));
+
+            let loMul = range.min;
+            let hiMul = range.max;
+
+            // Critical gate: flagged AND wins the RNG roll -> widen the ceiling x mult.
+            if (critEnabled && flagged.has(cat + '.' + stat)) {
+                if ((Math.random() * 100) < critChance) {
+                    loMul = range.min * critMult;
+                    hiMul = range.max * critMult;
+                    firedCriticals.push(cat + '.' + stat);
+                }
+            }
+
+            const minVal = before + loMul;
+            const maxVal = before + hiMul;
+            // Still respect the absolute [-100,100] bound.
+            result[cat][stat] = Math.max(-100, Math.min(100, Math.max(minVal, Math.min(maxVal, after))));
         }
     }
+    // Stash fired criticals on the result object (non-enumerable so it won't
+    // pollute the stat shape when iterated/serialized as plain stats).
+    Object.defineProperty(result, '__criticals', { value: firedCriticals, enumerable: false });
     return result;
 }
 
@@ -1194,13 +1238,17 @@ function buildInitialStatSystemPrompt(settings) {
         '          "sexual": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"}',
         '        },',
         '        "dynamicTitle": "...",',
-        '        "narrativeSummary": "..."',
+        '        "narrativeSummary": "...",',
+        '        "criticalStats": ["category.stat for any stat where a narratively pivotal moment justifies an unusually large shift"]',
         '      }',
         '    }',
         '  }',
         '',
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
+        '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
+        '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
+        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Still provide your normal stat value for it.',
         '- Range: -100 to 100. 0 = neutral.',
         '- Commentary: explain each stat from scene events.',
         '- Dynamic title: character\'s relationship role/attitude toward {{user}}.',
@@ -1244,7 +1292,7 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
     parts.push('CRITICAL — Scan for ALL additional characters:');
     parts.push('- You MUST identify EVERY named individual who appears, speaks, interacts, or is described as doing something in the scene messages.');
     parts.push('- INCLUDE characters who: speak dialogue, are addressed by name, perform actions described by another speaker, interact with someone in the scene, or are described as being physically present or doing an activity.');
-    parts.push('- Example of INCLUDE: a character says "I talked with [Name]" or "[Name] handed me the package" — [Name] is described as interacting and should be included.');
+    parts.push('- Example of INCLUDE: a character says "I talked with [Name]" or "[Name] handed me the package" — [Name] is interacting. ALSO INCLUDE remote involvement: "[Name] watched the feed of her" or "[Name]\'s operatives tailed her on his orders" — [Name] is shaping/observing the scene from afar and IS affected by it.');
     parts.push('- Example of EXCLUDE: "I heard about [Name]\'s reputation" — [Name] is merely discussed with no described interaction.');
     parts.push('- When in doubt, INCLUDE the character.');
     parts.push('Include them in your characters object with full stat estimates based on their scene behavior.');
@@ -1383,7 +1431,9 @@ function parseInitialStatResponse(response, characters) {
                     const range = settings.statChangeRange || { min: -5, max: 5 };
                     // Merge LLM stats over existing stats so unmentioned ones don't default to 0
                     const mergedStats = mergeWithExistingStats(statsBefore, statsAfter);
-                    const clampedAfter = applyDeltaRange(statsBefore, mergedStats, range);
+                    const _site4settings = (typeof settings !== 'undefined') ? settings : getSettings();
+                    const clampedAfter = applyDeltaRange(statsBefore, mergedStats, range, llmData.criticalStats, _site4settings);
+                    const firedCriticals = clampedAfter.__criticals || [];
                     let commentary = llmData.commentary || null;
                     if (!commentary || hasEmptyCommentary(commentary)) {
                         commentary = generateFallbackCommentary(statsBefore, clampedAfter, matchedExisting);
@@ -1402,6 +1452,7 @@ function parseInitialStatResponse(response, characters) {
                         milestoneReached: false,
                         milestoneDetail: "",
                         narrativeSummary: llmData.narrativeSummary || matchedExisting.narrativeSummary || "",
+                        criticalStats: firedCriticals,
                         source: "llm_initial",
                         changeCount,
                     });

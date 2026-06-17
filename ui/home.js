@@ -284,9 +284,12 @@ function renderStatCategory(cat, charUpdate) {
             ? `<span class="rst-sv ${beforeClass}">${formatPercent(before)}</span> → <span class="rst-sv ${afterClass}">${formatPercent(after)}</span>`
             : `<span class="rst-sv ${afterClass}">${formatPercent(after)}</span>`;
 
+        const isCritical = Array.isArray(charUpdate.criticalStats) && charUpdate.criticalStats.includes(cat + "." + stat);
+        const critBadge = isCritical ? ' <span class="rst-crit-badge"><i class="fa-solid fa-bolt"></i> critical</span>' : '';
+
         $cat.append(`
             <div class="rst-sr">
-                <span class="rst-sn">${stat.charAt(0).toUpperCase() + stat.slice(1)}</span>
+                <span class="rst-sn">${stat.charAt(0).toUpperCase() + stat.slice(1)}${critBadge}</span>
                 <span>${display}</span>
             </div>
             <div class="rst-sc">${commentary}</div>
@@ -535,6 +538,7 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
             dynamicTitleBefore: charUpdate.dynamicTitleBefore,
             dynamicTitleAfter: charUpdate.dynamicTitleAfter,
             narrativeSummary: charUpdate.narrativeSummary,
+            criticalStats: charUpdate.criticalStats || [],
             source: charUpdate.source || "unknown",
         });
 

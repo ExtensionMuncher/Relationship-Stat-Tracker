@@ -228,8 +228,25 @@ function reRenderCharacterList($pane) {
  */
 export function selectCharacter(charId) {
     selectedCharId = charId;
+
+    // If the character lives inside a folder, make sure that folder is open —
+    // otherwise the selected chip and its profile card render inside a collapsed
+    // folder body and stay invisible. (Folders are collapsed by default.)
+    const _selProfile = getCharacterProfile(charId);
+    if (_selProfile && _selProfile.folderId) {
+        collapsedFolders.add(_selProfile.folderId + '_open');
+    }
+
     const $pane = $("#rst-p-lib");
-            reRenderCharacterList($pane);
+    reRenderCharacterList($pane);
+
+    // Scroll the now-visible character card into view.
+    setTimeout(() => {
+        const $sel = $pane.find(".rst-chip.on").first();
+        if ($sel.length && $sel[0].scrollIntoView) {
+            $sel[0].scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+    }, 60);
 }
 
 // ─── Filter/Sort Pipeline ─────────────────────────────────
@@ -519,10 +536,10 @@ function renderCharacterCard($pane, profile) {
                 </div>
             </div>
             <div style="margin-left:auto;display:flex;gap:6px">
-                <button class="rst-icon-btn rst-wand-btn" title="Generate profile">✦</button>
-                <button class="rst-icon-btn rst-edit-btn" title="Edit stats">✎</button>
-                <button class="rst-icon-btn rst-log-btn" title="Update log">◷</button>
-                <button class="rst-icon-btn rst-delete-btn" style="color:var(--rst-danger)" title="Delete character">✕</button>
+                <button class="rst-icon-btn rst-wand-btn" title="Generate profile"><i class="fa-solid fa-wand-magic-sparkles"></i></button>
+                <button class="rst-icon-btn rst-edit-btn" title="Edit stats"><i class="fa-solid fa-pen"></i></button>
+                <button class="rst-icon-btn rst-log-btn" title="Update log"><i class="fa-solid fa-clock-rotate-left"></i></button>
+                <button class="rst-icon-btn rst-delete-btn" style="color:var(--rst-danger)" title="Delete character"><i class="fa-solid fa-xmark"></i></button>
             </div>
         </div>
     `);
@@ -1300,54 +1317,105 @@ function toggleLogPanel(profile) {
 function renderLogEntry(entry, profile) {
     const sceneNum = entry.sceneId?.replace("scene_", "") || "?";
     const timeAgo = formatTimeAgo(entry.timestamp);
-    const msgRange = (entry.messageRange && typeof entry.messageRange.start === "number") ? `msgs ${entry.messageRange.start}–${entry.messageRange.end}` : "no msg range";
+    const msgRange = (entry.messageRange && typeof entry.messageRange.start === "number") ? `msgs ${entry.messageRange.start}–${entry.messageRange.end}` : null;
 
-    const $entry = $(`
-        <div class="rst-log-entry">
-            <div class="rst-log-meta">Scene ${sceneNum} · ${msgRange} · ${timeAgo}</div>
+    const $entry = $(`<div class="rst-log-entry"></div>`);
+
+    // ── Entry header: scene number + meta + net change summary ──
+    const sourceLabel = entry.source === "batch_scan" ? "batch scan"
+        : entry.source === "manual_edit" ? "manual edit"
+        : entry.source === "scene_close" ? "scene close"
+        : "";
+    const metaBits = [msgRange, timeAgo, sourceLabel].filter(Boolean).join(" · ");
+
+    // Count how many stats actually changed
+    let changedCount = 0;
+    for (const cat of STAT_CATEGORIES) {
+        for (const stat of STAT_NAMES) {
+            const b = entry.statsBefore?.[cat]?.[stat];
+            const a = entry.statsAfter?.[cat]?.[stat];
+            if (a === undefined) continue;
+            if ((b !== undefined && b !== a) || (b === undefined && a !== 0)) changedCount++;
+        }
+    }
+
+    $entry.append(`
+        <div class="rst-log-head">
+            <div class="rst-log-scene">Scene ${sceneNum}</div>
+            <div class="rst-log-meta">${metaBits}</div>
+            <div class="rst-log-changecount">${changedCount} change${changedCount === 1 ? "" : "s"}</div>
         </div>
     `);
 
+    // Optional dynamic title transition
+    if (entry.dynamicTitleBefore && entry.dynamicTitleAfter && entry.dynamicTitleBefore !== entry.dynamicTitleAfter) {
+        $entry.append(`
+            <div class="rst-log-dyn">
+                <span class="rst-log-dyn-from">${entry.dynamicTitleBefore}</span>
+                <i class="fa-solid fa-arrow-right-long" style="font-size:10px;opacity:0.6;margin:0 6px"></i>
+                <span class="rst-log-dyn-to">${entry.dynamicTitleAfter}</span>
+            </div>
+        `);
+    }
+
+    // ── Per-category grouped changes ──
+    const $changes = $('<div class="rst-log-changes"></div>');
     for (const cat of STAT_CATEGORIES) {
+        const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
+        const catIcon = cat === "platonic" ? "fa-user-group" : cat === "romantic" ? "fa-heart" : "fa-fire";
+
+        // Gather changed stats in this category
+        const rows = [];
         for (const stat of STAT_NAMES) {
             const before = entry.statsBefore?.[cat]?.[stat];
             const after = entry.statsAfter?.[cat]?.[stat];
             if (after === undefined) continue;
 
-            const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
-            const statTitle = stat.charAt(0).toUpperCase() + stat.slice(1);
-
+            let changed = false, delta = "", cls = "z";
             if (before !== undefined && before !== after) {
-                const cls = after > before ? "p" : "n";
-                $entry.append(`
-                    <div class="rst-sr">
-                        <span>${catTitle} / ${statTitle}</span>
-                        <span class="rst-sv ${cls}">${before}% → ${after}%</span>
-                    </div>
-                `);
+                changed = true;
+                cls = after > before ? "p" : "n";
+                const diff = after - before;
+                delta = `${before}% → ${after}% (${diff > 0 ? "+" : ""}${diff})`;
             } else if (before === undefined && after !== 0) {
-                const cls = after > 0 ? "p" : "n";
-                $entry.append(`
-                    <div class="rst-sr">
-                        <span>${catTitle} / ${statTitle}</span>
-                        <span class="rst-sv ${cls}">set to ${after}%</span>
-                    </div>
-                `);
-            } else {
-                continue;
+                changed = true;
+                cls = after > 0 ? "p" : "n";
+                delta = `set to ${after}%`;
             }
+            if (!changed) continue;
 
-            const commentary = entry.commentary?.[cat]?.[stat];
-            if (commentary) {
-                $entry.append(`<div style="font-size:11px;color:var(--rst-text-muted);padding:3px 0;line-height:1.4">${commentary}</div>`);
-            }
+            const statTitle = stat.charAt(0).toUpperCase() + stat.slice(1);
+            const commentary = entry.commentary?.[cat]?.[stat] || "";
+            const isCritical = Array.isArray(entry.criticalStats) && entry.criticalStats.includes(cat + "." + stat);
+            rows.push({ statTitle, delta, cls, commentary, isCritical });
         }
+
+        if (rows.length === 0) continue;
+
+        const $catGroup = $(`<div class="rst-log-cat"><div class="rst-log-cat-h"><i class="fa-solid ${catIcon}"></i> ${catTitle}</div></div>`);
+        for (const r of rows) {
+            $catGroup.append(`
+                <div class="rst-log-stat">
+                    <div class="rst-log-stat-top">
+                        <span class="rst-log-stat-name">${r.statTitle}${r.isCritical ? ' <span class="rst-log-crit"><i class="fa-solid fa-bolt"></i> critical</span>' : ''}</span>
+                        <span class="rst-log-stat-delta ${r.cls}">${r.delta}</span>
+                    </div>
+                    ${r.commentary ? `<div class="rst-log-stat-com">${r.commentary}</div>` : ""}
+                </div>
+            `);
+        }
+        $changes.append($catGroup);
     }
 
+    if (changedCount === 0) {
+        $changes.append('<div class="rst-log-nochange">No stat changes recorded for this entry.</div>');
+    }
+    $entry.append($changes);
+
     const $btnRow = $(`
-        <div class="rst-btn-row" style="margin-top:8px">
-            <button class="rst-btn rst-rollback-btn">Rollback</button>
-            <button class="rst-btn-danger rst-delete-log-btn">Delete</button>
+        <div class="rst-btn-row" style="margin-top:10px">
+            <button class="rst-btn rst-rollback-btn"><i class="fa-solid fa-rotate-left" style="font-size:10px;margin-right:4px"></i>Rollback</button>
+            <button class="rst-btn-danger rst-delete-log-btn"><i class="fa-solid fa-trash" style="font-size:10px;margin-right:4px"></i>Delete</button>
         </div>
     `);
 

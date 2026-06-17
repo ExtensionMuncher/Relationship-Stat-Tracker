@@ -51,15 +51,15 @@ export async function detectCharacters(messageCount = null) {
         dlog("[RST] detectCharacters: parsed names:", JSON.stringify(detectedNames));
 
         // ── Post-filter: verify names against actual message content ──
-        // LLMs often include characters who are only mentioned or described
-        // by narration. This filter keeps only characters who actually SPEAK
-        // or are directly addressed in the scanned messages.
-        const verifiedNames = filterByMessagePresence(detectedNames, messages);
-        const removedNames = detectedNames.filter(n => !verifiedNames.includes(n));
-        if (removedNames.length > 0) {
-            dlog("[RST] detectCharacters: post-filter removed (mentioned-only or narration-only):", JSON.stringify(removedNames));
-        }
-        dlog("[RST] detectCharacters: post-filter kept:", JSON.stringify(verifiedNames));
+        // Trust the sidecar's reading comprehension directly. The model reads
+        // full prose and judges involvement (including remote/observational
+        // involvement) better than any keyword filter could. The mechanical
+        // filterByMessagePresence() remains defined below but is intentionally
+        // NOT applied — it can only agree with the sidecar or wrongly veto a
+        // correct detection it lacks a keyword for. The stat-update LLM is a
+        // second safety net that re-reads the scene and catches any misses.
+        const verifiedNames = detectedNames;
+        dlog("[RST] detectCharacters: trusting sidecar, detected:", JSON.stringify(verifiedNames));
 
         return categorizeNames(verifiedNames, knownNames);
     } catch (err) {
@@ -100,20 +100,21 @@ function buildSidecarRequestPrompt(messages, knownNames) {
     });
 
     const parts = [
-        'Identify ONLY characters who are PHYSICALLY PRESENT and actively participating in the CURRENT scene — not characters in other locations or timeframes.',
+        'Identify characters who are INVOLVED in the CURRENT scene. A character is involved if they are either PHYSICALLY PRESENT, OR REMOTELY INVOLVED (actively observing, directing, or affecting the scene from elsewhere).',
         '',
-        'STRICT INCLUSION RULES (ALL must be true):',
-        '- The character must actually SPEAK dialogue in these messages (appear as a message speaker), OR be directly addressed BY NAME in dialogue by another character.',
-        '- The character must be in the SAME physical location/scene as the other characters, not in a different place.',
+        'INCLUDE a character if ANY of these is true:',
+        '- They SPEAK dialogue in these messages (appear as a message speaker).',
+        '- They are directly addressed BY NAME in dialogue by another character.',
+        '- They are REMOTELY INVOLVED: actively watching/surveilling the scene, issuing orders that shape it, commenting on events as they happen, or otherwise deliberately influencing what is happening — even from a different location and even if other characters are unaware of them. (Example: a character monitoring a surveillance feed of the scene, or directing operatives who appear in it.)',
         '',
-        'STRICT EXCLUSION RULES:',
-        '- EXCLUDE characters who are in a DIFFERENT LOCATION (separate scene, different building, different part of the city).',
-        '- EXCLUDE characters who are only MENTIONED or REFERENCED in conversation (e.g., "I talked with [Name] yesterday" — EXCLUDE [Name]).',
-        '- EXCLUDE characters who are only DESCRIBED by narration, surveillance logs, or internal reports but do not speak or get addressed.',
-        '- EXCLUDE characters appearing in flashbacks, memories, or hypothetical scenarios.',
-        '- EXCLUDE the user/player character name.',
-        '- EXCLUDE generic titles (like "the man", "a woman").',
-        '- CRITICAL: If a character is merely being talked ABOUT, EXCLUDE them. They must be ACTIVELY PARTICIPATING.',
+        'EXCLUDE a character if:',
+        '- They are only MENTIONED or REFERENCED in passing (e.g., "I talked with [Name] yesterday" — EXCLUDE [Name]).',
+        '- They are in a different location AND are NOT watching, directing, or otherwise actively involved in this scene (a character simply being elsewhere doing their own unrelated thing is EXCLUDED).',
+        '- They appear only in flashbacks, memories, or hypothetical scenarios.',
+        '- They are the user/player character.',
+        '- They are a generic title (like "the man", "a woman").',
+        '',
+        'KEY DISTINCTION: "merely talked about" = EXCLUDE. "actively watching or influencing the scene from afar" = INCLUDE, even if physically absent and even if unknown to the other characters.',
         '- Each name should appear only once.',
     ];
 
@@ -408,6 +409,21 @@ function filterByMessagePresence(names, messages) {
             ];
             for (const pat of patterns) {
                 if (pat.test(allDialogue)) return true;
+            }
+        }
+
+        // 3. REMOTE INVOLVEMENT (known characters only): named in scene text AND
+        // an involvement cue (watching, directing, etc.) appears nearby. Scoped to
+        // known characters so narration cannot invent false positives. Handles
+        // asymmetric scenes where a character observes or controls events from
+        // elsewhere without speaking or being directly addressed.
+        if (knownLowerSet.has(nameLower)) {
+            for (const part of nameParts) {
+                if (part.length < 3) continue;
+                const idx = allText.indexOf(part);
+                if (idx === -1) continue;
+                const windowText = allText.slice(Math.max(0, idx - 220), idx + 220);
+                if (involvementCue.test(windowText)) return true;
             }
         }
 

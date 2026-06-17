@@ -486,6 +486,7 @@ function renderSceneSummaryPrompt($pane, settings) {
 
 function renderStatSettings($pane, settings) {
     const range = settings.statChangeRange || { min: -5, max: 5 };
+    const crit = settings.criticalChanges || { enabled: true, chance: 7, multiplier: 3 };
     const $card = $(`
         <div class="rst-card">
             <div class="rst-setting-row">
@@ -499,6 +500,23 @@ function renderStatSettings($pane, settings) {
                     <input type="number" id="rst-range-max" value="${range.max}" min="0" max="20" style="width:52px;text-align:center">
                 </div>
             </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Critical changes</div>
+                    <div class="rst-setting-sub">On pivotal moments, a flagged stat can shift up to ${crit.multiplier || 3}\u00d7 the normal range. RNG-gated and rare.</div>
+                </div>
+                <label class="rst-toggle"><input type="checkbox" id="rst-crit-enabled" ${crit.enabled !== false ? "checked" : ""}><span class="rst-slider"></span></label>
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Critical chance</div>
+                    <div class="rst-setting-sub">Percent chance a flagged stat actually goes critical (lower = rarer)</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+                    <input type="number" id="rst-crit-chance" value="${crit.chance ?? 7}" min="0" max="100" style="width:56px;text-align:center">
+                    <span style="font-size:12px;color:var(--rst-text-muted)">%</span>
+                </div>
+            </div>
         </div>
     `);
 
@@ -507,6 +525,15 @@ function renderStatSettings($pane, settings) {
     });
     $card.find("#rst-range-max").on("change", function () {
         saveSetting("statChangeRange.max", parseInt($(this).val(), 10));
+    });
+    $card.find("#rst-crit-enabled").on("change", function () {
+        saveSetting("criticalChanges.enabled", $(this).prop("checked"));
+    });
+    $card.find("#rst-crit-chance").on("change", function () {
+        let v = parseInt($(this).val(), 10);
+        if (isNaN(v) || v < 0) v = 0; if (v > 100) v = 100;
+        $(this).val(v);
+        saveSetting("criticalChanges.chance", v);
     });
 
     $pane.append($card);

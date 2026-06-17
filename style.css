@@ -26,7 +26,7 @@
     --rst-bg: var(--SmartThemeBlurTintColor, #fff);
     --rst-bg-hover: var(--SmartThemeBlurTintColor, #f8f8f8);
     --rst-font: var(--SmartThemeBodyFont, system-ui, sans-serif);
-    --rst-font-size: 14px;
+    --rst-font-size: 13px;
     --rst-pos: #1D9E75;
     --rst-neg: #D85A30;
 }
@@ -884,17 +884,87 @@
 
 /* --- Log Entry --- */
 .rst-log-entry {
-    border: 0.5px solid var(--rst-border);
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #888) 14%, transparent);
     border-radius: 8px;
-    padding: 10px;
-    margin-bottom: 8px;
+    padding: 12px;
+    margin-bottom: 9px;
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #888) 2.5%, transparent);
 }
 
-.rst-log-meta {
-    font-size: 11px;
+/* Entry header row */
+.rst-log-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding-bottom: 9px;
+    margin-bottom: 9px;
+    border-bottom: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #888) 11%, transparent);
+}
+.rst-log-scene { font-size: 13px; font-weight: 600; color: var(--rst-text); }
+.rst-log-meta { font-size: 11px; color: var(--rst-text-muted); }
+.rst-log-changecount {
+    margin-left: auto;
+    font-size: 10px;
+    color: var(--rst-text-muted);
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #888) 9%, transparent);
+    padding: 1px 8px;
+    border-radius: 100px;
+    white-space: nowrap;
+}
+
+/* Dynamic title transition */
+.rst-log-dyn {
+    font-style: italic;
+    font-size: 12px;
+    color: var(--rst-text-muted);
+    margin-bottom: 11px;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.rst-log-dyn-to { color: var(--rst-text); font-weight: 500; }
+
+/* Per-category groups */
+.rst-log-cat { margin-bottom: 11px; }
+.rst-log-cat:last-child { margin-bottom: 0; }
+.rst-log-cat-h {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
     color: var(--rst-text-muted);
     margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
 }
+.rst-log-cat-h i { opacity: 0.7; }
+
+.rst-log-stat { margin-bottom: 8px; padding-left: 2px; }
+.rst-log-stat:last-child { margin-bottom: 0; }
+.rst-log-stat-top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+}
+.rst-log-stat-name { font-size: 12px; font-weight: 500; color: var(--rst-text); }
+.rst-log-stat-delta {
+    font-size: 12px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+.rst-log-stat-delta.p { color: var(--rst-pos); }
+.rst-log-stat-delta.n { color: var(--rst-neg); }
+.rst-log-stat-delta.z { color: var(--rst-text-muted); }
+.rst-log-stat-com {
+    font-size: 11px;
+    line-height: 1.5;
+    color: color-mix(in srgb, var(--SmartThemeBodyColor, #888) 70%, transparent);
+    margin-top: 2px;
+}
+.rst-log-nochange { font-size: 12px; color: var(--rst-text-muted); font-style: italic; }
 
 /* --- Two Column Layout --- */
 .rst-two-col {
@@ -1519,3 +1589,22 @@ dialog.popup .editor_maximize:hover {
 
 /* Scene chevron rotation on open */
 .rst-scene-entry.open .rst-scene-chev { transform: rotate(180deg); }
+
+/* Critical stat change badge (update log + pending) */
+.rst-log-crit, .rst-crit-badge {
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: #C77800;
+    background: color-mix(in srgb, #E8A317 18%, transparent);
+    border: 1px solid color-mix(in srgb, #E8A317 40%, transparent);
+    padding: 1px 6px;
+    border-radius: 100px;
+    margin-left: 6px;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+}
+.rst-log-crit i, .rst-crit-badge i { font-size: 8px; }
