@@ -77,10 +77,44 @@ export function createBlankSoftLocks() {
     for (const cat of STAT_CATEGORIES) {
         locks[cat] = {};
         for (const stat of STAT_NAMES) {
-            locks[cat][stat] = { cap: null, condition: "", progress: "", met: false };
+            locks[cat][stat] = { cap: null, condition: "", progress: "", met: false, setAtScene: 0 };
         }
     }
     return locks;
+}
+
+export const SOFT_LOCK_COOLDOWN_SCENES = 5;
+
+/**
+ * Determine whether a character can receive a NEW soft lock right now.
+ * Two gates:
+ *   1. CAP: at most ONE active (unmet) soft lock per character at a time.
+ *   2. COOLDOWN: at least SOFT_LOCK_COOLDOWN_SCENES closed scenes must have
+ *      passed since the most recent soft lock was set or resolved.
+ * @param {object} profile
+ * @param {number} currentSceneCount - getClosedSceneCount() at evaluation time
+ * @returns {{ allowed: boolean, reason: string, activeStat: string|null }}
+ */
+export function getSoftLockAvailability(profile, currentSceneCount) {
+    if (!profile || !profile.softLocks) return { allowed: false, reason: "no profile", activeStat: null };
+    let activeStat = null;
+    let lastSetAt = 0;
+    for (const cat of STAT_CATEGORIES) {
+        for (const stat of STAT_NAMES) {
+            const sl = profile.softLocks[cat]?.[stat];
+            if (!sl || typeof sl.cap !== 'number') continue;
+            if (!sl.met) activeStat = `${cat}.${stat}`;          // an active lock exists
+            if (typeof sl.setAtScene === 'number') lastSetAt = Math.max(lastSetAt, sl.setAtScene);
+        }
+    }
+    if (activeStat) {
+        return { allowed: false, reason: "an active soft lock already exists", activeStat };
+    }
+    const elapsed = currentSceneCount - lastSetAt;
+    if (lastSetAt > 0 && elapsed < SOFT_LOCK_COOLDOWN_SCENES) {
+        return { allowed: false, reason: `cooldown: ${SOFT_LOCK_COOLDOWN_SCENES - elapsed} more scene(s)`, activeStat: null };
+    }
+    return { allowed: true, reason: "", activeStat: null };
 }
 
 /**
@@ -130,6 +164,8 @@ export function createCharacter(name, options = {}) {
         stats: options.stats || createBlankStats(),
         hardLocks: options.hardLocks || createBlankLocks(),
         softLocks: options.softLocks || createBlankSoftLocks(),
+        suppressDescriptionInjection: options.suppressDescriptionInjection || false,
+        suppressNotesInjection: options.suppressNotesInjection || false,
 
         dynamicTitle: options.dynamicTitle || "",
         narrativeSummary: options.narrativeSummary || "",
@@ -210,7 +246,7 @@ function normalizeProfileLocks(profile) {
             if (!profile.softLocks[cat]) profile.softLocks[cat] = {};
             for (const stat of STAT_NAMES) {
                 if (!profile.softLocks[cat][stat]) {
-                    profile.softLocks[cat][stat] = { cap: null, condition: "", progress: "", met: false };
+                    profile.softLocks[cat][stat] = { cap: null, condition: "", progress: "", met: false, setAtScene: 0 };
                 }
             }
         }
@@ -423,7 +459,7 @@ export function updateCharacterProfile(charId, updates) {
     const profile = getStoredCharacter(charId);
     if (!profile) return;
 
-    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary", "folderId", "avatar", "hardLocks", "softLocks"];
+    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary", "folderId", "avatar", "hardLocks", "softLocks", "suppressDescriptionInjection", "suppressNotesInjection"];
     for (const field of allowedFields) {
         if (updates[field] !== undefined) {
             profile[field] = updates[field];

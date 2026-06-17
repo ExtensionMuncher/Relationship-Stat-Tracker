@@ -113,6 +113,28 @@ export function getClosedScenes() {
 }
 
 /**
+ * Count of closed scenes — used as a monotonic clock for soft-lock cooldowns.
+ * @returns {number}
+ */
+export function getClosedSceneCount() {
+    return getClosedScenes().length;
+}
+
+/**
+ * Count of closed scenes a specific character was PRESENT in — used as a
+ * per-character monotonic clock for soft-lock cooldowns, so closing scenes that
+ * don't involve a character does not tick down their cooldown.
+ * @param {string} charId
+ * @returns {number}
+ */
+export function getClosedSceneCountForChar(charId) {
+    if (!charId) return 0;
+    return getClosedScenes().filter(
+        (s) => Array.isArray(s.charactersPresent) && s.charactersPresent.includes(charId)
+    ).length;
+}
+
+/**
  * Get all scene summaries (for injection into LLM prompts).
  * @returns {Array<{id: string, summary: string}>}
  */

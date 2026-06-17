@@ -1662,3 +1662,16 @@ dialog.popup .editor_maximize:hover {
 }
 .rst-softlock:hover { background: color-mix(in srgb, #5B8FBF 24%, transparent); }
 .rst-softlock i { font-size: 9px; }
+
+/* Resolved (unlocked) soft lock — shown as history, muted/green */
+.rst-softlock.met {
+    color: var(--rst-pos);
+    background: color-mix(in srgb, var(--rst-pos) 13%, transparent);
+    border-color: color-mix(in srgb, var(--rst-pos) 32%, transparent);
+    opacity: 0.85;
+}
+
+/* Eyeball injection toggle — distinct when profile is hidden from main AI */
+.rst-eye-btn.eye-off i { color: var(--rst-text-muted); }
+.rst-eye-btn.eye-partial i { color: #C9881F; }
+.rst-eye-btn.eye-partial { border-color: color-mix(in srgb, #C9881F 35%, transparent); }

@@ -106,13 +106,13 @@ function renderDebugSettings($pane, settings) {
     `);
     $pane.append($card);
 
-    $("#rst-debug-toggle").on("change", function () {
+    $card.find("#rst-debug-toggle").on("change", function () {
         const on = $(this).prop("checked");
         saveSetting("debug", on);
         toastr?.info?.(`Debug logging ${on ? "enabled" : "disabled"}.`, "Relationship Stat Tracker");
     });
 
-    $("#rst-scan-locks-btn").on("click", async function () {
+    $card.find("#rst-scan-locks-btn").on("click", async function () {
         const $btn = $(this);
         $btn.prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Scanning...');
         try {
@@ -164,18 +164,26 @@ function renderDebugSettings($pane, settings) {
                     }
                     updateCharacterProfile(r.characterId, { hardLocks: prof.hardLocks });
                 }
-                // Soft locks — only set on stats without an active (unmet) soft lock already.
+                // Soft locks — enforce the same 1-active cap + cooldown as the
+                // normal path. At most ONE new soft lock per character per scan.
                 if (prof.softLocks) {
-                    for (const l of (r.softLocks || [])) {
-                        const [cat, stat] = String(l.stat).split(".");
-                        if (!prof.softLocks[cat] || !prof.softLocks[cat][stat]) continue;
-                        const existing = prof.softLocks[cat][stat];
-                        if (existing.cap === null || existing.met) {
-                            prof.softLocks[cat][stat] = { cap: l.cap, condition: l.condition || "", progress: l.progress || "", met: false };
-                            appliedSoft++;
+                    const { getSoftLockAvailability } = await import("../data/characters.js");
+                    const { getClosedSceneCountForChar } = await import("../data/scenes.js");
+                    const sceneCount = getClosedSceneCountForChar(r.characterId);
+                    const avail = getSoftLockAvailability(prof, sceneCount);
+                    if (avail.allowed) {
+                        for (const l of (r.softLocks || [])) {
+                            const [cat, stat] = String(l.stat).split(".");
+                            const slot = prof.softLocks[cat]?.[stat];
+                            if (!slot) continue;
+                            if ((slot.cap === null || slot.met) && l.condition && String(l.condition).trim()) {
+                                prof.softLocks[cat][stat] = { cap: l.cap, condition: l.condition || "", progress: l.progress || "", met: false, setAtScene: sceneCount };
+                                appliedSoft++;
+                                break; // cap of 1 active per character
+                            }
                         }
+                        updateCharacterProfile(r.characterId, { softLocks: prof.softLocks });
                     }
-                    updateCharacterProfile(r.characterId, { softLocks: prof.softLocks });
                 }
             }
             toastr?.success?.(`Applied ${appliedHard} hard + ${appliedSoft} soft lock${(appliedHard + appliedSoft) === 1 ? "" : "s"}.`, "Relationship Stat Tracker");

@@ -536,6 +536,7 @@ function renderCharacterCard($pane, profile) {
                 </div>
             </div>
             <div style="margin-left:auto;display:flex;gap:6px">
+                <button class="rst-icon-btn rst-eye-btn ${(profile.suppressDescriptionInjection && profile.suppressNotesInjection) ? 'eye-off' : ((profile.suppressDescriptionInjection || profile.suppressNotesInjection) ? 'eye-partial' : '')}" title="${(profile.suppressDescriptionInjection && profile.suppressNotesInjection) ? 'Personality & Notes hidden from the main AI' : ((profile.suppressDescriptionInjection || profile.suppressNotesInjection) ? 'Some profile info hidden from the main AI' : 'Personality & Notes sent to the main AI')}"><i class="fa-solid ${(profile.suppressDescriptionInjection && profile.suppressNotesInjection) ? 'fa-eye-slash' : 'fa-eye'}"></i></button>
                 <button class="rst-icon-btn rst-wand-btn" title="Generate profile"><i class="fa-solid fa-wand-magic-sparkles"></i></button>
                 <button class="rst-icon-btn rst-edit-btn" title="Edit stats"><i class="fa-solid fa-pen"></i></button>
                 <button class="rst-icon-btn rst-log-btn" title="Update log"><i class="fa-solid fa-clock-rotate-left"></i></button>
@@ -566,6 +567,7 @@ function renderCharacterCard($pane, profile) {
         });
     }
 
+    $header.find(".rst-eye-btn").on("click", () => showInjectionVisibilityModal(profile));
     $header.find(".rst-wand-btn").on("click", () => showWandModal(profile));
     $header.find(".rst-edit-btn").on("click", () => showEditStatsModal(profile));
     $header.find(".rst-log-btn").on("click", () => toggleLogPanel(profile));
@@ -1270,15 +1272,20 @@ function renderStatCategoryForLibrary(cat, profile) {
         const lock = profile.hardLocks?.[cat]?.[stat];
         const cap = (lock && typeof lock.cap === 'number') ? lock.cap : null;
         const lockMarkup = cap !== null
-            ? `<span class="rst-lock on" title="Capped at ${cap}%${lock.reason ? ' \u2014 ' + lock.reason.replace(/"/g,'') : ''}" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-lock"></i> ${cap}%</span>`
+            ? `<span class="rst-lock on" title="Capped at ${cap}%${lock.reason ? ' \u2014 ' + lock.reason.replace(/"/g,'') : ''}" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-lock"></i> HARD ${cap}%</span>`
             : `<span class="rst-lock" title="Set a hard cap" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-lock-open"></i></span>`;
 
         // Soft lock: conditional cap that auto-unlocks. Only shown when active & unmet.
         const slock = profile.softLocks?.[cat]?.[stat];
         const sActive = slock && typeof slock.cap === 'number' && !slock.met;
-        const softMarkup = sActive
-            ? `<span class="rst-softlock" title="Soft-capped at ${slock.cap}% until: ${(slock.condition||'').replace(/"/g,'')}${slock.progress ? '  |  Progress: ' + slock.progress.replace(/"/g,'') : ''}" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-hourglass-half"></i> ${slock.cap}%</span>`
-            : "";
+        const sResolved = slock && typeof slock.cap === 'number' && slock.met;
+        let softMarkup = "";
+        if (sActive) {
+            softMarkup = `<span class="rst-softlock" title="Soft-capped at ${slock.cap}% until: ${(slock.condition||'').replace(/"/g,'')}${slock.progress ? '  |  Progress: ' + slock.progress.replace(/"/g,'') : ''}" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-hourglass-half"></i> SOFT ${slock.cap}%</span>`;
+        } else if (sResolved) {
+            // Resolved soft locks remain visible as a record (unlocked history).
+            softMarkup = `<span class="rst-softlock met" title="Unlocked \u2014 condition met: ${(slock.condition||'').replace(/"/g,'')}" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-lock-open"></i> unlocked</span>`;
+        }
 
         // mini bar: grows right from center for positive, left for negative
         const pct = Math.min(Math.abs(val) / 2, 50); // 100% maps to half the track
@@ -1354,23 +1361,89 @@ async function editHardLock(profile, cat, stat) {
  * condition/progress or removing a lock manually. Editing the prose condition
  * is also offered.
  */
+/**
+ * Show the injection-visibility modal (eyeball toggle). Lets the user hide a
+ * character's Personality (description) and/or Notes from the MAIN AI prompt
+ * independently. Useful when the main character card already carries that info
+ * and re-injecting it via RST would be redundant. Stats/narrative still inject.
+ */
+async function showInjectionVisibilityModal(profile) {
+    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    const p = getCharacterProfile(profile.id);
+    const descHidden = !!p.suppressDescriptionInjection;
+    const notesHidden = !!p.suppressNotesInjection;
+    const anythingHidden = descHidden || notesHidden;
+
+    const safeName = $("<div>").text(profile.name).html();
+    const html = `
+        <div style="text-align:left;font-size:13px;line-height:1.6">
+            <div style="margin-bottom:10px;color:var(--rst-text-muted);font-size:12px">Choose what to HIDE from the main AI for <b>${safeName}</b>. Stats and narrative are always sent.</div>
+            <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
+                <input type="checkbox" id="rst-vis-desc" ${descHidden ? "checked" : ""}> Hide Personality
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
+                <input type="checkbox" id="rst-vis-notes" ${notesHidden ? "checked" : ""}> Hide Notes
+            </label>
+            ${anythingHidden ? `<label style="display:flex;align-items:center;gap:8px;margin-top:6px;padding-top:8px;border-top:1px solid var(--rst-border);cursor:pointer"><input type="checkbox" id="rst-vis-showall"> <b>Show all</b> (send both to the main AI)</label>` : ""}
+        </div>`;
+
+    const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Save", cancelButton: "Cancel" });
+    // Grab the live dialog so we can read checkbox state when the user saves.
+    const showPromise = popup.show();
+    const $dlg = $("dialog.popup").last();
+    const result = await showPromise;
+    if (result !== POPUP_RESULT.AFFIRMATIVE) return;
+
+    const readChk = (id) => {
+        const el = $dlg.find("#" + id)[0] || document.getElementById(id);
+        return !!(el && el.checked);
+    };
+    const showAll = readChk("rst-vis-showall");
+    let nextDesc, nextNotes;
+    if (showAll) {
+        nextDesc = false;
+        nextNotes = false;
+    } else {
+        nextDesc = readChk("rst-vis-desc");
+        nextNotes = readChk("rst-vis-notes");
+    }
+
+    updateCharacterProfile(profile.id, {
+        suppressDescriptionInjection: nextDesc,
+        suppressNotesInjection: nextNotes,
+    });
+
+    const msg = (!nextDesc && !nextNotes) ? "Personality & Notes will be sent to the main AI."
+        : (nextDesc && nextNotes) ? "Personality & Notes hidden from the main AI."
+        : nextDesc ? "Personality hidden; Notes still sent."
+        : "Notes hidden; Personality still sent.";
+    toastr?.info?.(msg);
+
+    try { const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); } catch (e) {}
+    const $pane = $("#rst-p-lib");
+    reRenderCharacterList($pane);
+}
+
 async function editSoftLock(profile, cat, stat) {
     const sl = profile.softLocks?.[cat]?.[stat] || { cap: null, condition: "", progress: "", met: false };
     if (sl.cap === null) { toastr?.info?.("No soft lock on this stat."); return; }
+    const statusLine = sl.met
+        ? `Soft lock on ${cat} ${stat}: UNLOCKED (condition met). Shown as history.`
+        : `Soft lock on ${cat} ${stat}: capped at ${sl.cap}% until the condition is met.`;
     const detail = [
-        `Soft lock on ${cat} ${stat}: capped at ${sl.cap}% until the condition is met.`,
+        statusLine,
         "",
         `Condition: ${sl.condition || "(none specified)"}`,
         `Progress: ${sl.progress || "(no progress noted yet)"}`,
         "",
-        "Click OK to REMOVE this soft lock, or Cancel to keep it.",
+        sl.met ? "Click OK to CLEAR this history record, or Cancel to keep it." : "Click OK to REMOVE this soft lock, or Cancel to keep it.",
     ].join("\n");
     const remove = await Popup.show.confirm(`Soft lock \u2014 ${cat} ${stat}`, detail);
     if (!remove) return;
     const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
     const prof = getCharacterProfile(profile.id);
     if (!prof.softLocks) return;
-    prof.softLocks[cat][stat] = { cap: null, condition: "", progress: "", met: false };
+    prof.softLocks[cat][stat] = { cap: null, condition: "", progress: "", met: false, setAtScene: 0 };
     updateCharacterProfile(profile.id, { softLocks: prof.softLocks });
     toastr?.success?.("Soft lock removed.");
     const $pane = $("#rst-p-lib");

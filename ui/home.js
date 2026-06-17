@@ -560,31 +560,55 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
             const prof = getCharacterProfile(charUpdate.characterId);
             if (prof && prof.softLocks) {
                 const personaFilled = !!(prof.description && prof.description.trim());
-                // New proposed soft locks (eligible characters only).
-                for (const sl of (personaFilled ? (charUpdate.proposedSoftLocks || []) : [])) {
-                    if (!sl || typeof sl.cap !== 'number') continue;
-                    const [cat, stat] = String(sl.stat).split(".");
-                    if (prof.softLocks[cat] && prof.softLocks[cat][stat]) {
-                        const existing = prof.softLocks[cat][stat];
-                        // Don't overwrite an active, unmet soft lock that's already set.
-                        if (existing.cap === null || existing.met) {
-                            prof.softLocks[cat][stat] = { cap: sl.cap, condition: sl.condition || "", progress: sl.progress || "", met: false };
-                        }
-                    }
-                }
-                // Conditions met this scene -> mark as met (auto-unlock).
+                const { getSoftLockAvailability } = await import("../data/characters.js");
+                const { getClosedSceneCountForChar } = await import("../data/scenes.js");
+                const sceneCount = getClosedSceneCountForChar(charUpdate.characterId);
+
+                // 1) Resolve met conditions FIRST (auto-unlock). Stamp setAtScene so
+                //    the cooldown clock starts ticking from when the lock resolved.
                 for (const key of (charUpdate.unlockedSoftLocks || [])) {
                     const [cat, stat] = String(key).split(".");
-                    if (prof.softLocks[cat] && prof.softLocks[cat][stat] && prof.softLocks[cat][stat].cap !== null) {
-                        prof.softLocks[cat][stat].met = true;
+                    const sl = prof.softLocks[cat]?.[stat];
+                    if (sl && sl.cap !== null && !sl.met) {
+                        sl.met = true;
+                        sl.setAtScene = sceneCount; // resolution resets the cooldown clock
                     }
                 }
-                // Progress notes for still-locked soft locks.
+                // 2) Progress notes for still-locked soft locks.
                 for (const pr of (charUpdate.softLockProgress || [])) {
                     if (!pr || !pr.stat) continue;
                     const [cat, stat] = String(pr.stat).split(".");
-                    if (prof.softLocks[cat] && prof.softLocks[cat][stat] && !prof.softLocks[cat][stat].met) {
-                        prof.softLocks[cat][stat].progress = String(pr.progress || "").slice(0, 400);
+                    const sl = prof.softLocks[cat]?.[stat];
+                    if (sl && sl.cap !== null && !sl.met) {
+                        sl.progress = String(pr.progress || "").slice(0, 400);
+                    }
+                }
+                // 3) New proposed soft locks — gated by personality, the 1-active
+                //    cap, and the cooldown. Mechanical enforcement so the LLM can't
+                //    flood locks even if it ignores the CLOSED signal in the prompt.
+                //    Only the FIRST valid proposal is taken (cap = 1).
+                if (personaFilled) {
+                    const avail = getSoftLockAvailability(prof, sceneCount);
+                    if (avail.allowed) {
+                        for (const sl of (charUpdate.proposedSoftLocks || [])) {
+                            if (!sl || typeof sl.cap !== 'number') continue;
+                            const [cat, stat] = String(sl.stat).split(".");
+                            const slot = prof.softLocks[cat]?.[stat];
+                            if (!slot) continue;
+                            // Only fill an empty/resolved slot, and require a condition.
+                            if ((slot.cap === null || slot.met) && sl.condition && String(sl.condition).trim()) {
+                                prof.softLocks[cat][stat] = {
+                                    cap: sl.cap,
+                                    condition: String(sl.condition).slice(0, 300),
+                                    progress: (sl.progress || "").toString().slice(0, 400),
+                                    met: false,
+                                    setAtScene: sceneCount,
+                                };
+                                break; // cap of 1 active — take only the first valid proposal
+                            }
+                        }
+                    } else {
+                        dlog("[RST] Soft lock proposal suppressed:", avail.reason);
                     }
                 }
                 updateCharacterProfile(charUpdate.characterId, { softLocks: prof.softLocks });
