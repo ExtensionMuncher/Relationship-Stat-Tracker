@@ -1,5 +1,7 @@
 # Relationship Stat Tracker (RST)
 
+No further updates planned at this time. Only for bug fixes and refinement.
+
 ---
 
 # Planned Updates
@@ -11,7 +13,7 @@ Whenever a significant moment occurs within the roleplay scene, the respective s
 These moments, like the amounts themselves, are RNG-based and hinge on the scene content.
 
 ## Thresholds Locks
-
+### ✅ Updated as of 6/17/26
 To enhance the quality and realism of characters, I will introduce a stat lock/unlock system to provide more emotional depth to roleplays. This is a toggleable feature, meaning you do *not* have to use it if you don't want to. If you do decide to use it, the Personality section of the Character Profile is required to be filled in so the LLM has a reference point of the respective character's traits in order to make decisions on when/how to place locks and unlocks.
 
 ### Hard Locks
