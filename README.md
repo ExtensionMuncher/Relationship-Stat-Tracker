@@ -5,7 +5,7 @@
 # Planned Updates
 
 ## Critical Increase/Decreases
-
+### ✅ Updated as of 6/16/26
 Whenever a significant moment occurs within the roleplay scene, the respective stat(s) will increase/decrease thrice the amount set within the "Stat Change Range."
 
 These moments, like the amounts themselves, are RNG-based and hinge on the scene content.
