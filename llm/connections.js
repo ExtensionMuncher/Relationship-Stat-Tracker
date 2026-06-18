@@ -13,6 +13,8 @@
 import { getContext } from "../../../../extensions.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 import { setRSTInternalGen } from "../inject/promptInjector.js";
+import { getSetting } from "../settings.js";
+import { dlog } from "../lib/debug.js";
 
 // ─── Rate Limiter ───────────────────────────────────────────
 
@@ -50,7 +52,7 @@ export class RateLimiter {
             // Wait until the oldest timestamp expires + 100ms safety buffer
             const waitMs = timestamps[0] + 60000 - now + 100;
             if (waitMs > 0) {
-                console.log(`[RST] Rate limit reached for "${profileId}". Waiting ${Math.ceil(waitMs)}ms...`);
+                dlog(`[RST] Rate limit reached for "${profileId}". Waiting ${Math.ceil(waitMs)}ms...`);
                 await new Promise(r => setTimeout(r, waitMs));
                 // Re-acquire after waiting (recursive but depth-limited to 1)
                 return this.acquire(profileId);
@@ -81,7 +83,7 @@ export class RateLimiter {
                     this.baseDelayMs * Math.pow(2, attempt) + Math.random() * 1000,
                     this.maxDelayMs
                 );
-                console.log(`[RST] Retry ${attempt + 1}/${this.maxRetries} for "${profileId}" in ${Math.ceil(delay)}ms: ${err.message || err}`);
+                dlog(`[RST] Retry ${attempt + 1}/${this.maxRetries} for "${profileId}" in ${Math.ceil(delay)}ms: ${err.message || err}`);
                 await new Promise(r => setTimeout(r, delay));
             }
         }
@@ -210,7 +212,7 @@ export function getConnectionProfile(profileName) {
  * @returns {Promise<string|null>} The response text, or null on failure
  */
 export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens = 500, temperature = null) {
-    console.log("[RST] makeRequest called — profileId:", JSON.stringify(profileId), "hasSystemPrompt:", !!systemPrompt, "hasUserPrompt:", !!userPrompt, "maxTokens:", maxTokens, "temperature:", temperature);
+    dlog("[RST] makeRequest called — profileId:", JSON.stringify(profileId), "hasSystemPrompt:", !!systemPrompt, "hasUserPrompt:", !!userPrompt, "maxTokens:", maxTokens, "temperature:", temperature);
 
     if (!profileId) {
         console.warn("[RST] No connection profile specified for LLM request (profileId was:", JSON.stringify(profileId), ")");
@@ -226,10 +228,18 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
     // Mark internal generation to suppress passive library reference self-injection
     setRSTInternalGen(true);
 
+    // Per-profile no-think resolution, keyed by profile ID. Backward-compat: the
+    // old blanket booleans (noThink / noThinkHard), if true, apply to all
+    // profiles until a per-profile map is set.
+    const softMap = getSetting("noThinkProfiles", null);
+    const hardMap = getSetting("noThinkHardProfiles", null);
+    const softOn = (softMap && typeof softMap === "object") ? !!softMap[profileId] : getSetting("noThink", false);
+    const hardOn = (hardMap && typeof hardMap === "object") ? !!hardMap[profileId] : getSetting("noThinkHard", false);
+
     try {
         // Wrap the actual API call with rate limiter + retry logic
         const response = await rateLimiter.executeWithRetry(profileId, async () => {
-            console.log(`[RST] Sending LLM request to profile "${profileId}"...`);
+            dlog(`[RST] Sending LLM request to profile "${profileId}"...`);
 
             // Build messages array in ST-compatible format (matching timeline-memory pattern)
             const messages = [];
@@ -237,7 +247,14 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
                 messages.push({ role: 'system', content: systemPrompt });
             }
             if (userPrompt) {
-                messages.push({ role: 'user', content: userPrompt });
+                // No-think soft switch: append "/no_think" to the user message
+                // when enabled for this profile. Reliable in the user turn;
+                // harmless to other models.
+                let finalUser = userPrompt;
+                if (softOn) {
+                    finalUser = finalUser + "\n\n/no_think";
+                }
+                messages.push({ role: 'user', content: finalUser });
             }
 
             // Build override payload with max_tokens and optional temperature override
@@ -246,6 +263,17 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
             };
             if (temperature !== null) {
                 overridePayload.temperature = temperature;
+            }
+
+            // No-think HARD switch (per-profile, opt-in). Some backends ERROR on
+            // unknown body keys, so this is only sent when enabled for this
+            // profile. Tolerant backends ignore keys they don't recognize.
+            if (hardOn) {
+                overridePayload.think = false;
+                overridePayload.enable_thinking = false;
+                overridePayload.chat_template_kwargs = Object.assign(
+                    {}, overridePayload.chat_template_kwargs, { enable_thinking: false }
+                );
             }
 
             return await ConnectionManagerRequestService.sendRequest(
@@ -272,7 +300,7 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
                 const content = response.choices[0].message.content;
                 const reasoning = response.choices[0].message.reasoning;
                 const finishReason = response.choices[0].finish_reason;
-                console.log("[RST] makeRequest raw — hasContent:", !!content, "hasReasoning:", !!reasoning,
+                dlog("[RST] makeRequest raw — hasContent:", !!content, "hasReasoning:", !!reasoning,
                     "contentLen:", (content || "").length, "reasoningLen:", (reasoning || "").length,
                     "finishReason:", finishReason,
                     "contentPreview:", (content || "").substring(0, 120));
@@ -281,7 +309,7 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
                 // AND may contain the answer. Pass it through — parseDetectedNames will
                 // safely handle it (JSON extraction first, bail out if pure prose).
                 if (!content && reasoning) {
-                    console.log("[RST] makeRequest: content empty, returning reasoning (len=" + (reasoning || "").length +
+                    dlog("[RST] makeRequest: content empty, returning reasoning (len=" + (reasoning || "").length +
                         ", finishReason=" + finishReason + ")");
                     return reasoning;
                 }
@@ -297,13 +325,13 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
                     const contentLooksLikeJSON = /^\s*[\[{]/.test(trimmedContent);
                     const reasoningLooksLikeJSON = /^\s*[\[{]/.test(trimmedReasoning);
                     if (!contentLooksLikeJSON && reasoningLooksLikeJSON) {
-                        console.log("[RST] makeRequest: content appears to be thinking prose, preferring reasoning field as answer");
+                        dlog("[RST] makeRequest: content appears to be thinking prose, preferring reasoning field as answer");
                         return trimmedReasoning;
                     }
                     // If both are prose but reasoning is shorter (likely the answer),
                     // still prefer reasoning as it's less likely to be the thinking trace.
                     if (!contentLooksLikeJSON && !reasoningLooksLikeJSON && trimmedReasoning.length < trimmedContent.length) {
-                        console.log("[RST] makeRequest: both fields are prose, preferring shorter reasoning field as answer");
+                        dlog("[RST] makeRequest: both fields are prose, preferring shorter reasoning field as answer");
                         return trimmedReasoning;
                     }
                 }
@@ -330,4 +358,24 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
         // Restore normal injection state regardless of success/failure
         setRSTInternalGen(false);
     }
+}
+
+/**
+ * Resolve the user's persona context for prompts: their name (name1) and, if
+ * available, their persona description. Used to ground soft-lock conditions,
+ * which are inherently about what the USER must do — so the model needs to know
+ * who the user is rather than defaulting to a generic "the user".
+ * @returns {{ name: string, description: string }}
+ */
+export function getPersonaContext() {
+    let name = "User";
+    let description = "";
+    try {
+        const ctx = getContext();
+        if (ctx && ctx.name1) name = ctx.name1;
+        // Persona description lives in power_user in most ST builds; access defensively.
+        const pu = ctx?.powerUserSettings || (typeof window !== "undefined" ? window.power_user : null);
+        if (pu && typeof pu.persona_description === "string") description = pu.persona_description.trim();
+    } catch (e) { /* non-fatal — fall back to defaults */ }
+    return { name, description };
 }

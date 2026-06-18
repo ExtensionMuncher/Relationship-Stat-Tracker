@@ -4,15 +4,16 @@
  * and appends it to ST's extension settings area
  */
 
-import { isEnabled, toggleEnabled } from "../settings.js";
+import { isEnabled, toggleEnabled, getSetting } from "../settings.js";
+import { getOpenScene } from "../data/scenes.js";
 
 // ─── Tab Definitions ──────────────────────────────────────
 
 const TABS = [
-    { id: "home", label: "Home" },
-    { id: "lib", label: "Character library" },
-    { id: "scenes", label: "Scenes" },
-    { id: "settings", label: "Settings" },
+    { id: "home", label: "Home", icon: "fa-house" },
+    { id: "lib", label: "Library", icon: "fa-user-group" },
+    { id: "scenes", label: "Scenes", icon: "fa-film" },
+    { id: "settings", label: "Settings", icon: "fa-gear" },
 ];
 
 // ─── Panel Creation ───────────────────────────────────────
@@ -49,7 +50,7 @@ export function createPanel() {
     // Tabs
     const $tabs = $('<div class="rst-tabs"></div>');
     TABS.forEach((tab, i) => {
-        const $tab = $(`<div class="rst-tab${i === 0 ? " on" : ""}">${tab.label}</div>`);
+        const $tab = $(`<div class="rst-tab${i === 0 ? " on" : ""}"><i class="fa-solid ${tab.icon}"></i>${tab.label}</div>`);
         $tab.on("click", () => switchTab(tab.id));
         $tabs.append($tab);
     });
@@ -111,7 +112,10 @@ export function switchTab(tabId) {
     $(".rst-tab").removeClass("on");
     const tabIndex = TABS.findIndex((t) => t.id === tabId);
     if (tabIndex >= 0) {
-        $(".rst-tab").eq(tabIndex).addClass("on");
+        const $active = $(".rst-tab").eq(tabIndex);
+        $active.addClass("on");
+        // Bring the active tab fully into view if the bar is scrolled/overflowing.
+        try { $active[0]?.scrollIntoView({ inline: "nearest", block: "nearest" }); } catch (e) {}
     }
 
     // Update panes
@@ -150,16 +154,16 @@ export function getActiveTab() {
  */
 export function renderHomeHeader($pane) {
     const enabled = isEnabled();
-    const statusText = enabled ? "Extension enabled" : "Extension disabled";
 
     // Remove existing header to prevent duplicates
     $pane.find("#rst-header-wrap").remove();
 
     const $header = $(`
-        <div id="rst-header-wrap" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-            <div>
-                <div style="font-size:14px;font-weight:500">Relationship Stat Tracker</div>
-                <div id="rst-ext-lbl" style="font-size:11px;color:var(--rst-text-muted)">${statusText}</div>
+        <div id="rst-header-wrap" class="rst-statusbar${enabled ? "" : " rst-disabled-bar"}">
+            <div class="rst-status-dot"></div>
+            <div style="flex:1;min-width:0">
+                <div class="rst-status-title">Relationship Stat Tracker</div>
+                <div id="rst-ext-lbl" class="rst-status-sub">${buildStatusSub(enabled)}</div>
             </div>
             <label class="rst-toggle">
                 <input type="checkbox" ${enabled ? "checked" : ""}>
@@ -171,16 +175,24 @@ export function renderHomeHeader($pane) {
     $header.find("input").on("change", function () {
         const newState = $(this).prop("checked");
         toggleEnabled(newState);
-        $("#rst-ext-lbl").text(newState ? "Extension enabled" : "Extension disabled");
+        $("#rst-ext-lbl").text(buildStatusSub(newState));
+        $("#rst-header-wrap").toggleClass("rst-disabled-bar", !newState);
         $(document).trigger("rst:toggle", [newState]);
     });
 
     $pane.prepend($header);
-    // Ensure divider follows the header
-    const $divider = $pane.find("> hr.rst-div");
-    if ($divider.length) {
-        $divider.insertAfter($header);
-    } else {
-        $pane.find("#rst-header-wrap").after('<hr class="rst-div">');
-    }
+}
+
+/**
+ * Build the status sub-line: active state, scan frequency, open scene.
+ */
+function buildStatusSub(enabled) {
+    if (!enabled) return "Disabled";
+    const freq = getSetting("scanFrequency", 5);
+    let openLabel = "no open scene";
+    try {
+        const open = getOpenScene();
+        if (open) openLabel = `Scene ${String(open.id).replace("scene_", "")} open`;
+    } catch (e) { /* ignore */ }
+    return `Active · scanning every ${freq} messages · ${openLabel}`;
 }

@@ -219,7 +219,7 @@ function buildStatBlock(charIds, settings) {
  * @param {object} settings
  * @returns {string}
  */
-function buildCharacterBlock(profile, settings) {
+export function buildCharacterBlock(profile, settings) {
     const parts = [];
 
     // ── Header (always markdown) ──────────────────────────
@@ -227,14 +227,19 @@ function buildCharacterBlock(profile, settings) {
     parts.push("");
 
     // ── Optional profile injection ────────────────────────
+    // Per-character opt-out (eyeball toggle): Description and Notes can each be
+    // independently hidden from the main AI, avoiding redundancy with an ST
+    // character card whose personality is already in context.
     if (settings.injection.injectProfile) {
-        if (profile.description) {
+        const showDesc = profile.description && !profile.suppressDescriptionInjection;
+        const showNotes = profile.notes && !profile.suppressNotesInjection;
+        if (showDesc) {
             parts.push(`- **Description:** ${profile.description}`);
         }
-        if (profile.notes) {
+        if (showNotes) {
             parts.push(`- **Notes:** ${profile.notes}`);
         }
-        if (profile.description || profile.notes) {
+        if (showDesc || showNotes) {
             parts.push("");
         }
     }

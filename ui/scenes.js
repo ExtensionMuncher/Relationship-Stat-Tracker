@@ -34,7 +34,12 @@ export function renderScenesTab($pane) {
     // Open scene (if any)
     const openScene = getOpenScene();
     if (openScene) {
-        $pane.append('<div class="rst-lbl">Open scene</div>');
+        $pane.append(`
+            <div class="rst-sec-h">
+                <span class="rst-open-live"><span class="rst-open-live-dot"></span>Open scene</span>
+                <div class="rst-sec-line"></div>
+            </div>
+        `);
         $pane.append(renderSceneEntry(openScene, true));
     }
 
@@ -43,7 +48,13 @@ export function renderScenesTab($pane) {
     const closedScenes = allScenes.filter((s) => s.status === "closed");
 
     if (closedScenes.length > 0) {
-        $pane.append('<div class="rst-lbl">Closed scenes</div>');
+        $pane.append(`
+            <div class="rst-sec-h">
+                <span class="rst-sec-title">Closed scenes</span>
+                <span class="rst-sec-count">${closedScenes.length}</span>
+                <div class="rst-sec-line"></div>
+            </div>
+        `);
 
         // Bulk action toolbar
         const $toolbar = $(`
@@ -83,9 +94,11 @@ export function renderScenesTab($pane) {
 
         $pane.append($toolbar);
 
+        const $timeline = $('<div class="rst-scene-tl"></div>');
         for (const scene of closedScenes) {
-            $pane.append(renderSceneEntry(scene, false));
+            $timeline.append(renderSceneEntry(scene, false));
         }
+        $pane.append($timeline);
     }
 
     if (!openScene && closedScenes.length === 0) {
@@ -136,6 +149,7 @@ function renderSceneEntry(scene, isOpen) {
                     ? '<span class="rst-badge-pending">open</span>'
                     : '<span class="rst-badge-closed">closed</span>'
                 }
+                <i class="fa-solid fa-chevron-down rst-scene-chev" style="font-size:11px;color:var(--rst-text-muted);transition:transform .15s"></i>
             </div>
         </div>
     `);

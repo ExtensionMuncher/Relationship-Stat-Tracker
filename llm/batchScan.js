@@ -14,6 +14,7 @@ import { getScenes, saveScenes } from "../data/storage.js";
 import { findCharacterByName, findCharacterByFuzzyName, createCharacter, updateCharacterStats, getCharacterProfile, addUpdateLogEntry, updateCharacterProfile, getAllCharacters, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { initSceneCounter, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
 import { showPanelLoading, hidePanelLoading } from "../ui/panel.js";
+import { dlog } from "../lib/debug.js";
 
 // ─── Constants ─────────────────────────────────────────────
 
@@ -109,7 +110,7 @@ export async function runBatchScan() {
     // ST marks hidden messages with is_system=true, mirroring how ST's Generate()
     // builds coreChat = chat.filter(x => !x.is_system ...) for the context window.
     const allMessages = chat.filter(m => !m.is_system);
-    console.log(`[RST] Processing ${allMessages.length} visible messages out of ${chat.length} total (${chat.length - allMessages.length} hidden)`);
+    dlog(`[RST] Processing ${allMessages.length} visible messages out of ${chat.length} total (${chat.length - allMessages.length} hidden)`);
 
     // Non-compounding: determine unprocessed message ranges (only within visible messages)
     const ranges = getUnprocessedRanges(existingScenes, allMessages.length, 0);
@@ -148,11 +149,11 @@ export async function runBatchScan() {
         detail: `Detected ${detectedScenes.length} scenes across ${ranges.length} range(s)`,
         elapsed: Date.now() - scanStartTime,
     });
-    console.log("[RST-DEBUG] Phase 1 complete. Detected scenes:", JSON.stringify(detectedScenes, null, 2));
+    dlog("[RST-DEBUG] Phase 1 complete. Detected scenes:", JSON.stringify(detectedScenes, null, 2));
     // Log unique character names found across all scenes
     const charNamesFromLLM = new Set();
     for (const s of detectedScenes) { for (const n of s.characters) charNamesFromLLM.add(n); }
-    console.log("[RST-DEBUG] All character names from LLM:", [...charNamesFromLLM]);
+    dlog("[RST-DEBUG] All character names from LLM:", [...charNamesFromLLM]);
 
     if (!detectedScenes || detectedScenes.length === 0) {
         toastr?.warning?.("Batch scan: No scenes detected in the chat history.");
@@ -175,7 +176,7 @@ export async function runBatchScan() {
             chatSpeakerNames.add(normalizeNameForComparison(msg.name));
         }
     }
-    console.log("[RST-DEBUG] chatSpeakerNames:", [...chatSpeakerNames]);
+    dlog("[RST-DEBUG] chatSpeakerNames:", [...chatSpeakerNames]);
 
     // --- Multi-character RP detection ---
     // In multi-character roleplay, a single {{char}} card generates ALL character dialogue,
@@ -196,19 +197,19 @@ export async function runBatchScan() {
         }
     }
     const isMultiCharRP = uniqueSpeakers <= 1 && llmDetectedCharCount.size > 1;
-    console.log(`[RST-DEBUG] Multi-character RP detection: uniqueSpeakers=${uniqueSpeakers}, llmDetectedNames=${llmDetectedCharCount.size}, isMultiCharRP=${isMultiCharRP}`);
+    dlog(`[RST-DEBUG] Multi-character RP detection: uniqueSpeakers=${uniqueSpeakers}, llmDetectedNames=${llmDetectedCharCount.size}, isMultiCharRP=${isMultiCharRP}`);
 
     if (isMultiCharRP) {
         // Multi-character RP: trust the LLM's character detection from message content.
         // The LLM scene detection prompt already excludes {{user}}, so just filter excluded names.
-        console.log("[RST-DEBUG] Multi-character RP detected — trusting LLM character names, bypassing speaker-name filter.");
+        dlog("[RST-DEBUG] Multi-character RP detected — trusting LLM character names, bypassing speaker-name filter.");
         for (const scene of detectedScenes) {
             for (const name of scene.characters) {
                 if (userNamesToExclude.has(name)) continue;
                 if (userNamesToExclude.has(name.toLowerCase())) continue;
                 const cleanName = normalizeNameForComparison(name);
                 if (!cleanName) continue;
-                console.log(`[RST-DEBUG] Phase2 (multi-char): accepting name="${name}" -> clean="${cleanName}"`);
+                dlog(`[RST-DEBUG] Phase2 (multi-char): accepting name="${name}" -> clean="${cleanName}"`);
                 allCharNames.add(name);
             }
         }
@@ -223,25 +224,25 @@ export async function runBatchScan() {
                 if (userNamesToExclude.has(name.toLowerCase())) continue;
                 const cleanName = normalizeNameForComparison(name);
                 const found = chatSpeakerNames.has(cleanName);
-                console.log(`[RST-DEBUG] Phase2 check: name="${name}" -> clean="${cleanName}" -> found=${found}`);
+                dlog(`[RST-DEBUG] Phase2 check: name="${name}" -> clean="${cleanName}" -> found=${found}`);
                 if (!cleanName || !found) continue;
                 allCharNames.add(name);
             }
         }
     }
-    console.log("[RST-DEBUG] Phase 2: Character names to create profiles for:", [...allCharNames]);
+    dlog("[RST-DEBUG] Phase 2: Character names to create profiles for:", [...allCharNames]);
 
     for (const name of allCharNames) {
         const existing = findCharacterByFuzzyName(name) || findCharacterByName(name);
         if (!existing) {
             const newProfile = createCharacter(name, { source: "auto_generated" });
             profilesCreated.push(name);
-            console.log(`[RST-DEBUG] Created character profile: "${name}" -> id: ${newProfile?.id}`);
+            dlog(`[RST-DEBUG] Created character profile: "${name}" -> id: ${newProfile?.id}`);
         } else {
-            console.log(`[RST-DEBUG] Character already exists: "${name}" -> id: ${existing.id}`);
+            dlog(`[RST-DEBUG] Character already exists: "${name}" -> id: ${existing.id}`);
         }
     }
-    console.log("[RST-DEBUG] Profiles created:", profilesCreated);
+    dlog("[RST-DEBUG] Profiles created:", profilesCreated);
 
     // Phase 3: Create scene objects
     const createdScenes = [];
@@ -257,7 +258,7 @@ export async function runBatchScan() {
                 return profile ? profile.id : null;
             })
             .filter(Boolean);
-        console.log(`[RST-DEBUG] Scene ${detected.messageStart}-${detected.messageEnd}: characters=${JSON.stringify(detected.characters)} -> charIds=${JSON.stringify(charIds)}`);
+        dlog(`[RST-DEBUG] Scene ${detected.messageStart}-${detected.messageEnd}: characters=${JSON.stringify(detected.characters)} -> charIds=${JSON.stringify(charIds)}`);
 
         // Determine if {{user}} (resolved persona name) is present in this scene.
         // If the persona name is "{{user}}" or empty (can't resolve), default to true
@@ -266,7 +267,7 @@ export async function runBatchScan() {
         if (userNameFromChat && !EXCLUDED_NAMES.has(userNameFromChat)) {
             hasUserInteraction = detected.characters.some(name => name === userNameFromChat);
         }
-        console.log(`[RST-DEBUG] Scene ${detected.messageStart}-${detected.messageEnd}: hasUserInteraction=${hasUserInteraction} (userNameFromChat="${userNameFromChat}")`);
+        dlog(`[RST-DEBUG] Scene ${detected.messageStart}-${detected.messageEnd}: hasUserInteraction=${hasUserInteraction} (userNameFromChat="${userNameFromChat}")`);
 
         // Create scene as closed (historical)
         const scenes = getScenes();
@@ -312,7 +313,7 @@ export async function runBatchScan() {
     // Inter-phase delay between scene creation (Phase 3) and stat generation (Phase 4)
     const interPhaseDelay = bsSettings.interPhaseDelay || 0;
     if (interPhaseDelay > 0) {
-        console.log(`[RST] Inter-phase delay: waiting ${interPhaseDelay}ms before Phase 4...`);
+        dlog(`[RST] Inter-phase delay: waiting ${interPhaseDelay}ms before Phase 4...`);
         reportProgress({
             phase: 3, totalPhases: 4,
             label: "Inter-phase cool-down",
@@ -332,7 +333,7 @@ export async function runBatchScan() {
 
             // Skip stat generation for scenes without {{user}} interaction
             if (!scene.hasUserInteraction) {
-                console.log(`[RST] Scene ${scene.id} (${scene.messageStart}-${scene.messageEnd}): No {{user}} interaction — saving scene as reference only, skipping stat generation.`);
+                dlog(`[RST] Scene ${scene.id} (${scene.messageStart}-${scene.messageEnd}): No {{user}} interaction — saving scene as reference only, skipping stat generation.`);
                 updateSceneSummary(scene.id, "(Reference only — no direct {{user}} interaction in this scene)");
                 scenesProcessed++;
                 continue;
@@ -419,7 +420,7 @@ export async function runBatchScan() {
 
             // Per-scene delay (skip after the last scene)
             if (perSceneDelay > 0 && sceneIdx < createdScenes.length - 1) {
-                console.log(`[RST] Per-scene delay: waiting ${perSceneDelay}ms before next scene...`);
+                dlog(`[RST] Per-scene delay: waiting ${perSceneDelay}ms before next scene...`);
                 await new Promise(r => setTimeout(r, perSceneDelay));
             }
         } catch (err) {
@@ -461,18 +462,18 @@ async function detectScenes(allMessages, ranges, profileName, settings, combineR
     if (combineRanges && ranges.length > 1) {
         const totalMessages = ranges.reduce((sum, r) => sum + (r.end - r.start + 1), 0);
         if (totalMessages <= MAX_UNCHUNKED_SIZE) {
-            console.log(`[RST] Combining ${ranges.length} ranges (${totalMessages} total messages) into single scene detection call.`);
+            dlog(`[RST] Combining ${ranges.length} ranges (${totalMessages} total messages) into single scene detection call.`);
             const requestPrompt = buildSceneDetectionRequest(allMessages, ranges);
             const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
             if (result) {
-                console.log(`[RST-DEBUG] Scene detection LLM response (combined ${ranges.length} ranges):`, result.substring(0, 500));
+                dlog(`[RST-DEBUG] Scene detection LLM response (combined ${ranges.length} ranges):`, result.substring(0, 500));
                 const parsed = parseSceneDetectionResponse(result, ranges, _sceneBlacklist);
-                console.log(`[RST-DEBUG] Parsed scenes from combined ranges:`, JSON.stringify(parsed.map(s => ({ start: s.messageStart, end: s.messageEnd, chars: s.characters }))));
+                dlog(`[RST-DEBUG] Parsed scenes from combined ranges:`, JSON.stringify(parsed.map(s => ({ start: s.messageStart, end: s.messageEnd, chars: s.characters }))));
                 allScenes.push(...parsed);
             }
             return allScenes;
         }
-        console.log(`[RST] Combined ranges skipped: ${totalMessages} total messages exceeds ${MAX_UNCHUNKED_SIZE}. Processing per-range.`);
+        dlog(`[RST] Combined ranges skipped: ${totalMessages} total messages exceeds ${MAX_UNCHUNKED_SIZE}. Processing per-range.`);
     }
 
     for (const range of ranges) {
@@ -484,9 +485,9 @@ async function detectScenes(allMessages, ranges, profileName, settings, combineR
             const requestPrompt = buildSceneDetectionRequest(allMessages, [range]);
             const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
             if (result) {
-                console.log(`[RST-DEBUG] Scene detection LLM response (range ${range.start}-${range.end}):`, result.substring(0, 500));
+                dlog(`[RST-DEBUG] Scene detection LLM response (range ${range.start}-${range.end}):`, result.substring(0, 500));
                 const parsed = parseSceneDetectionResponse(result, [range], _sceneBlacklist);
-                console.log(`[RST-DEBUG] Parsed scenes from range ${range.start}-${range.end}:`, JSON.stringify(parsed.map(s => ({start: s.messageStart, end: s.messageEnd, chars: s.characters}))));
+                dlog(`[RST-DEBUG] Parsed scenes from range ${range.start}-${range.end}:`, JSON.stringify(parsed.map(s => ({start: s.messageStart, end: s.messageEnd, chars: s.characters}))));
                 allScenes.push(...parsed);
             }
         } else {
@@ -498,11 +499,11 @@ async function detectScenes(allMessages, ranges, profileName, settings, combineR
                 const requestPrompt = buildSceneDetectionRequest(allMessages, [windowRange]);
                 const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
                 if (result) {
-                    console.log(`[RST-DEBUG] Scene detection LLM response (window ${cs}-${ce}):`, result.substring(0, 500));
+                    dlog(`[RST-DEBUG] Scene detection LLM response (window ${cs}-${ce}):`, result.substring(0, 500));
                     // Only take scenes within the non-overlapping portion
                     const nonOverlapStart = cs + (cs > range.start ? OVERLAP : 0);
                     const parsed = parseSceneDetectionResponse(result, [windowRange], _sceneBlacklist);
-                    console.log(`[RST-DEBUG] Parsed window scenes:`, JSON.stringify(parsed.map(s => ({start: s.messageStart, end: s.messageEnd, chars: s.characters}))));
+                    dlog(`[RST-DEBUG] Parsed window scenes:`, JSON.stringify(parsed.map(s => ({start: s.messageStart, end: s.messageEnd, chars: s.characters}))));
                     const windowScenes = parsed.filter((s) => s.messageStart >= nonOverlapStart);
                     allScenes.push(...windowScenes);
                 }
@@ -597,7 +598,7 @@ function parseSceneDetectionResponse(response, ranges, blacklistSet = new Set())
         // If JSON extraction failed, try analysis-text fallback
         const fallback = parseSceneDetectionAnalysisText(response, ranges);
         if (fallback && fallback.length > 0) {
-            console.log("[RST] Batch scan: Scene detection via analysis-text fallback succeeded");
+            dlog("[RST] Batch scan: Scene detection via analysis-text fallback succeeded");
             return fallback;
         }
         const preview = (response || "").substring(0, 200);
@@ -1028,7 +1029,7 @@ function parseInitialStatResponse(response, characters) {
         const inputNames = new Set(characters.map(c => c.name));
         for (const [llmName, llmData] of Object.entries(parsed.characters)) {
             if (!inputNames.has(llmName) && llmData && llmData.stats) {
-                console.log("[RST] Batch scan: LLM discovered additional character:", llmName);
+                dlog("[RST] Batch scan: LLM discovered additional character:", llmName);
                 const newChar = createCharacter(llmName, { source: "auto_generated" });
                 if (newChar) {
                     const statsAfter = {};
@@ -1129,7 +1130,7 @@ function extractBatchStatJson(text) {
     try {
         const fallback = parseInitialStatAnalysisText(clean);
         if (fallback) {
-            console.log("[RST] Batch stat: analysis-text fallback succeeded");
+            dlog("[RST] Batch stat: analysis-text fallback succeeded");
             return fallback;
         }
     } catch { /* fall through */ }

@@ -41,6 +41,93 @@ export function createBlankStats() {
 }
 
 /**
+ * Create a blank hard-lock map mirroring the stats shape.
+ * Each entry is { cap: number|null, reason: string }.
+ *   cap = null  -> no lock on this stat
+ *   cap = N     -> this stat cannot rise above N through normal growth.
+ *                  A critical change can push past it and RAISE the cap to the
+ *                  new value (requiring a further critical to climb again).
+ * A lock may also have a negative-direction floor via capLow (optional).
+ */
+export function createBlankLocks() {
+    const locks = {};
+    for (const cat of STAT_CATEGORIES) {
+        locks[cat] = {};
+        for (const stat of STAT_NAMES) {
+            locks[cat][stat] = { cap: null, reason: "" };
+        }
+    }
+    return locks;
+}
+
+/**
+ * Create a blank SOFT-lock map mirroring the stats shape.
+ * Each entry is { cap: number|null, condition: string, progress: string, met: boolean }.
+ *   cap = null      -> no soft lock on this stat
+ *   cap = N         -> growth is blocked above N UNTIL the condition is met,
+ *                      then the stat AUTO-unlocks and normal growth resumes.
+ *   condition       -> the LLM-defined requirement to unlock (prose).
+ *   progress        -> the LLM's running prose notes toward the condition.
+ *   met             -> once true, the lock is satisfied and no longer gates growth.
+ * Unlike hard locks, a soft lock is not broken by a critical — it is removed by
+ * fulfilling its narrative condition.
+ */
+export function createBlankSoftLocks() {
+    const locks = {};
+    for (const cat of STAT_CATEGORIES) {
+        locks[cat] = {};
+        for (const stat of STAT_NAMES) {
+            locks[cat][stat] = { cap: null, condition: "", progress: "", met: false, setAtScene: 0 };
+        }
+    }
+    return locks;
+}
+
+export const SOFT_LOCK_COOLDOWN_SCENES = 5;
+
+/**
+ * Determine whether a character can receive a NEW soft lock right now.
+ * Two gates:
+ *   1. CAP: at most ONE active (unmet) soft lock per character at a time.
+ *   2. COOLDOWN: at least SOFT_LOCK_COOLDOWN_SCENES closed scenes must have
+ *      passed since the most recent soft lock was set or resolved.
+ * @param {object} profile
+ * @param {number} currentSceneCount - getClosedSceneCount() at evaluation time
+ * @returns {{ allowed: boolean, reason: string, activeStat: string|null }}
+ */
+export function getSoftLockAvailability(profile, currentSceneCount) {
+    if (!profile || !profile.softLocks) return { allowed: false, reason: "no profile", activeStat: null, slotsFree: 0 };
+    // Configurable ceiling: 1-3 simultaneous active soft locks per character.
+    // This is a MAX, not a target — the model is told to use 0..max as fitting.
+    let maxActive = 1;
+    try {
+        const s = getSettings();
+        if (s?.softLocks?.maxActive) maxActive = Math.max(1, Math.min(3, s.softLocks.maxActive));
+    } catch (e) { /* default 1 */ }
+
+    let activeCount = 0;
+    let activeStat = null;
+    let lastSetAt = 0;
+    for (const cat of STAT_CATEGORIES) {
+        for (const stat of STAT_NAMES) {
+            const sl = profile.softLocks[cat]?.[stat];
+            if (!sl || typeof sl.cap !== 'number') continue;
+            if (!sl.met) { activeCount++; activeStat = `${cat}.${stat}`; }
+            if (typeof sl.setAtScene === 'number') lastSetAt = Math.max(lastSetAt, sl.setAtScene);
+        }
+    }
+    const slotsFree = Math.max(0, maxActive - activeCount);
+    if (slotsFree <= 0) {
+        return { allowed: false, reason: `at the soft-lock limit (${maxActive})`, activeStat, slotsFree: 0 };
+    }
+    const elapsed = currentSceneCount - lastSetAt;
+    if (lastSetAt > 0 && elapsed < SOFT_LOCK_COOLDOWN_SCENES) {
+        return { allowed: false, reason: `cooldown: ${SOFT_LOCK_COOLDOWN_SCENES - elapsed} more scene(s)`, activeStat, slotsFree: 0 };
+    }
+    return { allowed: true, reason: "", activeStat: null, slotsFree };
+}
+
+/**
  * Create a new character profile.
  * Checks for name collisions (same words in different order) and warns.
  * @param {string} name - Character display name
@@ -48,7 +135,22 @@ export function createBlankStats() {
  * @returns {object} The new profile
  */
 export function createCharacter(name, options = {}) {
-    // Check for name collisions (same words, different order)
+    const id = generateCharacterId(name);
+
+    // GUARD: if a profile already exists at this deterministic ID, return it
+    // instead of overwriting. createCharacter() is called from detection/scan
+    // paths whenever the LLM names a character — without this guard, re-detecting
+    // an existing character clobbered its saved profile (aliases, stats, and
+    // update log were silently wiped). Returning the existing profile is
+    // backward-compatible: it only prevents destruction of saved data.
+    const existing = getStoredCharacter(id);
+    if (existing) {
+        return existing;
+    }
+
+    // Check for name collisions (same words, different order) — different ID,
+    // so not caught by the guard above. Warn but allow (user may genuinely want
+    // a distinct profile).
     const similar = findCharacterBySimilarName(name);
     if (similar) {
         console.warn(`[RST] Name collision detected: "${name}" is similar to existing character "${similar.name}" (id=${similar.id})`);
@@ -58,8 +160,6 @@ export function createCharacter(name, options = {}) {
             { timeOut: 8000, closeButton: true }
         );
     }
-
-    const id = generateCharacterId(name);
 
     const profile = {
         id,
@@ -72,6 +172,10 @@ export function createCharacter(name, options = {}) {
         avatar: options.avatar || null,
 
         stats: options.stats || createBlankStats(),
+        hardLocks: options.hardLocks || createBlankLocks(),
+        softLocks: options.softLocks || createBlankSoftLocks(),
+        suppressDescriptionInjection: options.suppressDescriptionInjection || false,
+        suppressNotesInjection: options.suppressNotesInjection || false,
 
         dynamicTitle: options.dynamicTitle || "",
         narrativeSummary: options.narrativeSummary || "",
@@ -122,7 +226,42 @@ function simpleHash(str) {
  * @returns {object|null}
  */
 export function getCharacterProfile(charId) {
-    return getStoredCharacter(charId);
+    return normalizeProfileLocks(getStoredCharacter(charId));
+}
+
+/**
+ * Ensure a profile has the hardLocks map (added in the locks feature). Older
+ * saved profiles predate this field; fill it in on read so the rest of the
+ * code can assume it exists. Non-destructive — only adds missing structure.
+ */
+function normalizeProfileLocks(profile) {
+    if (!profile) return profile;
+    if (!profile.hardLocks) {
+        profile.hardLocks = createBlankLocks();
+    } else {
+        for (const cat of STAT_CATEGORIES) {
+            if (!profile.hardLocks[cat]) profile.hardLocks[cat] = {};
+            for (const stat of STAT_NAMES) {
+                if (!profile.hardLocks[cat][stat]) {
+                    profile.hardLocks[cat][stat] = { cap: null, reason: "" };
+                }
+            }
+        }
+    }
+    // Soft locks (added later) — same backfill treatment.
+    if (!profile.softLocks) {
+        profile.softLocks = createBlankSoftLocks();
+    } else {
+        for (const cat of STAT_CATEGORIES) {
+            if (!profile.softLocks[cat]) profile.softLocks[cat] = {};
+            for (const stat of STAT_NAMES) {
+                if (!profile.softLocks[cat][stat]) {
+                    profile.softLocks[cat][stat] = { cap: null, condition: "", progress: "", met: false, setAtScene: 0 };
+                }
+            }
+        }
+    }
+    return profile;
 }
 
 /**
@@ -131,7 +270,7 @@ export function getCharacterProfile(charId) {
  */
 export function getAllCharacters() {
     const map = getCharacters();
-    return Object.values(map);
+    return Object.values(map).map(normalizeProfileLocks);
 }
 
 /**
@@ -330,7 +469,7 @@ export function updateCharacterProfile(charId, updates) {
     const profile = getStoredCharacter(charId);
     if (!profile) return;
 
-    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary", "folderId", "avatar"];
+    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary", "folderId", "avatar", "hardLocks", "softLocks", "suppressDescriptionInjection", "suppressNotesInjection"];
     for (const field of allowedFields) {
         if (updates[field] !== undefined) {
             profile[field] = updates[field];
@@ -350,6 +489,7 @@ export function addUpdateLogEntry(charId, logEntry) {
     const profile = getStoredCharacter(charId);
     if (!profile) return;
 
+    if (!Array.isArray(profile.updateLog)) profile.updateLog = [];
     profile.updateLog.unshift(logEntry);
     if (profile.updateLog.length > MAX_UPDATE_LOG) {
         profile.updateLog = profile.updateLog.slice(0, MAX_UPDATE_LOG);
@@ -367,6 +507,7 @@ export function removeUpdateLogEntry(charId, sceneId) {
     const profile = getStoredCharacter(charId);
     if (!profile) return;
 
+    if (!Array.isArray(profile.updateLog)) profile.updateLog = [];
     profile.updateLog = profile.updateLog.filter((entry) => entry.sceneId !== sceneId);
     saveCharacter(charId, profile);
 }
@@ -380,6 +521,7 @@ export function removeUpdateLogEntryByTimestamp(charId, timestamp) {
     const profile = getStoredCharacter(charId);
     if (!profile || !timestamp) return;
 
+    if (!Array.isArray(profile.updateLog)) profile.updateLog = [];
     profile.updateLog = profile.updateLog.filter((entry) => entry.timestamp !== timestamp);
     saveCharacter(charId, profile);
 }
@@ -556,9 +698,10 @@ function validateProfile(profile) {
         }
     }
 
-    // Required: updateLog must be an array
-    if (!Array.isArray(profile.updateLog)) {
-        errors.push("Missing or invalid 'updateLog' (must be an array)");
+    // updateLog should be an array; tolerate a legacy profile that predates it
+    // (treat absent as empty rather than rejecting valid old data on import).
+    if (profile.updateLog !== undefined && !Array.isArray(profile.updateLog)) {
+        errors.push("Invalid 'updateLog' (must be an array if present)");
     }
 
     // Optional fields: type checks

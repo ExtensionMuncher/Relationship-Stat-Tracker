@@ -4,9 +4,12 @@
  * Connection Profiles are NOT accordion-wrapped to ensure ConnectionManager initializes properly
  */
 
-import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist } from "../data/storage.js";
+import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist, getPendingLockScan, savePendingLockScan } from "../data/storage.js";
 import { setSetting, isEnabled, exportAllData, importAllData } from "../settings.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
+import { getContext } from "../../../../extensions.js";
+import { Popup, POPUP_TYPE, POPUP_RESULT } from "../../../../../scripts/popup.js";
+import { scanForLocks } from "../llm/lockScan.js";
 
 // ─── Accordion Helper ─────────────────────────────────────
 
@@ -75,6 +78,193 @@ export function renderSettingsTab($pane) {
     renderAccordion($pane, "Data", ($body) => {
         renderDataSection($body);
     });
+
+    renderAccordion($pane, "Debug", ($body) => {
+        renderDebugSettings($body, settings);
+    });
+}
+
+// ─── Debug Settings ───────────────────────────────────────
+
+function renderDebugSettings($pane, settings) {
+    const $card = $('<div class="rst-card"></div>');
+    $card.append(`
+        <div class="rst-setting-row">
+            <div>
+                <div class="rst-setting-label">Debug F12 logging</div>
+                <div class="rst-setting-sub">Show RST activity logs in the browser console · warnings and errors always show</div>
+            </div>
+            <label class="rst-toggle"><input type="checkbox" id="rst-debug-toggle" ${settings.debug ? "checked" : ""}><span class="rst-slider"></span></label>
+        </div>
+        <div class="rst-setting-row" style="border-bottom:none">
+            <div>
+                <div class="rst-setting-label">Scan for Locks</div>
+                <div class="rst-setting-sub">Have the Stat Update LLM read each character's Personality, Notes, and past scenes to propose hard AND soft locks. Characters with an empty Personality are skipped. You review every proposal before anything is applied.</div>
+            </div>
+            <div style="display:flex;gap:6px;flex-shrink:0">
+                <button id="rst-review-scan-btn" class="rst-btn" style="display:${getPendingLockScan() ? 'inline-flex' : 'none'}"><i class="fa-solid fa-list-check"></i> Review</button>
+                <button id="rst-scan-locks-btn" class="rst-btn"><i class="fa-solid fa-lock"></i> Scan</button>
+            </div>
+        </div>
+    `);
+    $pane.append($card);
+
+    $card.find("#rst-debug-toggle").on("change", function () {
+        const on = $(this).prop("checked");
+        saveSetting("debug", on);
+        toastr?.info?.(`Debug logging ${on ? "enabled" : "disabled"}.`, "Relationship Stat Tracker");
+    });
+
+    $card.find("#rst-review-scan-btn").on("click", async function () {
+        const pending = getPendingLockScan();
+        if (!pending || pending.length === 0) {
+            toastr?.info?.("No pending scan to review.");
+            $card.find("#rst-review-scan-btn").hide();
+            return;
+        }
+        await reviewLockScanResults(pending);
+    });
+
+    $card.find("#rst-scan-locks-btn").on("click", async function () {
+        const $btn = $(this);
+        $btn.prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Scanning...');
+        try {
+            const results = await scanForLocks();
+            if (!results || results.length === 0) {
+                toastr?.info?.("Scan complete — no new locks proposed.", "Relationship Stat Tracker");
+                return;
+            }
+            // Persist results so dismissing the dialog (e.g. Esc) does not waste
+            // the scan — it can be reopened via the "Review pending scan" button.
+            savePendingLockScan(results);
+            $card.find("#rst-review-scan-btn").show();
+            await reviewLockScanResults(results);
+        } catch (err) {
+            console.error("[RST] Lock scan error:", err);
+            toastr?.error?.("Lock scan failed. Check the console and your connection settings.");
+        } finally {
+            $btn.prop("disabled", false).html('<i class="fa-solid fa-lock"></i> Scan');
+        }
+    });
+}
+
+// ─── Lock-scan review (reopenable) ────────────────────────
+
+/**
+ * Render the lock-scan review dialog and apply the user's selection.
+ * Results are passed in (and are already persisted via savePendingLockScan),
+ * so dismissing the dialog with Esc/Cancel keeps them for re-review instead of
+ * wasting the scan. Pending results are cleared only when the user applies them
+ * or explicitly discards.
+ * @param {Array} results
+ */
+async function reviewLockScanResults(results) {
+    let totalHard = 0, totalSoft = 0;
+    const charBlocks = [];
+    for (const r of results) {
+        const hardRows = (r.hardLocks || []).map((l) => {
+            totalHard++;
+            const reason = (l.reason || "").toString().replace(/</g, "&lt;");
+            return `<div class="rst-scan-lock">
+                <span class="rst-scan-tag hard">HARD</span>
+                <span class="rst-scan-stat">${l.stat}</span>
+                <span class="rst-scan-cap">${l.cap}%</span>
+                ${reason ? `<div class="rst-scan-why">${reason}</div>` : ""}
+            </div>`;
+        }).join("");
+        const softRows = (r.softLocks || []).map((l) => {
+            totalSoft++;
+            const cond = (l.condition || "").toString().replace(/</g, "&lt;");
+            return `<div class="rst-scan-lock">
+                <span class="rst-scan-tag soft">SOFT</span>
+                <span class="rst-scan-stat">${l.stat}</span>
+                <span class="rst-scan-cap">${l.cap}%</span>
+                ${cond ? `<div class="rst-scan-why">until: ${cond}</div>` : ""}
+            </div>`;
+        }).join("");
+        const count = (r.hardLocks?.length || 0) + (r.softLocks?.length || 0);
+        charBlocks.push(`
+            <details class="rst-scan-char">
+                <summary><input type="checkbox" class="rst-scan-pick" data-charid="${r.characterId}" checked onclick="event.stopPropagation()"><span class="rst-scan-name">${$("<div>").text(r.characterName).html()}</span><span class="rst-scan-count">${count}</span></summary>
+                <div class="rst-scan-locks">${hardRows}${softRows}</div>
+            </details>`);
+    }
+    const html = `
+        <div class="rst-scan-review">
+            <div class="rst-scan-summary">Proposed <b>${totalHard}</b> hard and <b>${totalSoft}</b> soft lock${(totalHard + totalSoft) === 1 ? "" : "s"} across <b>${results.length}</b> character${results.length === 1 ? "" : "s"}. Untick any character to exclude it. Closing this keeps the scan so you can review it again later; tick "Discard" to throw it away.</div>
+            ${charBlocks.join("")}
+            <label class="rst-scan-discard"><input type="checkbox" id="rst-scan-discard-chk"> Discard this scan instead of keeping it</label>
+        </div>`;
+    const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Apply selected", cancelButton: "Close" });
+    const showPromise = popup.show();
+    const $dlg = $("dialog.popup").last();
+    const proceedResult = await showPromise;
+    const proceed = proceedResult === POPUP_RESULT.AFFIRMATIVE;
+
+    const discardChecked = !!($dlg.find("#rst-scan-discard-chk")[0]?.checked);
+
+    if (!proceed) {
+        // Closed/Esc. Honor an explicit discard; otherwise keep for re-review.
+        if (discardChecked) {
+            savePendingLockScan(null);
+            $("#rst-review-scan-btn").hide();
+            toastr?.info?.("Scan discarded.");
+        } else {
+            toastr?.info?.("Scan kept — reopen it any time with Review.");
+        }
+        return;
+    }
+
+    const selectedIds = new Set();
+    $dlg.find(".rst-scan-pick").each(function () {
+        if (this.checked && this.dataset.charid) selectedIds.add(this.dataset.charid);
+    });
+
+    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    let appliedHard = 0, appliedSoft = 0, skippedChars = 0;
+    for (const r of results) {
+        if (!selectedIds.has(r.characterId)) { skippedChars++; continue; }
+        const prof = getCharacterProfile(r.characterId);
+        if (!prof) continue;
+        if (!(prof.description && prof.description.trim())) continue;
+        if (prof.hardLocks) {
+            for (const l of (r.hardLocks || [])) {
+                const [cat, stat] = String(l.stat).split(".");
+                if (!prof.hardLocks[cat] || !prof.hardLocks[cat][stat]) continue;
+                const cur = prof.hardLocks[cat][stat].cap;
+                if (cur === null || l.cap > cur) {
+                    prof.hardLocks[cat][stat] = { cap: l.cap, reason: l.reason || "Lock scan" };
+                    appliedHard++;
+                }
+            }
+            updateCharacterProfile(r.characterId, { hardLocks: prof.hardLocks });
+        }
+        if (prof.softLocks) {
+            const { getSoftLockAvailability } = await import("../data/characters.js");
+            const { getClosedSceneCountForChar } = await import("../data/scenes.js");
+            const sceneCount = getClosedSceneCountForChar(r.characterId);
+            const avail = getSoftLockAvailability(prof, sceneCount);
+            if (avail.allowed) {
+                let addedForChar = 0;
+                for (const l of (r.softLocks || [])) {
+                    if (addedForChar >= avail.slotsFree) break;
+                    const [cat, stat] = String(l.stat).split(".");
+                    const slot = prof.softLocks[cat]?.[stat];
+                    if (!slot) continue;
+                    if ((slot.cap === null || slot.met) && l.condition && String(l.condition).trim()) {
+                        prof.softLocks[cat][stat] = { cap: l.cap, condition: l.condition || "", progress: l.progress || "", met: false, setAtScene: sceneCount };
+                        appliedSoft++;
+                        addedForChar++;
+                    }
+                }
+                updateCharacterProfile(r.characterId, { softLocks: prof.softLocks });
+            }
+        }
+    }
+    // Applied — clear the pending scan and hide the Review button.
+    savePendingLockScan(null);
+    $("#rst-review-scan-btn").hide();
+    toastr?.success?.(`Applied ${appliedHard} hard + ${appliedSoft} soft lock${(appliedHard + appliedSoft) === 1 ? "" : "s"}${skippedChars > 0 ? ` · ${skippedChars} character(s) skipped` : ""}.`, "Relationship Stat Tracker");
 }
 
 // ─── Connection Profiles ──────────────────────────────────
@@ -103,11 +293,61 @@ function renderConnectionProfiles($card, settings) {
     $card.append($twoCol);
     $card.append($autoGen);
 
+    // No-think (per connection profile)
+    const $noThink = $(`
+        <div style="margin-top:14px;font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--rst-text-muted)">No-think (per profile)</div>
+        <div style="font-size:11px;color:var(--rst-text-faint,#999);margin:4px 0 8px;line-height:1.4">
+            Soft appends <code>/no_think</code> (safe, ignored if unsupported). Hard also sends API params (<code>think</code>/<code>enable_thinking=false</code>) — turn off if your backend errors.
+        </div>
+        <div id="rst-nothink-rows"></div>
+    `);
+    $card.append($noThink);
+
+    const RST_NT_ROLES = {
+        statUpdateLLM: "Stat update",
+        sidecarLLM: "Sidecar detection",
+        autoGenLLM: "Auto-gen profile",
+    };
+    function rstRenderNoThinkRows() {
+        const $rows = $card.find("#rst-nothink-rows");
+        if (!$rows.length) return;
+        const conns = settings.connections || {};
+        const softMap = (settings.noThinkProfiles && typeof settings.noThinkProfiles === "object") ? settings.noThinkProfiles : {};
+        const hardMap = (settings.noThinkHardProfiles && typeof settings.noThinkHardProfiles === "object") ? settings.noThinkHardProfiles : {};
+        $rows.empty();
+        Object.keys(RST_NT_ROLES).forEach(roleKey => {
+            const pid = conns[roleKey] || "";
+            const dis = pid ? "" : "disabled";
+            const label = pid ? RST_NT_ROLES[roleKey] : `${RST_NT_ROLES[roleKey]} <span style="color:#a66">(no profile)</span>`;
+            const $row = $(`
+                <div style="display:flex;align-items:center;gap:14px;padding:5px 0;border-bottom:0.5px solid #2a2a2a">
+                    <span style="flex:1;font-size:12px;color:var(--rst-text-muted)">${label}</span>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--rst-text-faint,#999);cursor:pointer"><input type="checkbox" class="rst-nt-soft" ${softMap[pid] ? "checked" : ""} ${dis}> soft</label>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--rst-text-faint,#999);cursor:pointer"><input type="checkbox" class="rst-nt-hard" ${hardMap[pid] ? "checked" : ""} ${dis}> hard</label>
+                </div>
+            `);
+            $row.find(".rst-nt-soft").on("change", function () {
+                const m = (settings.noThinkProfiles && typeof settings.noThinkProfiles === "object") ? settings.noThinkProfiles : {};
+                if (this.checked) m[pid] = true; else delete m[pid];
+                settings.noThinkProfiles = m;
+                saveSetting("noThinkProfiles", m);
+            });
+            $row.find(".rst-nt-hard").on("change", function () {
+                const m = (settings.noThinkHardProfiles && typeof settings.noThinkHardProfiles === "object") ? settings.noThinkHardProfiles : {};
+                if (this.checked) m[pid] = true; else delete m[pid];
+                settings.noThinkHardProfiles = m;
+                saveSetting("noThinkHardProfiles", m);
+            });
+            $rows.append($row);
+        });
+    }
+    rstRenderNoThinkRows();
+
     try {
         ConnectionManagerRequestService.handleDropdown(
             "#rst-conn-stat",
             settings.connections?.statUpdateLLM || "",
-            (profile) => { saveSetting("connections.statUpdateLLM", profile?.id || ""); },
+            (profile) => { saveSetting("connections.statUpdateLLM", profile?.id || ""); if (settings.connections) settings.connections.statUpdateLLM = profile?.id || ""; rstRenderNoThinkRows(); },
         );
     } catch (err) {
         console.warn("[RST] Connection Manager not available for stat update LLM:", err);
@@ -117,7 +357,7 @@ function renderConnectionProfiles($card, settings) {
         ConnectionManagerRequestService.handleDropdown(
             "#rst-conn-sidecar",
             settings.connections?.sidecarLLM || "",
-            (profile) => { saveSetting("connections.sidecarLLM", profile?.id || ""); },
+            (profile) => { saveSetting("connections.sidecarLLM", profile?.id || ""); if (settings.connections) settings.connections.sidecarLLM = profile?.id || ""; rstRenderNoThinkRows(); },
         );
     } catch (err) {
         console.warn("[RST] Connection Manager not available for sidecar LLM:", err);
@@ -127,7 +367,7 @@ function renderConnectionProfiles($card, settings) {
         ConnectionManagerRequestService.handleDropdown(
             "#rst-conn-autogen",
             settings.connections?.autoGenLLM || "",
-            (profile) => { saveSetting("connections.autoGenLLM", profile?.id || ""); },
+            (profile) => { saveSetting("connections.autoGenLLM", profile?.id || ""); if (settings.connections) settings.connections.autoGenLLM = profile?.id || ""; rstRenderNoThinkRows(); },
         );
     } catch (err) {
         console.warn("[RST] Connection Manager not available for auto-gen LLM:", err);
@@ -382,7 +622,8 @@ function renderSceneSummaryPrompt($pane, settings) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = "rst-summary-prompt.txt";
+        const _cn2 = String(getContext()?.name2 || "chat").replace(/[^a-zA-Z0-9 _-]/g, "").trim().replace(/\s+/g, "_") || "chat";
+        a.download = `rst-summary-prompt-${_cn2}.txt`;
         a.click();
         URL.revokeObjectURL(url);
     });
@@ -408,6 +649,7 @@ function renderSceneSummaryPrompt($pane, settings) {
 
 function renderStatSettings($pane, settings) {
     const range = settings.statChangeRange || { min: -5, max: 5 };
+    const crit = settings.criticalChanges || { enabled: true, chance: 7, multiplier: 3 };
     const $card = $(`
         <div class="rst-card">
             <div class="rst-setting-row">
@@ -421,6 +663,44 @@ function renderStatSettings($pane, settings) {
                     <input type="number" id="rst-range-max" value="${range.max}" min="0" max="20" style="width:52px;text-align:center">
                 </div>
             </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Critical changes</div>
+                    <div class="rst-setting-sub">On pivotal moments, a flagged stat can shift up to ${crit.multiplier || 3}\u00d7 the normal range. RNG-gated and rare.</div>
+                </div>
+                <label class="rst-toggle"><input type="checkbox" id="rst-crit-enabled" ${crit.enabled !== false ? "checked" : ""}><span class="rst-slider"></span></label>
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Critical chance</div>
+                    <div class="rst-setting-sub">Percent chance a flagged stat actually goes critical (lower = rarer)</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+                    <input type="number" id="rst-crit-chance" value="${crit.chance ?? 7}" min="0" max="100" style="width:56px;text-align:center">
+                    <span style="font-size:12px;color:var(--rst-text-muted)">%</span>
+                </div>
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Hard locks</div>
+                    <div class="rst-setting-sub">Enforce per-stat caps based on a character\'s psychology. Normal growth stops at the cap; only a critical can push past and raise it. <b>Requires the character\'s Personality field to be filled</b> \u2014 locks will not be set for a character whose Personality is empty.</div>
+                </div>
+                <label class="rst-toggle"><input type="checkbox" id="rst-hardlocks-enabled" ${(settings.hardLocks?.enabled !== false) ? "checked" : ""}><span class="rst-slider"></span></label>
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Soft locks</div>
+                    <div class="rst-setting-sub">Conditional caps that gate growth until an LLM-defined milestone is met, then auto-unlock. <b>Requires the character\'s Personality field to be filled.</b></div>
+                </div>
+                <label class="rst-toggle"><input type="checkbox" id="rst-softlocks-enabled" ${(settings.softLocks?.enabled !== false) ? "checked" : ""}><span class="rst-slider"></span></label>
+            </div>
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Max active soft locks</div>
+                    <div class="rst-setting-sub">Ceiling on simultaneous active soft locks per character (1-3). A maximum, not a target \u2014 the LLM still uses judgment and often sets fewer or none.</div>
+                </div>
+                <input type="number" id="rst-softlocks-max" value="${settings.softLocks?.maxActive ?? 1}" min="1" max="3" style="width:56px;text-align:center;flex-shrink:0">
+            </div>
         </div>
     `);
 
@@ -429,6 +709,27 @@ function renderStatSettings($pane, settings) {
     });
     $card.find("#rst-range-max").on("change", function () {
         saveSetting("statChangeRange.max", parseInt($(this).val(), 10));
+    });
+    $card.find("#rst-crit-enabled").on("change", function () {
+        saveSetting("criticalChanges.enabled", $(this).prop("checked"));
+    });
+    $card.find("#rst-crit-chance").on("change", function () {
+        let v = parseInt($(this).val(), 10);
+        if (isNaN(v) || v < 0) v = 0; if (v > 100) v = 100;
+        $(this).val(v);
+        saveSetting("criticalChanges.chance", v);
+    });
+    $card.find("#rst-hardlocks-enabled").on("change", function () {
+        saveSetting("hardLocks.enabled", $(this).prop("checked"));
+    });
+    $card.find("#rst-softlocks-enabled").on("change", function () {
+        saveSetting("softLocks.enabled", $(this).prop("checked"));
+    });
+    $card.find("#rst-softlocks-max").on("change", function () {
+        let v = parseInt($(this).val(), 10);
+        if (isNaN(v) || v < 1) v = 1; if (v > 3) v = 3;
+        $(this).val(v);
+        saveSetting("softLocks.maxActive", v);
     });
 
     $pane.append($card);
@@ -498,6 +799,7 @@ function renderInjectionSettings($pane, settings) {
 
     const roleOptions = [{ value: "system", label: "System" },{ value: "user", label: "User" },{ value: "assistant", label: "Assistant" }].map((o) => `<option value="${o.value}"${(o.value === (inj.libraryRefRole || "system")) ? " selected" : ""}>${o.label}</option>`).join("");
     $card.append(`<div class="rst-setting-row" style="border-top:1px solid var(--rst-border);padding-top:12px;margin-top:4px"><div><div class="rst-setting-label">Passive library reference</div><div class="rst-setting-sub">Inject library as freely-referenceable context — LLM can reference any tracked character's full relationship data when relevant</div></div><label class="rst-toggle"><input type="checkbox" id="rst-passive-ref" ${inj.passiveLibraryRef ? "checked" : ""}><span class="rst-slider"></span></label></div>`);
+    $card.append(`<div class="rst-setting-row"><div><div class="rst-setting-label">Stat lookup tool (function calling)</div><div class="rst-setting-sub">Lets the main LLM request a character's stats on demand — even when they aren't present. Requires a Chat Completion backend with tool calling enabled.</div></div><label class="rst-toggle"><input type="checkbox" id="rst-stat-tool" ${inj.statToolEnabled !== false ? "checked" : ""}><span class="rst-slider"></span></label></div>`);
     $card.append(`<div class="rst-setting-row"><div><div class="rst-setting-label">Library reference depth</div><div class="rst-setting-sub">Where in the context the library block is inserted (higher = later in context)</div></div><select id="rst-ref-depth" style="width:160px;flex-shrink:0"><option value="0"${(inj.libraryRefDepth === 0) ? " selected" : ""}>Top of prompt</option><option value="1"${(inj.libraryRefDepth === 1 || inj.libraryRefDepth === undefined) ? " selected" : ""}>Above character card</option><option value="2"${(inj.libraryRefDepth === 2) ? " selected" : ""}>Below character card</option></select></div>`);
     $card.append(`<div class="rst-setting-row"><div><div class="rst-setting-label">Library reference role</div><div class="rst-setting-sub">Speaker role for the injected library block</div></div><select id="rst-ref-role" style="width:160px;flex-shrink:0">${roleOptions}</select></div>`);
 
@@ -508,6 +810,7 @@ function renderInjectionSettings($pane, settings) {
     $("#rst-inject-format").on("change", async function () { saveSetting("injection.format", $(this).val()); const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); });
     $("#rst-inject-placement").on("change", async function () { saveSetting("injection.placement", $(this).val()); const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); });
     $("#rst-passive-ref").on("change", async function () { saveSetting("injection.passiveLibraryRef", $(this).prop("checked")); const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); });
+    $("#rst-stat-tool").on("change", function () { saveSetting("injection.statToolEnabled", $(this).prop("checked")); });
     $("#rst-ref-depth").on("change", async function () { saveSetting("injection.libraryRefDepth", parseInt($(this).val(), 10)); const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); });
     $("#rst-ref-role").on("change", async function () { saveSetting("injection.libraryRefRole", $(this).val()); const { updatePassiveLibraryRef } = await import("../inject/promptInjector.js"); updatePassiveLibraryRef(); });
 }
@@ -521,7 +824,8 @@ function renderDataSection($pane) {
         const data = await exportAllData();
         const blob = new Blob([data], { type: "application/json" });
         const url = URL.createObjectURL(blob);
-        const a = document.createElement("a"); a.href = url; a.download = "rst-data.json"; a.click();
+        const _cn = String(getContext()?.name2 || "chat").replace(/[^a-zA-Z0-9 _-]/g, "").trim().replace(/\s+/g, "_") || "chat";
+        const a = document.createElement("a"); a.href = url; a.download = `rst-data-${_cn}-${Date.now()}.json`; a.click();
         URL.revokeObjectURL(url);
         toastr?.success?.("All data exported.");
     });

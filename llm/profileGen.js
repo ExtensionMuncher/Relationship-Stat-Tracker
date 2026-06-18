@@ -9,6 +9,7 @@ import { makeRequest } from "./connections.js";
 import { getSettings } from "../data/storage.js";
 import { getAllSceneSummaries } from "../data/scenes.js";
 import { STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
+import { dlog } from "../lib/debug.js";
 
 // ─── Profile Generation ───────────────────────────────────
 
@@ -23,7 +24,7 @@ export async function generateProfile(characterName, prompt = "", fromScene = fa
     const settings = getSettings();
     const profileName = settings.connections.autoGenLLM;
 
-    console.log("[RST] generateProfile called for:", characterName, "profileName:", JSON.stringify(profileName), "prompt length:", prompt?.length, "fromScene:", fromScene);
+    dlog("[RST] generateProfile called for:", characterName, "profileName:", JSON.stringify(profileName), "prompt length:", prompt?.length, "fromScene:", fromScene);
 
     if (!profileName) {
         console.error("[RST] No autoGenLLM connection profile configured!");
@@ -34,8 +35,8 @@ export async function generateProfile(characterName, prompt = "", fromScene = fa
     const systemPrompt = buildProfileGenSystemPrompt();
     const requestPrompt = buildProfileGenRequestPrompt(characterName, prompt, fromScene);
 
-    console.log("[RST] Profile gen system prompt:", systemPrompt.slice(0, 200) + "...");
-    console.log("[RST] Profile gen request prompt length:", requestPrompt.length);
+    dlog("[RST] Profile gen system prompt:", systemPrompt.slice(0, 200) + "...");
+    dlog("[RST] Profile gen request prompt length:", requestPrompt.length);
 
     try {
         toastr?.info?.("Generating character profile...");
@@ -48,13 +49,13 @@ export async function generateProfile(characterName, prompt = "", fromScene = fa
             0.3,  // Low temperature for reliable JSON-structured output
         );
 
-        console.log("[RST] Profile gen raw response (first 500 chars):", result?.slice(0, 500));
-        console.log("[RST] Profile gen raw response (last 200 chars):", result?.slice(-200));
+        dlog("[RST] Profile gen raw response (first 500 chars):", result?.slice(0, 500));
+        dlog("[RST] Profile gen raw response (last 200 chars):", result?.slice(-200));
 
         if (!result) throw new Error("No response from LLM");
 
         const parsed = parseProfileResponse(result);
-        console.log("[RST] Profile gen parsed:", JSON.stringify(parsed).slice(0, 200));
+        dlog("[RST] Profile gen parsed:", JSON.stringify(parsed).slice(0, 200));
 
         return {
             name: characterName,
@@ -152,7 +153,7 @@ function parseProfileResponse(response) {
     // Strategy 1: Direct JSON parse
     try {
         parsed = JSON.parse(text);
-        console.log("[RST] Profile parse: strategy 1 (direct) succeeded");
+        dlog("[RST] Profile parse: strategy 1 (direct) succeeded");
         return extractProfileFields(parsed);
     } catch {
         // continue to next strategy
@@ -163,7 +164,7 @@ function parseProfileResponse(response) {
     if (jsonFenceMatch) {
         try {
             parsed = JSON.parse(jsonFenceMatch[1].trim());
-            console.log("[RST] Profile parse: strategy 2 (json fence) succeeded");
+            dlog("[RST] Profile parse: strategy 2 (json fence) succeeded");
             return extractProfileFields(parsed);
         } catch {
             // continue to next strategy
@@ -175,7 +176,7 @@ function parseProfileResponse(response) {
     if (fenceMatch) {
         try {
             parsed = JSON.parse(fenceMatch[1].trim());
-            console.log("[RST] Profile parse: strategy 3 (generic fence) succeeded");
+            dlog("[RST] Profile parse: strategy 3 (generic fence) succeeded");
             return extractProfileFields(parsed);
         } catch {
             // continue to next strategy
@@ -187,7 +188,7 @@ function parseProfileResponse(response) {
     if (braceMatch) {
         try {
             parsed = JSON.parse(braceMatch[0]);
-            console.log("[RST] Profile parse: strategy 4 (greedy braces) succeeded");
+            dlog("[RST] Profile parse: strategy 4 (greedy braces) succeeded");
             return extractProfileFields(parsed);
         } catch {
             // continue to next strategy
@@ -200,7 +201,7 @@ function parseProfileResponse(response) {
         if (start >= 0 && end > start) {
             try {
                 parsed = JSON.parse(text.substring(start, end + 1));
-                console.log("[RST] Profile parse: strategy 5 (progressive trim) succeeded");
+                dlog("[RST] Profile parse: strategy 5 (progressive trim) succeeded");
                 return extractProfileFields(parsed);
             } catch {
                 continue;
@@ -217,7 +218,7 @@ function parseProfileResponse(response) {
             let notes = notesRaw ? notesRaw[1] : '';
             if (notes) notes = notes.replace(/["\s,}]*$/, '');
             if (description) {
-                console.log("[RST] Profile parse: strategy 6 (truncated JSON) succeeded");
+                dlog("[RST] Profile parse: strategy 6 (truncated JSON) succeeded");
                 return extractProfileFields({ description, notes });
             }
         } catch {
@@ -226,10 +227,10 @@ function parseProfileResponse(response) {
     }
 
     // Strategy 7: Fallback — parse analysis text format (backtick-wrapped fields, bullet-point stats)
-    console.log("[RST] Profile parse: no JSON found, attempting analysis text fallback parser");
+    dlog("[RST] Profile parse: no JSON found, attempting analysis text fallback parser");
     const fallback = parseAnalysisTextFallback(text);
     if (fallback) {
-        console.log("[RST] Profile parse: strategy 6 (analysis text fallback) succeeded");
+        dlog("[RST] Profile parse: strategy 6 (analysis text fallback) succeeded");
         return fallback;
     }
 

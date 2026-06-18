@@ -218,6 +218,29 @@ export function savePendingUpdates(pending) {
 }
 
 /**
+ * Pending lock-scan results (library-wide, so stored globally in
+ * extension_settings rather than per-chat). Persisted so that dismissing the
+ * review dialog does not throw away an expensive scan — it can be reopened.
+ * @returns {Array|null}
+ */
+export function getPendingLockScan() {
+    if (!extension_settings[NAMESPACE]) return null;
+    return extension_settings[NAMESPACE].pendingLockScan || null;
+}
+
+/**
+ * Save (or clear, with null) the pending lock-scan results.
+ * @param {Array|null} results
+ */
+export function savePendingLockScan(results) {
+    if (!extension_settings[NAMESPACE]) {
+        extension_settings[NAMESPACE] = {};
+    }
+    extension_settings[NAMESPACE].pendingLockScan = results || null;
+    saveSettingsDebounced();
+}
+
+/**
  * Get present characters for this chat.
  * @returns {Array<string>} Array of character IDs
  */
@@ -301,6 +324,21 @@ export function getDefaultSettings() {
     return {
         enabled: true,
 
+        // Debug F12 logging: when true, routine [RST] activity logs appear in the
+        // browser console. Warnings and errors always show regardless. Off by default.
+        debug: false,
+
+        // No-think soft switch: append "/no_think" to each LLM call to disable
+        // reasoning on supporting models (Qwen3, etc.). Harmless to others.
+        noThink: false,
+        // No-think hard switch: also send API params (think/enable_thinking=false).
+        // Off by default — some backends error on unknown body keys.
+        noThinkHard: false,
+        // Per-profile no-think, keyed by connection profile ID. Take precedence
+        // over the blanket booleans above when present.
+        noThinkProfiles: {},
+        noThinkHardProfiles: {},
+
         connections: {
             statUpdateLLM: "",
             sidecarLLM: "",
@@ -311,6 +349,18 @@ export function getDefaultSettings() {
         scanFrequency: 5,
         newCharPopup: true,
         statChangeRange: { min: -5, max: 5 },
+        criticalChanges: {
+            enabled: true,
+            chance: 7,        // % chance an LLM-flagged stat actually goes critical
+            multiplier: 3,    // critical changes get this x the normal range ceiling
+        },
+        hardLocks: {
+            enabled: true,   // enforce per-stat hard caps; criticals can raise them
+        },
+        softLocks: {
+            enabled: true,   // enforce conditional caps that auto-unlock when met
+            maxActive: 1,    // max simultaneous active soft locks per character (1-3); a CEILING, not a target
+        },
         sceneSummaryPrompt:
             "Write a concise scene summary for internal reference. Include: key events, emotional turning points, characters present, and any significant relationship shifts. Keep it clinical and factual — this is a note for future analysis, not a narrative retelling.",
 
@@ -331,6 +381,7 @@ export function getDefaultSettings() {
             format: "stats_and_narrative",
             placement: "above_card",
             passiveLibraryRef: false,
+            statToolEnabled: true,
             libraryRefDepth: 2,
             libraryRefRole: "system",
         },
