@@ -1756,3 +1756,42 @@ dialog.popup .editor_maximize:hover {
     border-top: 0.5px solid var(--rst-border);
 }
 .rst-scan-discard input { flex-shrink: 0; }
+
+/* Hard lock pressure badge on the stat row */
+.rst-pressure-badge {
+    font-size: 10px; cursor: pointer; white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 3px; flex-shrink: 0;
+    padding: 1px 5px; border-radius: 100px; font-weight: 600;
+    color: #8A6D3B; background: color-mix(in srgb, #C9A227 16%, transparent);
+    border: 1px solid color-mix(in srgb, #C9A227 32%, transparent);
+}
+.rst-pressure-badge:hover { background: color-mix(in srgb, #C9A227 26%, transparent); }
+.rst-pressure-badge i { font-size: 9px; }
+.rst-pressure-badge.review {
+    color: #B5532A; background: color-mix(in srgb, #D85A30 16%, transparent);
+    border-color: color-mix(in srgb, #D85A30 40%, transparent);
+}
+
+/* Pressure section inside the hard-lock editor */
+.rst-pressure-section {
+    margin-top: 12px; padding-top: 10px;
+    border-top: 0.5px solid var(--rst-border);
+}
+.rst-pressure-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.rst-pressure-of { font-size: 13px; color: var(--rst-text-muted); }
+.rst-pressure-latest {
+    font-size: 11px; color: var(--rst-text-muted); line-height: 1.5;
+    margin-top: 8px; padding-left: 2px;
+}
+.rst-pressure-review {
+    margin-top: 10px; padding: 10px;
+    border-radius: 8px;
+    background: color-mix(in srgb, #D85A30 10%, transparent);
+    border: 0.5px solid color-mix(in srgb, #D85A30 35%, transparent);
+}
+.rst-pressure-review-title {
+    font-size: 12px; font-weight: 600; color: #B5532A;
+    display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+}
+.rst-pressure-review-rec { font-size: 12px; margin-bottom: 4px; }
+.rst-pressure-review-reason { font-size: 11px; color: var(--rst-text-muted); line-height: 1.5; }

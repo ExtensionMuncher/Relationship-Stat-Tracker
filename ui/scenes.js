@@ -318,6 +318,14 @@ function renderSceneEntry(scene, isOpen) {
             updateSceneSummary(scene.id, $(this).val());
         });
         $body.append($textarea);
+        // Explicit Save button so the user never has to wonder if blur-save fired.
+        const $summarySave = $(`<button class="rst-btn" style="margin-top:8px"><i class="fa-solid fa-floppy-disk"></i> Save summary</button>`);
+        $summarySave.on("click", function () {
+            updateSceneSummary(scene.id, $textarea.val());
+            scene.llmSummary = $textarea.val();
+            toastr?.success?.("Scene summary saved.");
+        });
+        $body.append($summarySave);
     }
 
     // Delete button (shown for both open and closed scenes)

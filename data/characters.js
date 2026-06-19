@@ -60,6 +60,55 @@ export function createBlankLocks() {
     return locks;
 }
 
+export const HARD_LOCK_PRESSURE_MAX = 5;
+
+/**
+ * Create a blank pressure object for a hard lock. Pressure tracks EVIDENCE that
+ * a character is acting against the psychological reason behind the lock. It
+ * never raises the stat itself — at max it flags the lock for user review.
+ *   value        0..max evidence level
+ *   max          ceiling (default 5)
+ *   reason       prose for the latest pressure change
+ *   lastUpdated  timestamp of last change
+ *   needsReview  true once value hits max
+ *   recommendation  LLM-proposed review object (or null)
+ *   history      past cap changes earned through pressure, so the LLM knows the
+ *                cap was not always its current value and why it moved.
+ */
+export function createBlankPressure() {
+    return {
+        value: 0,
+        max: HARD_LOCK_PRESSURE_MAX,
+        reason: "",
+        lastUpdated: 0,
+        needsReview: false,
+        recommendation: null,
+        history: [],
+    };
+}
+
+/**
+ * Ensure a hard-lock entry has a pressure object IF it has a cap. Lockless
+ * stats stay lean (no pressure attached). Returns the (possibly updated) entry.
+ */
+export function ensurePressure(lockEntry) {
+    if (!lockEntry || typeof lockEntry.cap !== "number") return lockEntry;
+    if (!lockEntry.pressure || typeof lockEntry.pressure !== "object") {
+        lockEntry.pressure = createBlankPressure();
+    } else {
+        // Backfill any missing fields on an older pressure object.
+        const p = lockEntry.pressure;
+        if (typeof p.value !== "number") p.value = 0;
+        if (typeof p.max !== "number") p.max = HARD_LOCK_PRESSURE_MAX;
+        if (typeof p.reason !== "string") p.reason = "";
+        if (typeof p.lastUpdated !== "number") p.lastUpdated = 0;
+        if (typeof p.needsReview !== "boolean") p.needsReview = false;
+        if (!("recommendation" in p)) p.recommendation = null;
+        if (!Array.isArray(p.history)) p.history = [];
+    }
+    return lockEntry;
+}
+
 /**
  * Create a blank SOFT-lock map mirroring the stats shape.
  * Each entry is { cap: number|null, condition: string, progress: string, met: boolean }.
@@ -246,6 +295,14 @@ function normalizeProfileLocks(profile) {
                     profile.hardLocks[cat][stat] = { cap: null, reason: "" };
                 }
             }
+        }
+    }
+    // Attach/backfill pressure on every hard lock that has a cap (migration for
+    // existing locked characters). Lockless stats stay lean.
+    for (const cat of STAT_CATEGORIES) {
+        for (const stat of STAT_NAMES) {
+            const e = profile.hardLocks[cat]?.[stat];
+            if (e && typeof e.cap === "number") ensurePressure(e);
         }
     }
     // Soft locks (added later) — same backfill treatment.

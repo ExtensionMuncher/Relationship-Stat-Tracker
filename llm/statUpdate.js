@@ -182,6 +182,8 @@ function buildStatUpdateSystemPrompt(settings) {
         '        "proposedSoftLocks": [{"stat":"category.stat","cap":NUMBER,"condition":"what {{user}} must do to unlock further growth","progress":"current prose progress toward it"}],',
         '        "unlockedSoftLocks": ["category.stat for any EXISTING soft lock whose condition was fulfilled this scene"],',
         '        "softLockProgress": [{"stat":"category.stat","progress":"updated prose progress note for an existing, still-locked soft lock"}],',
+        '        "hardLockPressureUpdates": [{"stat":"category.stat","change":-2|-1|0|1|2,"reason":"specific behavior that contradicts or reinforces the hard lock reason"}],',
+        '        "hardLockReviews": [{"stat":"category.stat","recommendation":"maintain|raise_cap|convert_to_soft|remove","recommendedCap":NUMBER,"reason":"why the accumulated evidence justifies this"}],',
         '        "milestoneDetail": "...",',
         '        "narrativeSummary": "..."',
         '      }',
@@ -197,6 +199,8 @@ function buildStatUpdateSystemPrompt(settings) {
         '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If no slots are open, propose NONE. The "Soft-lock slots OPEN" number is a CEILING, not a target — propose anywhere from zero up to that many, and zero or one is the typical, expected answer. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Each entry: {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. Never propose a lock just to use an available slot — only when it is genuinely warranted by the story.',
         '- unlockedSoftLocks: for any EXISTING soft lock listed in the character\'s data, if its condition was FULFILLED during this scene, list its "category.stat" here. The stat will then auto-unlock and resume normal growth. Only include locks that are genuinely satisfied by what happened.',
         '- softLockProgress: for existing soft locks that are NOT yet met, optionally provide an updated prose progress note reflecting movement toward the condition this scene.',
+        '- hardLockPressureUpdates: ONLY for stats that ALREADY have a hard lock (shown with "pressure X/5"). NEVER create pressure for an unlocked stat. Pressure tracks EVIDENCE the character is acting against the lock\'s psychological REASON; it does NOT change the stat value. Scale: +2 major sustained contradiction; +1 meaningful contradiction; 0 no change (default for almost every scene); -1 reinforced the locked pattern; -2 severe regression. Changes must be RARE and evidence-based. Possessiveness, jealousy, attraction, fascination, sexual tension, protectiveness, or angst do NOT count unless the behavior directly contradicts the specific lock reason. COUNTS: relying on {{user}}\'s judgment without controlling the outcome (contradicts a belief that reliance is weakness). Does NOT count: becoming more fascinated (not structural), or protecting {{user}} because they consider {{user}} theirs (possessive protection reinforces the lock).',
+        '- hardLockReviews: include an entry ONLY when a hard lock pressure reaches max (5/5) this scene. Shape {"stat":"category.stat","recommendation":"maintain|raise_cap|convert_to_soft|remove","recommendedCap":NUMBER,"reason":"..."}. Recommend a modest raise (+5/+10) unless evidence is overwhelming (+15 max). You only recommend; the user decides.',
         '- Range: -100 to 100. 0 = neutral.',
         `- Each stat MUST stay within ${range.min} to ${range.max} points of its current (pre-scene) value. For example, if Trust is currently 30 and the range is -5 to +5, the new Trust must be between 25 and 35.`,
         '- Stats are ABSOLUTE values (not deltas), but each must respect the per-scene change limit above.',
@@ -248,20 +252,30 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
             const stats = char.stats[cat];
             parts.push(`    ${cat}: trust=${stats.trust}%, openness=${stats.openness}%, support=${stats.support}%, affection=${stats.affection}%`);
         }
-        // Existing hard-lock caps, if any
+        // Existing hard-lock caps, if any — with pressure state + cap history.
         const lockLines = [];
         if (char.hardLocks) {
             for (const cat of STAT_CATEGORIES) {
                 for (const stat of STAT_NAMES) {
                     const lk = char.hardLocks[cat]?.[stat];
                     if (lk && typeof lk.cap === 'number') {
-                        lockLines.push(`    ${cat}.${stat} capped at ${lk.cap}%${lk.reason ? ` (${lk.reason})` : ''}`);
+                        let line = `    ${cat}.${stat} capped at ${lk.cap}%${lk.reason ? ` (${lk.reason})` : ''}`;
+                        const p = lk.pressure;
+                        if (p && typeof p.value === 'number') {
+                            line += ` | pressure ${p.value}/${p.max || 5}`;
+                            if (p.reason) line += ` (latest: ${p.reason})`;
+                        }
+                        if (p && Array.isArray(p.history) && p.history.length > 0) {
+                            const hist = p.history.map(h => `cap ${h.fromCap}->${h.toCap}: ${h.reason || ''}`).join('; ');
+                            line += ` | prior cap changes earned through pressure: ${hist}`;
+                        }
+                        lockLines.push(line);
                     }
                 }
             }
         }
         if (lockLines.length > 0) {
-            parts.push(`  Hard-lock caps (these stats cannot rise above the cap through ordinary growth):`);
+            parts.push(`  Hard-lock caps (these stats cannot rise above the cap through ordinary growth). "pressure X/5" tracks evidence the character is acting AGAINST the lock's psychological reason:`);
             parts.push(...lockLines);
         }
         // Existing soft locks (conditional caps the LLM can mark as met)
@@ -422,6 +436,8 @@ function parseStatUpdateResponse(response, characters) {
             proposedSoftLocks: Array.isArray(charData.proposedSoftLocks) ? charData.proposedSoftLocks : [],
             unlockedSoftLocks,
             softLockProgress: Array.isArray(charData.softLockProgress) ? charData.softLockProgress : [],
+            hardLockPressureUpdates: Array.isArray(charData.hardLockPressureUpdates) ? charData.hardLockPressureUpdates : [],
+            hardLockReviews: Array.isArray(charData.hardLockReviews) ? charData.hardLockReviews : [],
             source: "llm",
             changeCount,
         });
@@ -480,6 +496,8 @@ function parseStatUpdateResponse(response, characters) {
                         proposedSoftLocks: Array.isArray(llmData.proposedSoftLocks) ? llmData.proposedSoftLocks : [],
                         unlockedSoftLocks,
                         softLockProgress: Array.isArray(llmData.softLockProgress) ? llmData.softLockProgress : [],
+                        hardLockPressureUpdates: Array.isArray(llmData.hardLockPressureUpdates) ? llmData.hardLockPressureUpdates : [],
+                        hardLockReviews: Array.isArray(llmData.hardLockReviews) ? llmData.hardLockReviews : [],
                         source: "llm",
                         changeCount,
                     });
@@ -1381,6 +1399,8 @@ function buildInitialStatSystemPrompt(settings) {
         '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If no slots are open, propose NONE. The "Soft-lock slots OPEN" number is a CEILING, not a target — propose anywhere from zero up to that many, and zero or one is the typical, expected answer. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Each entry: {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. Never propose a lock just to use an available slot — only when it is genuinely warranted by the story.',
         '- unlockedSoftLocks: for any EXISTING soft lock listed in the character\'s data, if its condition was FULFILLED during this scene, list its "category.stat" here. The stat will then auto-unlock and resume normal growth. Only include locks that are genuinely satisfied by what happened.',
         '- softLockProgress: for existing soft locks that are NOT yet met, optionally provide an updated prose progress note reflecting movement toward the condition this scene.',
+        '- hardLockPressureUpdates: ONLY for stats that ALREADY have a hard lock (shown with "pressure X/5"). NEVER create pressure for an unlocked stat. Pressure tracks EVIDENCE the character is acting against the lock\'s psychological REASON; it does NOT change the stat value. Scale: +2 major sustained contradiction; +1 meaningful contradiction; 0 no change (default for almost every scene); -1 reinforced the locked pattern; -2 severe regression. Changes must be RARE and evidence-based. Possessiveness, jealousy, attraction, fascination, sexual tension, protectiveness, or angst do NOT count unless the behavior directly contradicts the specific lock reason. COUNTS: relying on {{user}}\'s judgment without controlling the outcome (contradicts a belief that reliance is weakness). Does NOT count: becoming more fascinated (not structural), or protecting {{user}} because they consider {{user}} theirs (possessive protection reinforces the lock).',
+        '- hardLockReviews: include an entry ONLY when a hard lock pressure reaches max (5/5) this scene. Shape {"stat":"category.stat","recommendation":"maintain|raise_cap|convert_to_soft|remove","recommendedCap":NUMBER,"reason":"..."}. Recommend a modest raise (+5/+10) unless evidence is overwhelming (+15 max). You only recommend; the user decides.',
         '- Range: -100 to 100. 0 = neutral.',
         '- Commentary: explain each stat from scene events.',
         '- Dynamic title: character\'s relationship role/attitude toward {{user}}.',
@@ -1602,6 +1622,8 @@ function parseInitialStatResponse(response, characters) {
                         proposedSoftLocks: Array.isArray(llmData.proposedSoftLocks) ? llmData.proposedSoftLocks : [],
                         unlockedSoftLocks,
                         softLockProgress: Array.isArray(llmData.softLockProgress) ? llmData.softLockProgress : [],
+                        hardLockPressureUpdates: Array.isArray(llmData.hardLockPressureUpdates) ? llmData.hardLockPressureUpdates : [],
+                        hardLockReviews: Array.isArray(llmData.hardLockReviews) ? llmData.hardLockReviews : [],
                         source: "llm_initial",
                         changeCount,
                     });

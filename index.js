@@ -55,93 +55,105 @@ const _rejectedNames = new Set();
 jQuery(async () => {
     dlog("[RST] Relationship Stat Tracker loading...");
 
+    let $homePane = null;
+
     try {
-        // 1. Initialize settings
+        // 1. Initialize settings. If this fails, the extension cannot safely run.
         await initSettings();
 
-        // 2. Initialize scene counter
-        initSceneCounter();
+        // 2. Create the UI panel EARLY. This prevents a later data/schema error
+        // from making the extension look completely invisible in ST.
+        createPanel();
+        $homePane = getPane("home");
 
-        // 3. Create the UI panel
-        const $panel = createPanel();
+        // 3. Render the Home tab header immediately so there is visible UI even
+        // if a later tab render fails on old/corrupt chat data.
+        safeStep("renderHomeHeader", () => renderHomeHeader($homePane));
 
-        // 4. Render the Home tab header
-        const $homePane = getPane("home");
-        renderHomeHeader($homePane);
+        // 4. Initialize scene counter after the panel exists. Old exports/chats
+        // may be missing scenes; storage.js now migrates those defensively.
+        safeStep("initSceneCounter", () => initSceneCounter());
 
-        // 5. Render all tab content
-        renderHomeTab($homePane);
-        renderLibraryTab(getPane("lib"));
-        renderScenesTab(getPane("scenes"));
-        renderSettingsTab(getPane("settings"));
+        // 5. Render all tab content independently. One broken tab should not
+        // prevent the whole extension from loading.
+        safeStep("renderHomeTab", () => renderHomeTab($homePane));
+        safeStep("renderLibraryTab", () => renderLibraryTab(getPane("lib")));
+        safeStep("renderScenesTab", () => renderScenesTab(getPane("scenes")));
+        safeStep("renderSettingsTab", () => renderSettingsTab(getPane("settings")));
 
         // 6. Register event handlers
-        registerEventHandlers();
+        safeStep("registerEventHandlers", () => registerEventHandlers());
 
         // 7. Register slash commands
-        registerSlashCommands();
+        safeStep("registerSlashCommands", () => registerSlashCommands());
 
         // 8. Initial injection update
         if (isEnabled()) {
-            updateInjection();
+            safeStep("updateInjection", () => updateInjection());
         }
 
         // 9. Listen for APP_READY — ST emits this after full initialization,
         //    after all extensions have loaded and messages are rendered.
         //    CHAT_CHANGED may fire before the extension registers its handler,
         //    so we use APP_READY as the reliable trigger to re-add buttons.
-        eventSource.once(event_types.APP_READY, () => {
-            if (!isEnabled()) return;
-            $(".mes").each(function () {
-                const mesId = $(this).attr("mesid");
-                if (mesId !== undefined) {
-                    addSceneButtons(parseInt(mesId, 10));
-                }
-            });
+        safeStep("APP_READY registration", () => {
+            const readyHandler = () => {
+                if (!isEnabled()) return;
+                $(".mes").each(function () {
+                    const mesId = $(this).attr("mesid");
+                    if (mesId !== undefined) {
+                        addSceneButtons(parseInt(mesId, 10));
+                    }
+                });
+            };
+            if (typeof eventSource.once === "function") {
+                eventSource.once(event_types.APP_READY, readyHandler);
+            } else {
+                eventSource.on(event_types.APP_READY, readyHandler);
+            }
         });
 
         // 9a. Register the entry in ST's magic wand menu (chatbar dropdown)
-        registerMagicWandMenuEntry();
+        safeStep("registerMagicWandMenuEntry", () => registerMagicWandMenuEntry());
 
         // 9c. Register the relationship-stat lookup function tool so the main
         // LLM can request stats for characters that aren't present in the scene.
-        registerStatLookupTool();
-
+        safeStep("registerStatLookupTool", () => registerStatLookupTool());
 
         // 9. Listen for tab switches to refresh content
         $(document).on("rst:tab-switched", (_e, tabId) => {
             const $pane = getPane(tabId);
             switch (tabId) {
                 case "home":
-                    renderHomeTab($pane);
+                    safeStep("refresh home tab", () => renderHomeTab($pane));
                     break;
                 case "lib":
-                    renderLibraryTab($pane);
+                    safeStep("refresh library tab", () => renderLibraryTab($pane));
                     break;
                 case "scenes":
-                    renderScenesTab($pane);
+                    safeStep("refresh scenes tab", () => renderScenesTab($pane));
                     break;
                 case "settings":
-                    renderSettingsTab($pane);
+                    safeStep("refresh settings tab", () => renderSettingsTab($pane));
                     break;
             }
         });
 
         // 10. Listen for character selection from Home tab
         $(document).on("rst:select-character", (_e, charId) => {
-            selectCharacter(charId);
+            safeStep("selectCharacter", () => selectCharacter(charId));
         });
 
         // 11. Listen for toggle
         $(document).on("rst:toggle", (_e, enabled) => {
             if (enabled) {
-                updateInjection();
+                safeStep("toggle updateInjection", () => updateInjection());
                 $(".rst-scene-btn").show();
                 $(".rst-scene-btn").prop("disabled", false);
                 $("body").removeClass("rst-disabled");
                 $("#rst_container").css({ opacity: "", pointerEvents: "", userSelect: "" });
             } else {
-                removeInjection();
+                safeStep("toggle removeInjection", () => removeInjection());
                 $(".rst-scene-btn").hide();
                 $(".rst-scene-btn").prop("disabled", true);
                 $("body").addClass("rst-disabled");
@@ -155,8 +167,32 @@ jQuery(async () => {
         dlog("[RST] Relationship Stat Tracker loaded successfully.");
     } catch (err) {
         console.error("[RST] Failed to load:", err);
+        try { window.rstLastLoadError = err; } catch (_) {}
+        // If we failed after the panel was created, leave a visible error on Home
+        // instead of silently disappearing.
+        try {
+            const $pane = $homePane || getPane("home");
+            if ($pane?.length) {
+                $pane.append(`<div class="rst-card" style="border-color:#b44;color:#f3b4b4">RST failed during startup. Check F12 Console for <code>[RST] Failed to load</code>.</div>`);
+            }
+        } catch (_) {}
     }
 });
+
+/**
+ * Run a boot/render step without allowing it to make the whole extension vanish.
+ * @param {string} label
+ * @param {Function} fn
+ */
+function safeStep(label, fn) {
+    try {
+        return fn();
+    } catch (err) {
+        console.error(`[RST] ${label} failed:`, err);
+        try { window.rstLastLoadError = err; } catch (_) {}
+        return null;
+    }
+}
 
 // ─── Event Handlers ───────────────────────────────────────
 

@@ -613,6 +613,7 @@ function renderCharacterCard($pane, profile) {
         const aliases = raw.split(",").map((s) => s.trim()).filter(Boolean);
         updateCharacterProfile(profile.id, { nameAliases: aliases });
         profile.nameAliases = aliases;
+        toastr?.success?.(`Aliases saved for ${profile.name}.`);
     });
     $card.append($aliasesRow);
 
@@ -641,6 +642,20 @@ function renderCharacterCard($pane, profile) {
     });
 
     $card.append($notes);
+
+    // Explicit Save button for the profile text — saves Personality + Notes on
+    // demand so the user never has to wonder whether blur-save fired.
+    const $profileSave = $(`<button class="rst-btn" style="margin-top:8px"><i class="fa-solid fa-floppy-disk"></i> Save profile</button>`);
+    $profileSave.on("click", function () {
+        updateCharacterProfile(profile.id, {
+            description: $desc.val(),
+            notes: $notes.val(),
+        });
+        profile.description = $desc.val();
+        profile.notes = $notes.val();
+        toastr?.success?.(`Profile saved for ${profile.name}.`);
+    });
+    $card.append($profileSave);
     $card.append('<hr class="rst-div">');
 
     // ── Dossier: current dynamic (title + narrative) sits ABOVE the matrix ──
@@ -1278,6 +1293,18 @@ function renderStatCategoryForLibrary(cat, profile) {
             ? `<span class="rst-lock on" title="Capped at ${cap}%${lock.reason ? ' \u2014 ' + lock.reason.replace(/"/g,'') : ''}" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-lock"></i> HARD ${cap}%</span>`
             : `<span class="rst-lock" title="Set a hard cap" data-cat="${cat}" data-stat="${stat}"><i class="fa-solid fa-lock-open"></i></span>`;
 
+        // Hard lock pressure indicator (only when a lock exists and has pressure).
+        const lp = (cap !== null && lock.pressure) ? lock.pressure : null;
+        let pressureMarkup = "";
+        if (lp && (lp.value > 0 || lp.needsReview)) {
+            const review = lp.needsReview;
+            const titleTxt = (lp.reason ? String(lp.reason).replace(/"/g, "") : "Evidence against this lock");
+            const pIcon = review ? "fa-triangle-exclamation" : "fa-gauge-high";
+            const pText = review ? "review" : (lp.value + "/" + (lp.max || 5));
+            const pClass = review ? "rst-pressure-badge review" : "rst-pressure-badge";
+            pressureMarkup = '<span class="' + pClass + '" title="' + titleTxt + '" data-cat="' + cat + '" data-stat="' + stat + '"><i class="fa-solid ' + pIcon + '"></i> ' + pText + '</span>';
+        }
+
         // Soft lock: conditional cap that auto-unlocks. Only shown when active & unmet.
         const slock = profile.softLocks?.[cat]?.[stat];
         const sActive = slock && typeof slock.cap === 'number' && !slock.met;
@@ -1308,6 +1335,7 @@ function renderStatCategoryForLibrary(cat, profile) {
                     <div class="rst-d-track">${barFill}${capMarker}</div>
                     ${softMarkup}
                     ${lockMarkup}
+                    ${pressureMarkup}
                     <span class="rst-d-stat-val ${cls}">${sign}${val}%</span>
                 </div>
                 ${commentary ? `<div class="rst-d-stat-com">${commentary}</div>` : ""}
@@ -1315,6 +1343,10 @@ function renderStatCategoryForLibrary(cat, profile) {
         `);
         // Lock click -> prompt to set/clear cap
         $stat.find(".rst-lock").on("click", async function (e) {
+            e.stopPropagation();
+            await editHardLock(profile, cat, stat);
+        });
+        $stat.find(".rst-pressure-badge").on("click", async function (e) {
             e.stopPropagation();
             await editHardLock(profile, cat, stat);
         });
@@ -1336,6 +1368,32 @@ async function editHardLock(profile, cat, stat) {
     const curCap = (typeof lock.cap === 'number') ? String(lock.cap) : "";
     const curReason = (lock.reason || "").toString();
     const statLabel = `${cat.charAt(0).toUpperCase() + cat.slice(1)} ${stat.charAt(0).toUpperCase() + stat.slice(1)}`;
+    const hasLock = typeof lock.cap === 'number';
+    const p = (hasLock && lock.pressure) ? lock.pressure : null;
+    const pMax = p ? (p.max || 5) : 5;
+
+    // Build the pressure section only when a lock exists.
+    let pressureHtml = "";
+    if (hasLock) {
+        const recBlock = (p && p.needsReview && p.recommendation) ? `
+            <div class="rst-pressure-review">
+                <div class="rst-pressure-review-title"><i class="fa-solid fa-triangle-exclamation"></i> Lock review recommended</div>
+                <div class="rst-pressure-review-rec">Recommendation: <b>${(p.recommendation.recommendation || "maintain").replace(/_/g, " ")}</b>${p.recommendation.recommendation === "raise_cap" ? ` → cap ${p.recommendation.recommendedCap}%` : ""}</div>
+                <div class="rst-pressure-review-reason">${$("<div>").text(p.recommendation.reason || "").html()}</div>
+                <label class="rst-scan-discard" style="margin-top:8px"><input type="checkbox" id="rst-hl-applyrec"> Apply this recommendation on Save</label>
+            </div>` : "";
+        pressureHtml = `
+            <div class="rst-pressure-section">
+                <label class="rst-lockedit-label">Hard lock pressure (evidence against the lock — does not change the stat)</label>
+                <div class="rst-pressure-row">
+                    <input type="number" id="rst-hl-pressure" class="rst-lockedit-cap" value="${p ? p.value : 0}" min="0" max="${pMax}" style="width:64px">
+                    <span class="rst-pressure-of">/ ${pMax}</span>
+                    <button type="button" id="rst-hl-pressure-reset" class="rst-btn" style="font-size:11px;padding:3px 9px">Reset to 0</button>
+                </div>
+                ${(p && p.reason) ? `<div class="rst-pressure-latest">Latest: ${$("<div>").text(p.reason).html()}</div>` : ""}
+                ${recBlock}
+            </div>`;
+    }
 
     const html = `
         <div class="rst-lockedit">
@@ -1344,41 +1402,97 @@ async function editHardLock(profile, cat, stat) {
             <label class="rst-lockedit-label">Cap %</label>
             <input type="number" id="rst-hl-cap" class="rst-lockedit-cap" value="${curCap}" min="-100" max="100" placeholder="e.g. 40">
             <label class="rst-lockedit-label">Reason</label>
-            <textarea id="rst-hl-reason" class="rst-lockedit-reason" rows="4" placeholder="Why this stat is capped — e.g. 'Due to a traumatic past involving betrayal, he is pathologically incapable of fully trusting anyone.'">${$("<div>").text(curReason).html()}</textarea>
+            <textarea id="rst-hl-reason" class="rst-lockedit-reason" rows="4" placeholder="Why this stat is capped.">${$("<div>").text(curReason).html()}</textarea>
+            ${pressureHtml}
             <div class="rst-lockedit-hint" style="margin-top:6px">Tip: leave the Cap blank and Save to remove this lock.</div>
         </div>`;
 
     const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Save", cancelButton: "Cancel" });
     const showPromise = popup.show();
     const $dlg = $("dialog.popup").last();
+    // Wire the reset button (live, inside the open dialog).
+    $dlg.find("#rst-hl-pressure-reset").on("click", function () {
+        $dlg.find("#rst-hl-pressure").val(0);
+    });
     const result = await showPromise;
     if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
     const capRaw = ($dlg.find("#rst-hl-cap").val() || "").toString().trim();
     const reasonRaw = ($dlg.find("#rst-hl-reason").val() || "").toString().trim();
 
-    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    const { getCharacterProfile, updateCharacterProfile, ensurePressure, HARD_LOCK_PRESSURE_MAX } = await import("../data/characters.js");
     const prof = getCharacterProfile(profile.id);
     if (!prof.hardLocks) return;
 
     if (capRaw === "") {
-        // Blank cap = remove the lock.
+        // Blank cap = remove the lock (and its pressure).
         prof.hardLocks[cat][stat] = { cap: null, reason: "" };
         updateCharacterProfile(profile.id, { hardLocks: prof.hardLocks });
         toastr?.success?.("Hard lock removed.");
-    } else {
-        let v = parseInt(capRaw, 10);
-        if (isNaN(v)) { toastr?.warning?.("Enter a number for the cap, or leave it blank to remove the lock."); return; }
-        v = Math.max(-100, Math.min(100, v));
-        // Preserve the existing reason if the user left the box untouched/empty
-        // but a reason already existed; otherwise use what they typed.
-        const reason = reasonRaw || curReason || "Set manually";
-        prof.hardLocks[cat][stat] = { cap: v, reason };
-        updateCharacterProfile(profile.id, { hardLocks: prof.hardLocks });
-        toastr?.success?.(`Cap set to ${v}%.`);
+        reRenderCharacterList($("#rst-p-lib"));
+        return;
     }
-    const $pane = $("#rst-p-lib");
-    reRenderCharacterList($pane);
+
+    let v = parseInt(capRaw, 10);
+    if (isNaN(v)) { toastr?.warning?.("Enter a number for the cap, or leave it blank to remove the lock."); return; }
+    v = Math.max(-100, Math.min(100, v));
+    const reason = reasonRaw || curReason || "Set manually";
+
+    // Preserve the existing pressure object; only update its value from the field.
+    const existing = prof.hardLocks[cat][stat] || {};
+    const entry = { cap: v, reason };
+    entry.pressure = (existing.pressure && typeof existing.pressure === "object") ? existing.pressure : null;
+    ensurePressure(entry);
+
+    const pMaxNow = entry.pressure.max || HARD_LOCK_PRESSURE_MAX;
+    let pv = parseInt(($dlg.find("#rst-hl-pressure").val() || "0").toString(), 10);
+    if (isNaN(pv)) pv = entry.pressure.value;
+    pv = Math.max(0, Math.min(pMaxNow, pv));
+
+    // If the user manually drops pressure below max, clear the review flag.
+    if (pv < pMaxNow) { entry.pressure.needsReview = false; }
+    entry.pressure.value = pv;
+
+    // Apply the LLM recommendation if the user ticked it.
+    const applyRec = !!($dlg.find("#rst-hl-applyrec")[0]?.checked);
+    if (applyRec && existing.pressure && existing.pressure.recommendation) {
+        const rec = existing.pressure.recommendation;
+        if (rec.recommendation === "raise_cap" && typeof rec.recommendedCap === "number") {
+            const fromCap = entry.cap;
+            entry.cap = Math.max(-100, Math.min(100, rec.recommendedCap));
+            // Record the cap change in history so the LLM knows it moved and why.
+            entry.pressure.history.push({ fromCap, toCap: entry.cap, reason: rec.reason || "", at: Date.now() });
+            entry.pressure.value = 0;           // approving a cap change ALWAYS resets pressure
+            entry.pressure.needsReview = false;
+            entry.pressure.recommendation = null;
+            entry.pressure.reason = `Cap raised ${fromCap}% → ${entry.cap}% via pressure review.`;
+            toastr?.success?.(`Cap raised to ${entry.cap}%; pressure reset.`);
+        } else if (rec.recommendation === "remove") {
+            prof.hardLocks[cat][stat] = { cap: null, reason: "" };
+            updateCharacterProfile(profile.id, { hardLocks: prof.hardLocks });
+            toastr?.success?.("Hard lock removed via review.");
+            reRenderCharacterList($("#rst-p-lib"));
+            return;
+        } else if (rec.recommendation === "convert_to_soft") {
+            // Move it to a soft lock with the recommendation reason as the condition.
+            if (!prof.softLocks) { /* normalized on read */ }
+            prof.softLocks[cat][stat] = { cap: entry.cap, condition: rec.reason || "Converted from hard lock", progress: "", met: false, setAtScene: 0 };
+            prof.hardLocks[cat][stat] = { cap: null, reason: "" };
+            updateCharacterProfile(profile.id, { hardLocks: prof.hardLocks, softLocks: prof.softLocks });
+            toastr?.success?.("Hard lock converted to a soft lock.");
+            reRenderCharacterList($("#rst-p-lib"));
+            return;
+        } else {
+            // maintain: just clear the review flag, keep pressure where it is.
+            entry.pressure.needsReview = false;
+            entry.pressure.recommendation = null;
+        }
+    }
+
+    prof.hardLocks[cat][stat] = entry;
+    updateCharacterProfile(profile.id, { hardLocks: prof.hardLocks });
+    toastr?.success?.(`Cap set to ${v}%.`);
+    reRenderCharacterList($("#rst-p-lib"));
 }
 
 /**
@@ -1453,27 +1567,74 @@ async function showInjectionVisibilityModal(profile) {
 async function editSoftLock(profile, cat, stat) {
     const sl = profile.softLocks?.[cat]?.[stat] || { cap: null, condition: "", progress: "", met: false };
     if (sl.cap === null) { toastr?.info?.("No soft lock on this stat."); return; }
-    const statusLine = sl.met
-        ? `Soft lock on ${cat} ${stat}: UNLOCKED (condition met). Shown as history.`
-        : `Soft lock on ${cat} ${stat}: capped at ${sl.cap}% until the condition is met.`;
-    const detail = [
-        statusLine,
-        "",
-        `Condition: ${sl.condition || "(none specified)"}`,
-        `Progress: ${sl.progress || "(no progress noted yet)"}`,
-        "",
-        sl.met ? "Click OK to CLEAR this history record, or Cancel to keep it." : "Click OK to REMOVE this soft lock, or Cancel to keep it.",
-    ].join("\n");
-    const remove = await Popup.show.confirm(`Soft lock \u2014 ${cat} ${stat}`, detail);
-    if (!remove) return;
+
+    const statLabel = `${cat.charAt(0).toUpperCase() + cat.slice(1)} ${stat.charAt(0).toUpperCase() + stat.slice(1)}`;
+    const curCap = (typeof sl.cap === 'number') ? String(sl.cap) : "";
+    const curCond = (sl.condition || "").toString();
+    const curProg = (sl.progress || "").toString();
+    const statusNote = sl.met
+        ? `This soft lock is UNLOCKED (condition met) and shown as history. Editing it will keep it as history unless you re-lock it by unticking "keep unlocked".`
+        : `Capped at ${sl.cap}% until the condition is met. Edit the cap, condition, or progress below.`;
+
+    const html = `
+        <div class="rst-lockedit">
+            <div class="rst-lockedit-title">Soft lock — ${statLabel}</div>
+            <div class="rst-lockedit-hint">${statusNote}</div>
+            <label class="rst-lockedit-label">Cap %</label>
+            <input type="number" id="rst-sl-cap" class="rst-lockedit-cap" value="${curCap}" min="-100" max="100" placeholder="e.g. 45">
+            <label class="rst-lockedit-label">Condition to unlock</label>
+            <textarea id="rst-sl-cond" class="rst-lockedit-reason" rows="3" placeholder="What must happen for this stat to unlock — e.g. 'Sachiko must reveal a genuine vulnerability of her own before he lowers this guard.'">${$("<div>").text(curCond).html()}</textarea>
+            <label class="rst-lockedit-label">Progress notes</label>
+            <textarea id="rst-sl-prog" class="rst-lockedit-reason" rows="3" placeholder="Running notes toward the condition (optional).">${$("<div>").text(curProg).html()}</textarea>
+            ${sl.met ? `<label class="rst-scan-discard"><input type="checkbox" id="rst-sl-relock"> Re-lock this (treat condition as not yet met)</label>` : ""}
+            <label class="rst-scan-discard"><input type="checkbox" id="rst-sl-remove"> Remove this soft lock entirely</label>
+        </div>`;
+
+    const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Save", cancelButton: "Cancel" });
+    const showPromise = popup.show();
+    const $dlg = $("dialog.popup").last();
+    const result = await showPromise;
+    if (result !== POPUP_RESULT.AFFIRMATIVE) return;
+
     const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
     const prof = getCharacterProfile(profile.id);
     if (!prof.softLocks) return;
-    prof.softLocks[cat][stat] = { cap: null, condition: "", progress: "", met: false, setAtScene: 0 };
+
+    const remove = !!($dlg.find("#rst-sl-remove")[0]?.checked);
+    if (remove) {
+        prof.softLocks[cat][stat] = { cap: null, condition: "", progress: "", met: false, setAtScene: 0 };
+        updateCharacterProfile(profile.id, { softLocks: prof.softLocks });
+        toastr?.success?.("Soft lock removed.");
+        reRenderCharacterList($("#rst-p-lib"));
+        return;
+    }
+
+    const capRaw = ($dlg.find("#rst-sl-cap").val() || "").toString().trim();
+    let cap = parseInt(capRaw, 10);
+    if (isNaN(cap)) { toastr?.warning?.("Enter a number for the cap, or tick Remove."); return; }
+    cap = Math.max(-100, Math.min(100, cap));
+
+    const condition = ($dlg.find("#rst-sl-cond").val() || "").toString().trim().slice(0, 1500);
+    const progress = ($dlg.find("#rst-sl-prog").val() || "").toString().trim().slice(0, 1500);
+    if (!condition) { toastr?.warning?.("A soft lock needs an unlock condition. Add one, or tick Remove."); return; }
+
+    const existing = prof.softLocks[cat][stat] || {};
+    let met = !!existing.met;
+    if (existing.met) {
+        const relock = !!($dlg.find("#rst-sl-relock")[0]?.checked);
+        if (relock) met = false;
+    }
+
+    prof.softLocks[cat][stat] = {
+        cap,
+        condition,
+        progress,
+        met,
+        setAtScene: typeof existing.setAtScene === 'number' ? existing.setAtScene : 0,
+    };
     updateCharacterProfile(profile.id, { softLocks: prof.softLocks });
-    toastr?.success?.("Soft lock removed.");
-    const $pane = $("#rst-p-lib");
-    reRenderCharacterList($pane);
+    toastr?.success?.("Soft lock updated.");
+    reRenderCharacterList($("#rst-p-lib"));
 }
 
 // ─── Update Log Panel ─────────────────────────────────────

@@ -580,7 +580,7 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
                     const [cat, stat] = String(pr.stat).split(".");
                     const sl = prof.softLocks[cat]?.[stat];
                     if (sl && sl.cap !== null && !sl.met) {
-                        sl.progress = String(pr.progress || "").slice(0, 400);
+                        sl.progress = String(pr.progress || "").trim().slice(0, 1500);
                     }
                 }
                 // 3) New proposed soft locks — gated by personality, the 1-active
@@ -601,8 +601,8 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
                             if ((slot.cap === null || slot.met) && sl.condition && String(sl.condition).trim()) {
                                 prof.softLocks[cat][stat] = {
                                     cap: sl.cap,
-                                    condition: String(sl.condition).slice(0, 300),
-                                    progress: (sl.progress || "").toString().slice(0, 400),
+                                    condition: String(sl.condition || "").trim().slice(0, 1500),
+                                    progress: String(sl.progress || "").trim().slice(0, 1500),
                                     met: false,
                                     setAtScene: sceneCount,
                                 };
@@ -615,6 +615,57 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
                 }
                 updateCharacterProfile(charUpdate.characterId, { softLocks: prof.softLocks });
                 dlog("[RST] Applied soft-lock changes:", { proposed: charUpdate.proposedSoftLocks, unlocked: charUpdate.unlockedSoftLocks });
+            }
+        }
+
+        // ── Hard lock pressure application ──
+        // Pressure tracks evidence against a lock's reason. It NEVER changes the
+        // stat value. Only stats that already have a hard lock can gain pressure.
+        const hasPressure = Array.isArray(charUpdate.hardLockPressureUpdates) && charUpdate.hardLockPressureUpdates.length > 0;
+        const hasReviews = Array.isArray(charUpdate.hardLockReviews) && charUpdate.hardLockReviews.length > 0;
+        if (hasPressure || hasReviews) {
+            const { getCharacterProfile, updateCharacterProfile, ensurePressure, HARD_LOCK_PRESSURE_MAX } = await import("../data/characters.js");
+            const prof = getCharacterProfile(charUpdate.characterId);
+            if (prof && prof.hardLocks) {
+                for (const pu of (charUpdate.hardLockPressureUpdates || [])) {
+                    if (!pu || !pu.stat) continue;
+                    const [cat, stat] = String(pu.stat).split(".");
+                    const lock = prof.hardLocks[cat]?.[stat];
+                    // Guard: pressure only applies where a hard lock actually exists.
+                    if (!lock || typeof lock.cap !== "number") continue;
+                    ensurePressure(lock);
+                    let change = parseInt(pu.change, 10);
+                    if (isNaN(change)) continue;
+                    change = Math.max(-2, Math.min(2, change));
+                    if (change === 0) continue;
+                    const before = lock.pressure.value;
+                    const max = lock.pressure.max || HARD_LOCK_PRESSURE_MAX;
+                    lock.pressure.value = Math.max(0, Math.min(max, before + change));
+                    lock.pressure.reason = String(pu.reason || "").trim().slice(0, 1500);
+                    lock.pressure.lastUpdated = Date.now();
+                    if (lock.pressure.value >= max) lock.pressure.needsReview = true;
+                    dlog(`[RST] Pressure ${cat}.${stat}: ${before} -> ${lock.pressure.value} (${change > 0 ? "+" : ""}${change})`);
+                }
+                // Attach any review recommendations the LLM provided for maxed locks.
+                for (const rv of (charUpdate.hardLockReviews || [])) {
+                    if (!rv || !rv.stat) continue;
+                    const [cat, stat] = String(rv.stat).split(".");
+                    const lock = prof.hardLocks[cat]?.[stat];
+                    if (!lock || typeof lock.cap !== "number") continue;
+                    ensurePressure(lock);
+                    // Only honor a review when the lock is actually at/over max pressure.
+                    if (lock.pressure.value < (lock.pressure.max || HARD_LOCK_PRESSURE_MAX)) continue;
+                    const rec = String(rv.recommendation || "maintain");
+                    const validRecs = ["maintain", "raise_cap", "convert_to_soft", "remove"];
+                    lock.pressure.needsReview = true;
+                    lock.pressure.recommendation = {
+                        recommendation: validRecs.includes(rec) ? rec : "maintain",
+                        recommendedCap: (typeof rv.recommendedCap === "number") ? Math.max(-100, Math.min(100, rv.recommendedCap)) : lock.cap,
+                        reason: String(rv.reason || "").trim().slice(0, 1500),
+                    };
+                }
+                updateCharacterProfile(charUpdate.characterId, { hardLocks: prof.hardLocks });
+                dlog("[RST] Applied hard-lock pressure changes.");
             }
         }
 

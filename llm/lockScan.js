@@ -19,6 +19,11 @@ import { getAllSceneSummaries } from "../data/scenes.js";
 import { makeRequest, getPersonaContext } from "./connections.js";
 import { dlog } from "../lib/debug.js";
 
+// Max characters preserved for lock free-text fields (reason/condition/progress).
+// Generous so psychologically detailed locks are never chopped after a complete
+// LLM response. Truncation beyond this only guards against pathological output.
+const LOCK_TEXT_MAX = 1500;
+
 /**
  * Run a lock scan across the library.
  * @returns {Promise<Array<{characterId, characterName, hardLocks: Array, softLocks: Array}>>}
@@ -204,7 +209,14 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
         let cap = Math.max(-100, Math.min(100, Math.round(l.cap)));
         const cur = char.stats[cat]?.[stat] ?? 0;
         if (cap < cur) cap = cur; // never cap below current value
-        validHard.push({ stat: `${cat}.${stat}`, cap, reason: (l.reason || "").toString().slice(0, 240) });
+        const hardReasonRaw = String(l.reason || "").trim();
+        const hardReasonStored = hardReasonRaw.slice(0, LOCK_TEXT_MAX);
+        if (hardReasonRaw.length > hardReasonStored.length) {
+            dlog(`[RST] Lock scan: hard reason for ${cat}.${stat} TRUNCATED by extension slice — raw ${hardReasonRaw.length} chars, stored ${hardReasonStored.length}. Raise LOCK_TEXT_MAX if this is unwanted.`);
+        } else {
+            dlog(`[RST] Lock scan: hard reason for ${cat}.${stat} stored intact (${hardReasonStored.length} chars).`);
+        }
+        validHard.push({ stat: `${cat}.${stat}`, cap, reason: hardReasonStored });
     }
 
     const validSoft = [];
@@ -216,7 +228,16 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
         let cap = Math.max(-100, Math.min(100, Math.round(l.cap)));
         const cur = char.stats[cat]?.[stat] ?? 0;
         if (cap < cur) cap = cur;
-        validSoft.push({ stat: `${cat}.${stat}`, cap, condition: String(l.condition).slice(0, 300), progress: (l.progress || "").toString().slice(0, 300) });
+        const condRaw = String(l.condition || "").trim();
+        const condStored = condRaw.slice(0, LOCK_TEXT_MAX);
+        const progRaw = String(l.progress || "").trim();
+        const progStored = progRaw.slice(0, LOCK_TEXT_MAX);
+        if (condRaw.length > condStored.length || progRaw.length > progStored.length) {
+            dlog(`[RST] Lock scan: soft text for ${cat}.${stat} TRUNCATED by extension slice — condition raw ${condRaw.length}/stored ${condStored.length}, progress raw ${progRaw.length}/stored ${progStored.length}.`);
+        } else {
+            dlog(`[RST] Lock scan: soft text for ${cat}.${stat} stored intact (condition ${condStored.length}, progress ${progStored.length} chars).`);
+        }
+        validSoft.push({ stat: `${cat}.${stat}`, cap, condition: condStored, progress: progStored });
     }
 
     return { hardLocks: validHard, softLocks: validSoft };

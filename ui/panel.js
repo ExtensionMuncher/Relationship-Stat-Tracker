@@ -62,8 +62,16 @@ export function createPanel() {
         $shell.append($pane);
     });
 
-    // Append to ST's extension settings area
-    $("#extensions_settings").append($container);
+    // Append to ST's extension settings area. If the expected container is
+    // temporarily unavailable, append to <body> as a last-resort fallback rather
+    // than leaving the extension completely invisible.
+    const $target = $("#extensions_settings");
+    if ($target.length) {
+        $target.append($container);
+    } else {
+        console.error("[RST] #extensions_settings not found; appending RST panel to body as fallback");
+        $("body").append($container);
+    }
 
     // ST's extensions.js listens on $('html') to close the extensions dropdown.
     // It checks if the click target is closest to #sd_gen, #extensionsMenuButton,

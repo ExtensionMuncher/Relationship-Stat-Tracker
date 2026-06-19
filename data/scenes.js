@@ -14,14 +14,16 @@ let sceneCounter = 0;
  */
 export function initSceneCounter() {
     const scenes = getScenes();
-    if (scenes.length === 0) {
+    if (!Array.isArray(scenes) || scenes.length === 0) {
         sceneCounter = 0;
         return;
     }
-    // Find the highest scene number
+    // Find the highest scene number. Be defensive: old/corrupt scene entries
+    // should not crash extension boot.
     let maxNum = 0;
     for (const scene of scenes) {
-        const match = scene.id.match(/scene_(\d+)/);
+        const id = String(scene?.id || "");
+        const match = id.match(/scene_(\d+)/);
         if (match) {
             maxNum = Math.max(maxNum, parseInt(match[1], 10));
         }
@@ -91,7 +93,7 @@ export function getAllScenes() {
  */
 export function getOpenScene() {
     const scenes = getScenes();
-    return scenes.find((s) => s.status === "open") || null;
+    return scenes.find((s) => s && typeof s === "object" && s.status === "open") || null;
 }
 
 /**
@@ -101,7 +103,7 @@ export function getOpenScene() {
  */
 export function getSceneById(sceneId) {
     const scenes = getScenes();
-    return scenes.find((s) => s.id === sceneId) || null;
+    return scenes.find((s) => s && typeof s === "object" && s.id === sceneId) || null;
 }
 
 /**
@@ -109,7 +111,7 @@ export function getSceneById(sceneId) {
  * @returns {Array<object>}
  */
 export function getClosedScenes() {
-    return getScenes().filter((s) => s.status === "closed");
+    return getScenes().filter((s) => s && typeof s === "object" && s.status === "closed");
 }
 
 /**
@@ -140,7 +142,7 @@ export function getClosedSceneCountForChar(charId) {
  */
 export function getAllSceneSummaries() {
     return getScenes()
-        .filter((s) => s.status === "closed" && s.llmSummary)
+        .filter((s) => s && typeof s === "object" && s.status === "closed" && s.llmSummary)
         .map((s) => ({ id: s.id, summary: s.llmSummary }));
 }
 

@@ -76,7 +76,7 @@ export function persistSettings() {
  */
 export function getCharacters() {
     ensureChatNamespace();
-    if (!chat_metadata[NAMESPACE].characters) {
+    if (!chat_metadata[NAMESPACE].characters || typeof chat_metadata[NAMESPACE].characters !== "object" || Array.isArray(chat_metadata[NAMESPACE].characters)) {
         chat_metadata[NAMESPACE].characters = {};
     }
     return chat_metadata[NAMESPACE].characters;
@@ -124,7 +124,7 @@ export function deleteCharacterData(charId) {
  */
 export function saveAllCharacters(characters) {
     ensureChatNamespace();
-    chat_metadata[NAMESPACE].characters = characters;
+    chat_metadata[NAMESPACE].characters = (characters && typeof characters === "object" && !Array.isArray(characters)) ? characters : {};
     saveChatDebounced();
 }
 
@@ -136,7 +136,7 @@ export function saveAllCharacters(characters) {
  */
 export function getFolders() {
     ensureChatNamespace();
-    if (!chat_metadata[NAMESPACE].folders) {
+    if (!Array.isArray(chat_metadata[NAMESPACE].folders)) {
         chat_metadata[NAMESPACE].folders = [];
     }
     return chat_metadata[NAMESPACE].folders;
@@ -158,16 +158,20 @@ export function saveFolders(folders) {
  * Ensure the RST namespace exists in chat_metadata.
  */
 function ensureChatNamespace() {
-    if (!chat_metadata[NAMESPACE]) {
-        chat_metadata[NAMESPACE] = {
-            scenes: [],
-            pendingUpdates: null,
-            presentCharacters: [],
-            messageCounter: 0,
-            characters: {},
-            folders: [],
-        };
+    if (!chat_metadata[NAMESPACE] || typeof chat_metadata[NAMESPACE] !== "object" || Array.isArray(chat_metadata[NAMESPACE])) {
+        chat_metadata[NAMESPACE] = {};
     }
+
+    // Defensive migration/backfill. Old chats/imports may have a partial rst
+    // namespace, and a missing scenes array can crash boot before the UI mounts.
+    const data = chat_metadata[NAMESPACE];
+    if (!Array.isArray(data.scenes)) data.scenes = [];
+    if (data.pendingUpdates === undefined) data.pendingUpdates = null;
+    if (!Array.isArray(data.presentCharacters)) data.presentCharacters = [];
+    if (typeof data.messageCounter !== "number") data.messageCounter = 0;
+    if (!data.characters || typeof data.characters !== "object" || Array.isArray(data.characters)) data.characters = {};
+    if (!Array.isArray(data.folders)) data.folders = [];
+    if (!Array.isArray(data.nameBlacklist)) data.nameBlacklist = [];
 }
 
 /**
@@ -185,6 +189,10 @@ export function getChatData() {
  */
 export function getScenes() {
     ensureChatNamespace();
+    if (!Array.isArray(chat_metadata[NAMESPACE].scenes)) {
+        chat_metadata[NAMESPACE].scenes = [];
+        saveChatDebounced();
+    }
     return chat_metadata[NAMESPACE].scenes;
 }
 
@@ -194,7 +202,7 @@ export function getScenes() {
  */
 export function saveScenes(scenes) {
     ensureChatNamespace();
-    chat_metadata[NAMESPACE].scenes = scenes;
+    chat_metadata[NAMESPACE].scenes = Array.isArray(scenes) ? scenes : [];
     saveChatDebounced();
 }
 
@@ -204,7 +212,7 @@ export function saveScenes(scenes) {
  */
 export function getPendingUpdates() {
     ensureChatNamespace();
-    return chat_metadata[NAMESPACE].pendingUpdates;
+    return chat_metadata[NAMESPACE].pendingUpdates || null;
 }
 
 /**
@@ -246,7 +254,11 @@ export function savePendingLockScan(results) {
  */
 export function getPresentCharacters() {
     ensureChatNamespace();
-    return chat_metadata[NAMESPACE].presentCharacters || [];
+    if (!Array.isArray(chat_metadata[NAMESPACE].presentCharacters)) {
+        chat_metadata[NAMESPACE].presentCharacters = [];
+        saveChatDebounced();
+    }
+    return chat_metadata[NAMESPACE].presentCharacters;
 }
 
 /**
@@ -255,7 +267,7 @@ export function getPresentCharacters() {
  */
 export function savePresentCharacters(charIds) {
     ensureChatNamespace();
-    chat_metadata[NAMESPACE].presentCharacters = charIds;
+    chat_metadata[NAMESPACE].presentCharacters = Array.isArray(charIds) ? charIds : [];
     saveChatDebounced();
 }
 
@@ -265,7 +277,11 @@ export function savePresentCharacters(charIds) {
  */
 export function getNameBlacklist() {
     ensureChatNamespace();
-    return chat_metadata[NAMESPACE].nameBlacklist || [];
+    if (!Array.isArray(chat_metadata[NAMESPACE].nameBlacklist)) {
+        chat_metadata[NAMESPACE].nameBlacklist = [];
+        saveChatDebounced();
+    }
+    return chat_metadata[NAMESPACE].nameBlacklist;
 }
 
 /**
@@ -274,7 +290,7 @@ export function getNameBlacklist() {
  */
 export function saveNameBlacklist(names) {
     ensureChatNamespace();
-    chat_metadata[NAMESPACE].nameBlacklist = names;
+    chat_metadata[NAMESPACE].nameBlacklist = Array.isArray(names) ? names : [];
     saveChatDebounced();
 }
 
@@ -284,7 +300,7 @@ export function saveNameBlacklist(names) {
  */
 export function getMessageCounter() {
     ensureChatNamespace();
-    return chat_metadata[NAMESPACE].messageCounter || 0;
+    return typeof chat_metadata[NAMESPACE].messageCounter === "number" ? chat_metadata[NAMESPACE].messageCounter : 0;
 }
 
 /**
@@ -351,7 +367,7 @@ export function getDefaultSettings() {
         statChangeRange: { min: -5, max: 5 },
         criticalChanges: {
             enabled: true,
-            chance: 7,        // % chance an LLM-flagged stat actually goes critical
+            chance: 15,       // % chance an LLM-flagged stat actually goes critical (default; existing saved values are preserved)
             multiplier: 3,    // critical changes get this x the normal range ceiling
         },
         hardLocks: {
