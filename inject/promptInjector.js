@@ -7,7 +7,7 @@
  
 import { setExtensionPrompt } from "../../../../../script.js";
 import { getSettings, getPresentCharacters } from "../data/storage.js";
-import { getCharacterProfile, getAllCharacters, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
+import { getCharacterProfile, getAllCharacters, STAT_CATEGORIES, STAT_NAMES, getVisibleStatCategories } from "../data/characters.js";
 
 // ─── Constants ────────────────────────────────────────────
 
@@ -247,13 +247,16 @@ export function buildCharacterBlock(profile, settings) {
     // ── Stats (always markdown subheaders) ────────────────
     const format = settings.injection.format || "stats_and_narrative";
 
-    // Get latest commentary from the most recent updateLog entry (if any)
+    // Get latest commentary from the most recent updateLog entry (if any).
+    // NOTE: addUpdateLogEntry uses unshift(), so the NEWEST entry is at index 0,
+    // not at the end. Reading the end was the stale-commentary bug.
     const latestLog = profile.updateLog && profile.updateLog.length > 0
-        ? profile.updateLog[profile.updateLog.length - 1]
+        ? profile.updateLog[0]
         : null;
     const commentary = latestLog?.commentary || {};
 
-    for (const cat of STAT_CATEGORIES) {
+    const visibleCategories = getVisibleStatCategories(profile);
+    for (const cat of visibleCategories) {
         const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
         const stats = profile.stats[cat] || {};
         const catCommentary = commentary[cat] || {};

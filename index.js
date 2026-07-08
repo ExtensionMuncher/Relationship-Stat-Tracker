@@ -15,7 +15,16 @@ import { eventSource, event_types } from "../../../../scripts/events.js";
 import { extension_settings } from "../../../../scripts/extensions.js";
 
 import { initSettings, isEnabled, getSetting } from "./settings.js";
-import { getSettings, getPresentCharacters, savePresentCharacters, getNameBlacklist, getMessageCounter, incrementMessageCounter, getPendingUpdates, savePendingUpdates } from "./data/storage.js";
+import {
+    getSettings,
+    getPresentCharacters,
+    savePresentCharacters,
+    getNameBlacklist,
+    setMessageCounter,
+    syncMessageCounterToLiveCount,
+    getPendingUpdates,
+    savePendingUpdates,
+} from "./data/storage.js";
 import { createCharacter, findCharacterByName, findCharacterByFuzzyName } from "./data/characters.js";
 import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary, updateSceneTitle } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
@@ -40,7 +49,13 @@ let _sidecarRunning = false;
 // ─── Message deduplication guard ─────────────────────────
 // ST may fire MESSAGE_RECEIVED/SENT multiple times for the same message
 // (e.g., during streaming + at completion). This Set prevents double-counting.
+// Important: this is session-only and must be cleared if the live chat shrinks
+// after message deletion, because SillyTavern reuses/renumbers mesIds.
 const _processedMesIds = new Set();
+
+// Tracks the live chat size so deletion/renumbering can be detected even if ST
+// does not emit a dedicated delete event before the next MESSAGE_SENT/RECEIVED.
+let _lastObservedChatLength = Array.isArray(chat) ? chat.length : 0;
 
 // ─── Rejected names (in-memory, session-only) ────────────
 // Names the user clicked "Ignore" on in the new-character popup.
@@ -194,6 +209,65 @@ function safeStep(label, fn) {
     }
 }
 
+// ─── Runtime Message State ────────────────────────────────
+
+/**
+ * Return the current live chat message count, preferring the event mesId when it
+ * is available because ST passes the freshly rendered message index directly.
+ * ST mesIds are zero-based, so mesId 143 means 144 live message slots.
+ * @param {number|string|null} [mesId]
+ * @returns {number}
+ */
+function getLiveMessageCount(mesId = null) {
+    const chatLength = Array.isArray(chat) ? chat.length : 0;
+    const parsed = mesId !== null && mesId !== undefined ? parseInt(mesId, 10) : NaN;
+    const fromMesId = Number.isFinite(parsed) && parsed >= 0 ? parsed + 1 : 0;
+    return Math.max(chatLength, fromMesId);
+}
+
+/**
+ * Keep session-only message bookkeeping aligned with the live chat. This fixes
+ * the "deleted OOC messages strand the sidecar until the old message number"
+ * case by clearing processed mesIds when the chat shrinks, then clamping the
+ * saved sidecar counter so it cannot point past the current chat length.
+ * @param {string} reason
+ * @param {number|string|null} [mesId]
+ * @returns {number} current live message count
+ */
+function syncRuntimeMessageState(reason = "unknown", mesId = null) {
+    const liveCount = getLiveMessageCount(mesId);
+
+    if (liveCount < _lastObservedChatLength) {
+        const previousLength = _lastObservedChatLength;
+        _processedMesIds.clear();
+        const sync = syncMessageCounterToLiveCount(liveCount);
+        dlog(`[RST] Live chat shrank (${previousLength} → ${liveCount}) during ${reason}; cleared processed message IDs.` +
+            (sync.changed ? ` Sidecar counter clamped ${sync.previous} → ${sync.counter}.` : ""));
+    } else {
+        const sync = syncMessageCounterToLiveCount(liveCount);
+        if (sync.changed) {
+            dlog(`[RST] Sidecar counter clamped ${sync.previous} → ${sync.counter} during ${reason}.`);
+        }
+    }
+
+    _lastObservedChatLength = liveCount;
+    return liveCount;
+}
+
+/**
+ * Chat switches and destructive edits invalidate session-only mesId caches.
+ * Per-chat RST data is stored in chat_metadata, but the processed-id guard is
+ * only in memory, so it must be reset when the visible chat changes shape.
+ * @param {string} reason
+ */
+function resetRuntimeMessageState(reason = "chat changed") {
+    _processedMesIds.clear();
+    _lastObservedChatLength = getLiveMessageCount();
+    const sync = syncMessageCounterToLiveCount(_lastObservedChatLength);
+    dlog(`[RST] Runtime message state reset (${reason}); liveCount=${_lastObservedChatLength}` +
+        (sync.changed ? `, sidecar counter clamped ${sync.previous} → ${sync.counter}` : ""));
+}
+
 // ─── Event Handlers ───────────────────────────────────────
 
 /**
@@ -216,6 +290,14 @@ function registerEventHandlers() {
     // Chat changed — re-render everything
     eventSource.on(event_types.CHAT_CHANGED, () => {
         onChatChanged();
+    });
+
+    // Message deletion/edits can renumber mesIds without a full extension reload.
+    // Register defensively only for event names that exist in this ST build.
+    ["MESSAGE_DELETED", "MESSAGE_EDITED", "MESSAGE_SWIPED", "CHAT_DELETED"].forEach((eventName) => {
+        const eventType = event_types[eventName];
+        if (!eventType) return;
+        eventSource.on(eventType, () => resetRuntimeMessageState(eventName));
     });
 
     // Scenes deleted / chat data changed — re-add scene buttons to all messages
@@ -251,7 +333,11 @@ async function onMessageReceived(mesId, skipSidecar = false) {
         return;
     }
 
+    const liveCount = syncRuntimeMessageState("message event", mesId);
+
     // ── Deduplication: skip if this mesId was already processed ──
+    // If messages were deleted, syncRuntimeMessageState() clears this Set before
+    // we get here, so newly-renumbered messages are not mistaken for old ones.
     if (mesId !== undefined && _processedMesIds.has(mesId)) {
         dlog("[RST] onMessageReceived: skipping duplicate mesId=" + mesId);
         return;
@@ -270,24 +356,39 @@ async function onMessageReceived(mesId, skipSidecar = false) {
         return;
     }
 
-    // Sidecar detection check
+    // Sidecar detection check. The saved messageCounter is now treated as the
+    // live message count at the last sidecar scan/baseline, not as a permanent
+    // high-water counter. That means deleted OOC messages cannot strand it in
+    // the future.
     const settings = getSettings();
-    const counter = incrementMessageCounter();
     const frequency = settings.scanFrequency || 5;
+    const sync = syncMessageCounterToLiveCount(liveCount);
+    const lastScanCount = sync.counter;
+    const messagesSinceScan = Math.max(0, liveCount - lastScanCount);
+    const shouldFire = messagesSinceScan >= frequency;
 
-    dlog("[RST] onMessageReceived: mesId=" + mesId + " counter=" + counter + " frequency=" + frequency +
-        " shouldFire=" + (counter % frequency === 0));
+    dlog("[RST] onMessageReceived: mesId=" + mesId +
+        " liveCount=" + liveCount +
+        " lastSidecarCount=" + lastScanCount +
+        " sinceLastScan=" + messagesSinceScan +
+        " frequency=" + frequency +
+        " shouldFire=" + shouldFire);
 
-    if (counter % frequency === 0) {
+    if (shouldFire) {
         // Re-entrancy guard — skip if a sidecar detection is already in progress
         if (_sidecarRunning) {
-            console.warn("[RST] Sidecar detection already in progress, skipping duplicate call (counter=" + counter + ")");
+            console.warn("[RST] Sidecar detection already in progress, skipping duplicate call (liveCount=" + liveCount + ")");
             return;
         }
 
+        // Advance the baseline as soon as the run begins. This matches the old
+        // behavior where failed sidecar calls still advanced the counter instead
+        // of retrying every single message.
+        setMessageCounter(liveCount);
+
         _sidecarRunning = true;
         const profileName = settings.connections?.sidecarLLM || "(none)";
-        dlog("[RST] Sidecar detection start (counter=" + counter + ", frequency=" + frequency + ", profile=" + profileName + ")");
+        dlog("[RST] Sidecar detection start (liveCount=" + liveCount + ", frequency=" + frequency + ", profile=" + profileName + ")");
 
         try {
             const result = await detectCharacters();
@@ -396,6 +497,8 @@ async function onMessageReceived(mesId, skipSidecar = false) {
  * Warns if there are pending updates from the previous chat.
  */
 function onChatChanged() {
+    resetRuntimeMessageState("CHAT_CHANGED");
+
     // Warn about pending updates in the previous chat
     // (pending updates are stored per-chat and persist across switches)
     const pending = getPendingUpdates();
@@ -534,13 +637,20 @@ function addSceneButtons(mesId) {
     });
 
     $endBtn.on("click", async () => {
+        // Prevent double-clicks from starting overlapping stat-update calls.
+        if ($endBtn.hasClass("rst-scene-processing")) {
+            toastr?.info?.("Scene close is already processing. Waiting for the stat-update LLM...");
+            return;
+        }
+
         const openScene = getOpenScene();
         if (!openScene) {
             toastr?.warning?.("No open scene to close.");
             return;
         }
 
-        // Close the scene
+        // Close the scene immediately, before the expensive LLM call.
+        // This makes the close operation visible even when GLM / the API is slow.
         const closedScene = closeScene(openScene.id, mesId);
         if (!closedScene) {
             console.error("[RST] closeScene returned null for scene:", openScene.id, "status:", openScene.status);
@@ -548,13 +658,26 @@ function addSceneButtons(mesId) {
             return;
         }
 
+        // Reflect the closed state in the UI right away instead of waiting for
+        // generateStatUpdate(). Without this, a slow GLM call makes the scene
+        // look like it did not close until a refresh.
+        $startBtn.removeClass("rst-scene-active");
+        renderScenesTab(getPane("scenes"));
+        $(document).trigger("rst:refresh-message-buttons");
+
         // Show processing indicator — disable button and show spinner
         $endBtn.addClass("rst-scene-processing");
         $endBtn.find("i").removeClass("fa-stop").addClass("fa-spinner fa-spin");
-        toastr?.info?.("Scene closed. Generating stat updates... (may take a moment)");
+        toastr?.info?.("Scene closed. Generating stat updates with the selected LLM...");
 
         // Show persistent loading indicator in panel (survives tab switches)
         showPanelLoading("Generating stat updates...");
+
+        const startedAt = Date.now();
+        const slowNoticeTimer = setTimeout(() => {
+            toastr?.info?.("Still generating stat updates. The scene is already closed; the LLM call is just taking a while.");
+            showPanelLoading("Still generating stat updates...");
+        }, 45000);
 
         // Trigger stat update flow
         try {
@@ -568,25 +691,29 @@ function addSceneButtons(mesId) {
             // Store pending updates
             savePendingUpdates(result);
 
-            toastr?.success?.("Stat updates ready for review! Check the Home tab.");
+            const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+            toastr?.success?.(`Stat updates ready for review! Check the Home tab. (${elapsedSeconds}s)`);
 
             // Refresh UI
             const $homePane = getPane("home");
             renderHomeTab($homePane);
-            renderScenesTab(getPane("scenes"));
         } catch (err) {
             console.error("[RST] Stat update failed after scene close:", err);
-            toastr?.error?.("Stat update generation failed. Please try again from the Home tab.");
+            toastr?.error?.("Scene is closed, but stat update generation failed. Check the console for the LLM/API error.");
         } finally {
+            clearTimeout(slowNoticeTimer);
+
             // Hide persistent loading indicator
             hidePanelLoading();
 
             // Restore button state
             $endBtn.removeClass("rst-scene-processing");
             $endBtn.find("i").removeClass("fa-spinner fa-spin").addClass("fa-stop");
-        }
 
-        $startBtn.removeClass("rst-scene-active");
+            // Always refresh the scenes tab after the LLM stage, even on failure.
+            renderScenesTab(getPane("scenes"));
+            $(document).trigger("rst:refresh-message-buttons");
+        }
     });
 
     $messageBar.prepend($endBtn);

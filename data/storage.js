@@ -304,6 +304,26 @@ export function getMessageCounter() {
 }
 
 /**
+ * Set and save the message counter.
+ *
+ * Historically this value was a simple ever-incrementing sidecar counter. It is
+ * now treated as the live chat message count at the last sidecar scan/baseline.
+ * Keeping the same field name preserves old chat metadata while allowing the
+ * scheduler to recover when messages are deleted and SillyTavern renumbers the chat.
+ *
+ * @param {number} value
+ * @returns {number} Saved counter value
+ */
+export function setMessageCounter(value) {
+    ensureChatNamespace();
+    const parsed = Number(value);
+    const safeValue = Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+    chat_metadata[NAMESPACE].messageCounter = safeValue;
+    saveChatDebounced();
+    return chat_metadata[NAMESPACE].messageCounter;
+}
+
+/**
  * Increment and save the message counter.
  * @returns {number} New counter value
  */
@@ -312,6 +332,35 @@ export function incrementMessageCounter() {
     chat_metadata[NAMESPACE].messageCounter = (chat_metadata[NAMESPACE].messageCounter || 0) + 1;
     saveChatDebounced();
     return chat_metadata[NAMESPACE].messageCounter;
+}
+
+/**
+ * Clamp the sidecar message counter to the current live chat size.
+ *
+ * This prevents deleted messages from stranding the sidecar scheduler in the
+ * future. Example: a chat grows to message 170, then OOC messages are deleted
+ * and the visible/live chat returns to 143. The saved counter must not remain
+ * at 170, or the sidecar will act like it has already processed messages that
+ * no longer exist.
+ *
+ * @param {number} liveMessageCount Current live chat.length / mesId + 1
+ * @returns {{counter:number, previous:number, changed:boolean}}
+ */
+export function syncMessageCounterToLiveCount(liveMessageCount) {
+    ensureChatNamespace();
+    const parsed = Number(liveMessageCount);
+    const live = Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+    const previous = typeof chat_metadata[NAMESPACE].messageCounter === "number"
+        ? chat_metadata[NAMESPACE].messageCounter
+        : 0;
+
+    if (previous > live) {
+        chat_metadata[NAMESPACE].messageCounter = live;
+        saveChatDebounced();
+        return { counter: live, previous, changed: true };
+    }
+
+    return { counter: previous, previous, changed: false };
 }
 
 /**

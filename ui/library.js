@@ -32,6 +32,9 @@ import {
     getUnfiledCharacters,
     STAT_CATEGORIES,
     STAT_NAMES,
+    createBlankStatCategoryVisibility,
+    ensureStatCategoryVisibility,
+    isStatCategoryVisible,
 } from "../data/characters.js";
 import { generateProfile } from "../llm/profileGen.js";
 import { formatTimeAgo } from "../data/scenes.js";
@@ -503,6 +506,17 @@ function renderCharacterCard($pane, profile) {
     const folder = folders.find((f) => f.id === profile.folderId);
     const folderName = folder ? folder.name : null;
     const hasAvatar = !!profile.avatar;
+    ensureStatCategoryVisibility(profile);
+    const descHidden = !!profile.suppressDescriptionInjection;
+    const notesHidden = !!profile.suppressNotesInjection;
+    const hiddenStatCats = STAT_CATEGORIES.filter((cat) => !isStatCategoryVisible(profile, cat));
+    const anyVisibilityHidden = descHidden || notesHidden || hiddenStatCats.length > 0;
+    const allVisibilityHidden = descHidden && notesHidden && hiddenStatCats.length === STAT_CATEGORIES.length;
+    const eyeBtnClass = allVisibilityHidden ? "eye-off" : (anyVisibilityHidden ? "eye-partial" : "");
+    const eyeIcon = allVisibilityHidden ? "fa-eye-slash" : "fa-eye";
+    const eyeTitle = anyVisibilityHidden
+        ? `Some fields hidden from prompts/LLM updates: ${[descHidden ? "Personality" : "", notesHidden ? "Notes" : "", ...hiddenStatCats.map(c => c.charAt(0).toUpperCase() + c.slice(1) + " stats")].filter(Boolean).join(", ")}`
+        : "All RST fields visible to prompts/LLM updates";
 
     let avContent = `<span>${initials}</span>`;
     if (hasAvatar) {
@@ -538,7 +552,7 @@ function renderCharacterCard($pane, profile) {
             </div>
             </div>
             <div class="rst-char-actions" style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;margin-top:10px">
-                <button class="rst-icon-btn rst-eye-btn ${(profile.suppressDescriptionInjection && profile.suppressNotesInjection) ? 'eye-off' : ((profile.suppressDescriptionInjection || profile.suppressNotesInjection) ? 'eye-partial' : '')}" title="${(profile.suppressDescriptionInjection && profile.suppressNotesInjection) ? 'Personality & Notes hidden from the main AI' : ((profile.suppressDescriptionInjection || profile.suppressNotesInjection) ? 'Some profile info hidden from the main AI' : 'Personality & Notes sent to the main AI')}"><i class="fa-solid ${(profile.suppressDescriptionInjection && profile.suppressNotesInjection) ? 'fa-eye-slash' : 'fa-eye'}"></i></button>
+                <button class="rst-icon-btn rst-eye-btn ${eyeBtnClass}" title="${eyeTitle.replace(/"/g, '&quot;')}"><i class="fa-solid ${eyeIcon}"></i></button>
                 <button class="rst-icon-btn rst-wand-btn" title="Generate profile"><i class="fa-solid fa-wand-magic-sparkles"></i></button>
                 <button class="rst-icon-btn rst-edit-btn" title="Edit stats"><i class="fa-solid fa-pen"></i></button>
                 <button class="rst-icon-btn rst-log-btn" title="Update log"><i class="fa-solid fa-clock-rotate-left"></i></button>
@@ -1278,7 +1292,17 @@ function renderStatCategoryForLibrary(cat, profile) {
         : cat === "romantic" ? "fa-heart"
         : "fa-fire";
     const $cat = $(`<div class="rst-d-cat"></div>`);
-    $cat.append(`<div class="rst-d-cat-h"><i class="fa-solid ${catIcon}"></i> ${catTitle}</div>`);
+    const catVisible = isStatCategoryVisible(profile, cat);
+    const visIcon = catVisible ? "fa-eye" : "fa-eye-slash";
+    const visTitle = catVisible
+        ? `Hide ${catTitle} from main prompt injection, Stat Update LLM, and Scan Locks for this character`
+        : `Show ${catTitle} to main prompt injection, Stat Update LLM, and Scan Locks for this character`;
+    const hiddenBadge = catVisible ? "" : `<span style="font-size:10px;color:var(--rst-text-muted);font-weight:400" title="Hidden from main prompt injection, Stat Update LLM, and Scan Locks"><i class="fa-solid fa-eye-slash"></i> hidden from LLM</span>`;
+    $cat.append(`<div class="rst-d-cat-h" style="display:flex;align-items:center;gap:6px"><span><i class="fa-solid ${catIcon}"></i> ${catTitle}</span>${hiddenBadge}<button class="rst-icon-btn rst-cat-vis-toggle" style="margin-left:auto;padding:1px 5px;font-size:10px" title="${visTitle}"><i class="fa-solid ${visIcon}"></i></button></div>`);
+    $cat.find(".rst-cat-vis-toggle").on("click", async function (e) {
+        e.stopPropagation();
+        await toggleStatCategoryVisibility(profile, cat);
+    });
 
     for (const stat of STAT_NAMES) {
         const val = profile.stats[cat][stat];
@@ -1501,34 +1525,64 @@ async function editHardLock(profile, cat, stat) {
  * condition/progress or removing a lock manually. Editing the prose condition
  * is also offered.
  */
+async function toggleStatCategoryVisibility(profile, cat) {
+    const prof = getCharacterProfile(profile.id);
+    if (!prof) return;
+    const nextVisibility = { ...createBlankStatCategoryVisibility(), ...(prof.statCategoryVisibility || {}) };
+    const currentlyVisible = nextVisibility[cat] !== false;
+    nextVisibility[cat] = !currentlyVisible;
+    updateCharacterProfile(profile.id, { statCategoryVisibility: nextVisibility });
+    const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
+    toastr?.info?.(`${catTitle} stats for ${profile.name} are now ${nextVisibility[cat] ? "visible to prompts/LLMs" : "hidden from prompts/LLMs"}.`);
+    try { const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); } catch (e) {}
+    reRenderCharacterList($("#rst-p-lib"));
+}
+
 /**
  * Show the injection-visibility modal (eyeball toggle). Lets the user hide a
- * character's Personality (description) and/or Notes from the MAIN AI prompt
- * independently. Useful when the main character card already carries that info
- * and re-injecting it via RST would be redundant. Stats/narrative still inject.
+ * character's Personality (description), Notes, and stat categories from
+ * prompt injection and RST internal LLM update/lock passes.
  */
 async function showInjectionVisibilityModal(profile) {
-    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    const { getCharacterProfile, updateCharacterProfile, createBlankStatCategoryVisibility, ensureStatCategoryVisibility } = await import("../data/characters.js");
     const p = getCharacterProfile(profile.id);
+    ensureStatCategoryVisibility(p);
+
     const descHidden = !!p.suppressDescriptionInjection;
     const notesHidden = !!p.suppressNotesInjection;
-    const anythingHidden = descHidden || notesHidden;
+    const vis = { ...createBlankStatCategoryVisibility(), ...(p.statCategoryVisibility || {}) };
+    const hiddenCats = STAT_CATEGORIES.filter((cat) => vis[cat] === false);
+    const anythingHidden = descHidden || notesHidden || hiddenCats.length > 0;
 
     const safeName = $("<div>").text(profile.name).html();
+    const catRows = STAT_CATEGORIES.map((cat) => {
+        const label = cat.charAt(0).toUpperCase() + cat.slice(1);
+        const checked = vis[cat] === false ? "checked" : "";
+        return `
+            <label style="display:flex;align-items:flex-start;gap:8px;margin-bottom:8px;cursor:pointer">
+                <input type="checkbox" id="rst-vis-cat-${cat}" ${checked}>
+                <span><b>Hide ${label} stats</b><br><span style="color:var(--rst-text-muted);font-size:11px">Excludes this category from main prompt injection, Stat Update LLM adjustments, and Scan Locks.</span></span>
+            </label>`;
+    }).join("");
+
     const html = `
         <div style="text-align:left;font-size:13px;line-height:1.6">
-            <div style="margin-bottom:10px;color:var(--rst-text-muted);font-size:12px">Choose what to HIDE from the main AI for <b>${safeName}</b>. Stats and narrative are always sent.</div>
+            <div style="margin-bottom:10px;color:var(--rst-text-muted);font-size:12px">Choose what to HIDE for <b>${safeName}</b>. These settings apply only to this character profile.</div>
+            <div style="font-weight:600;margin:6px 0 4px">Profile text sent to the main AI</div>
             <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
                 <input type="checkbox" id="rst-vis-desc" ${descHidden ? "checked" : ""}> Hide Personality
             </label>
             <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
                 <input type="checkbox" id="rst-vis-notes" ${notesHidden ? "checked" : ""}> Hide Notes
             </label>
-            ${anythingHidden ? `<label style="display:flex;align-items:center;gap:8px;margin-top:6px;padding-top:8px;border-top:1px solid var(--rst-border);cursor:pointer"><input type="checkbox" id="rst-vis-showall"> <b>Show all</b> (send both to the main AI)</label>` : ""}
+
+            <div style="font-weight:600;margin:10px 0 4px;padding-top:8px;border-top:1px solid var(--rst-border)">Relationship stat categories</div>
+            ${catRows}
+
+            ${anythingHidden ? `<label style="display:flex;align-items:center;gap:8px;margin-top:6px;padding-top:8px;border-top:1px solid var(--rst-border);cursor:pointer"><input type="checkbox" id="rst-vis-showall"> <b>Show all</b> (unhide profile text and all stat categories)</label>` : ""}
         </div>`;
 
     const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Save", cancelButton: "Cancel" });
-    // Grab the live dialog so we can read checkbox state when the user saves.
     const showPromise = popup.show();
     const $dlg = $("dialog.popup").last();
     const result = await showPromise;
@@ -1539,24 +1593,35 @@ async function showInjectionVisibilityModal(profile) {
         return !!(el && el.checked);
     };
     const showAll = readChk("rst-vis-showall");
-    let nextDesc, nextNotes;
+    let nextDesc, nextNotes, nextVisibility;
     if (showAll) {
         nextDesc = false;
         nextNotes = false;
+        nextVisibility = createBlankStatCategoryVisibility();
     } else {
         nextDesc = readChk("rst-vis-desc");
         nextNotes = readChk("rst-vis-notes");
+        nextVisibility = createBlankStatCategoryVisibility();
+        for (const cat of STAT_CATEGORIES) {
+            nextVisibility[cat] = !readChk(`rst-vis-cat-${cat}`);
+        }
     }
 
     updateCharacterProfile(profile.id, {
         suppressDescriptionInjection: nextDesc,
         suppressNotesInjection: nextNotes,
+        statCategoryVisibility: nextVisibility,
     });
 
-    const msg = (!nextDesc && !nextNotes) ? "Personality & Notes will be sent to the main AI."
-        : (nextDesc && nextNotes) ? "Personality & Notes hidden from the main AI."
-        : nextDesc ? "Personality hidden; Notes still sent."
-        : "Notes hidden; Personality still sent.";
+    const hiddenNames = [];
+    if (nextDesc) hiddenNames.push("Personality");
+    if (nextNotes) hiddenNames.push("Notes");
+    for (const cat of STAT_CATEGORIES) {
+        if (nextVisibility[cat] === false) hiddenNames.push(cat.charAt(0).toUpperCase() + cat.slice(1) + " stats");
+    }
+    const msg = hiddenNames.length === 0
+        ? "All profile fields and stat categories are visible."
+        : `Hidden for ${profile.name}: ${hiddenNames.join(", ")}.`;
     toastr?.info?.(msg);
 
     try { const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); } catch (e) {}
@@ -1583,7 +1648,7 @@ async function editSoftLock(profile, cat, stat) {
             <label class="rst-lockedit-label">Cap %</label>
             <input type="number" id="rst-sl-cap" class="rst-lockedit-cap" value="${curCap}" min="-100" max="100" placeholder="e.g. 45">
             <label class="rst-lockedit-label">Condition to unlock</label>
-            <textarea id="rst-sl-cond" class="rst-lockedit-reason" rows="3" placeholder="What must happen for this stat to unlock — e.g. 'Sachiko must reveal a genuine vulnerability of her own before he lowers this guard.'">${$("<div>").text(curCond).html()}</textarea>
+            <textarea id="rst-sl-cond" class="rst-lockedit-reason" rows="3" placeholder="What must happen for this stat to unlock — e.g. '{{user}} must reveal a genuine vulnerability of their own before this guard comes down.'">${$("<div>").text(curCond).html()}</textarea>
             <label class="rst-lockedit-label">Progress notes</label>
             <textarea id="rst-sl-prog" class="rst-lockedit-reason" rows="3" placeholder="Running notes toward the condition (optional).">${$("<div>").text(curProg).html()}</textarea>
             ${sl.met ? `<label class="rst-scan-discard"><input type="checkbox" id="rst-sl-relock"> Re-lock this (treat condition as not yet met)</label>` : ""}

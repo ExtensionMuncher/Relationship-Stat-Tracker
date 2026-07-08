@@ -41,6 +41,52 @@ export function createBlankStats() {
 }
 
 /**
+ * Create a per-character visibility map for relationship stat categories.
+ * These flags control whether a category is injected into the main prompt AND
+ * whether RST internal LLM passes may see/modify/lock that category.
+ * true = visible/active, false = hidden/ignored by LLMs.
+ */
+export function createBlankStatCategoryVisibility() {
+    const visibility = {};
+    for (const cat of STAT_CATEGORIES) {
+        visibility[cat] = true;
+    }
+    return visibility;
+}
+
+/**
+ * Backfill/normalize category visibility for older profiles.
+ * Defaults to all categories visible so existing behavior is preserved.
+ */
+export function ensureStatCategoryVisibility(profile) {
+    if (!profile) return createBlankStatCategoryVisibility();
+    if (!profile.statCategoryVisibility || typeof profile.statCategoryVisibility !== "object" || Array.isArray(profile.statCategoryVisibility)) {
+        profile.statCategoryVisibility = createBlankStatCategoryVisibility();
+    }
+    for (const cat of STAT_CATEGORIES) {
+        if (typeof profile.statCategoryVisibility[cat] !== "boolean") {
+            profile.statCategoryVisibility[cat] = true;
+        }
+    }
+    // Drop obsolete keys to keep exports tidy.
+    for (const key of Object.keys(profile.statCategoryVisibility)) {
+        if (!STAT_CATEGORIES.includes(key)) delete profile.statCategoryVisibility[key];
+    }
+    return profile.statCategoryVisibility;
+}
+
+export function isStatCategoryVisible(profile, cat) {
+    if (!STAT_CATEGORIES.includes(cat)) return false;
+    const visibility = ensureStatCategoryVisibility(profile);
+    return visibility[cat] !== false;
+}
+
+export function getVisibleStatCategories(profile) {
+    ensureStatCategoryVisibility(profile);
+    return STAT_CATEGORIES.filter((cat) => isStatCategoryVisible(profile, cat));
+}
+
+/**
  * Create a blank hard-lock map mirroring the stats shape.
  * Each entry is { cap: number|null, reason: string }.
  *   cap = null  -> no lock on this stat
@@ -225,6 +271,7 @@ export function createCharacter(name, options = {}) {
         softLocks: options.softLocks || createBlankSoftLocks(),
         suppressDescriptionInjection: options.suppressDescriptionInjection || false,
         suppressNotesInjection: options.suppressNotesInjection || false,
+        statCategoryVisibility: options.statCategoryVisibility || createBlankStatCategoryVisibility(),
 
         dynamicTitle: options.dynamicTitle || "",
         narrativeSummary: options.narrativeSummary || "",
@@ -285,6 +332,8 @@ export function getCharacterProfile(charId) {
  */
 function normalizeProfileLocks(profile) {
     if (!profile) return profile;
+    ensureStatCategoryVisibility(profile);
+
     if (!profile.hardLocks) {
         profile.hardLocks = createBlankLocks();
     } else {
@@ -353,7 +402,7 @@ export function findCharacterByName(name) {
         }
     }
 
-    // 3. Word-set match (e.g., "Satoru Gojo" ↔ "Gojo Satoru")
+    // 3. Word-set match (e.g., "Jane Doe" ↔ "Doe Jane")
     const nameWords = lowerName.split(/\s+/).filter(Boolean).sort().join(" ");
     for (const c of all) {
         const cWords = c.name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
@@ -367,7 +416,7 @@ export function findCharacterByName(name) {
         }
     }
 
-    // 4. Substring match (e.g., "Gojo" matches inside "Satoru Gojo")
+    // 4. Substring match (e.g., "Doe" matches inside "Jane Doe")
     for (const c of all) {
         // Check if the name is a substring of the character's main name, or vice versa
         const cNameLower = c.name.toLowerCase().trim();
@@ -443,7 +492,7 @@ export function getCharacterNameVariants(profile) {
 
 /**
  * Find a character by word-set similarity (same words, different order).
- * Detects collisions like "Satoru Gojo" ↔ "Gojo Satoru".
+ * Detects collisions like "Jane Doe" ↔ "Doe Jane".
  * @param {string} name
  * @returns {object|null}
  */
@@ -526,7 +575,7 @@ export function updateCharacterProfile(charId, updates) {
     const profile = getStoredCharacter(charId);
     if (!profile) return;
 
-    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary", "folderId", "avatar", "hardLocks", "softLocks", "suppressDescriptionInjection", "suppressNotesInjection"];
+    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary", "folderId", "avatar", "hardLocks", "softLocks", "suppressDescriptionInjection", "suppressNotesInjection", "statCategoryVisibility"];
     for (const field of allowedFields) {
         if (updates[field] !== undefined) {
             profile[field] = updates[field];

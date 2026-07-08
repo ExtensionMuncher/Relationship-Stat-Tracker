@@ -23,15 +23,15 @@ const EXCLUDED_NAMES = new Set(["{{user}}", "user", "User"]);
 /**
  * Normalize a name for comparison by stripping parenthetical annotations,
  * normalizing diacritics (ō -> o, ū -> u, etc.), and lowercasing.
- * This allows LLM-returned names like "Satoru Gojō" or "Ryōmen Sukuna (referenced)"
- * to match chat speaker names like "Satoru Gojo" or "Ryomen Sukuna".
+ * This allows LLM-returned names like "José Muñoz" or "Renée Dubois (referenced)"
+ * to match chat speaker names like "Jose Munoz" or "Renee Dubois".
  * @param {string} name
  * @returns {string} Normalized name, or empty string if name is invalid.
  */
 function normalizeNameForComparison(name) {
     if (!name) return "";
     let cleaned = name
-        // Strip parenthetical annotations: "(referenced)", "(Sukuna)", etc.
+        // Strip parenthetical annotations: "(referenced)", "(Renee)", etc.
         .replace(/\s*\([^)]*\)\s*/g, "")
         .trim();
     if (!cleaned) return "";
@@ -181,7 +181,7 @@ export async function runBatchScan() {
     // --- Multi-character RP detection ---
     // In multi-character roleplay, a single {{char}} card generates ALL character dialogue,
     // so every assistant message has msg.name = the character card's display name
-    // (e.g., "JJK High School AU RPG"). Individual character names like "Sukuna", "Gojō"
+    // (e.g., "High School AU RPG"). Individual character names like "Renee", "José"
     // never appear as sender names in message metadata.
     //
     // We detect this scenario: if there's only 1 unique non-user speaker name but the LLM
@@ -217,7 +217,7 @@ export async function runBatchScan() {
         // Single-character RP (or ambiguous): use speaker-name verification filter.
         // This prevents descriptive {{char}} titles (e.g., "Fantasy AU RPG") from being
         // treated as character names, while preserving legitimate character names like
-        // "Gojo Satoru" that DO appear as message senders.
+        // "Jane Doe" that DO appear as message senders.
         for (const scene of detectedScenes) {
             for (const name of scene.characters) {
                 if (userNamesToExclude.has(name)) continue;

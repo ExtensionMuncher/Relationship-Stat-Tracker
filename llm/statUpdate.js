@@ -9,7 +9,7 @@ import { getContext } from "../../../../extensions.js";
 import { getPersonaContext } from "./connections.js";
 import { makeRequest } from "./connections.js";
 import { getSettings, getNameBlacklist } from "../data/storage.js";
-import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter, getSoftLockAvailability } from "../data/characters.js";
+import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter, getSoftLockAvailability, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneTitle, getClosedSceneCount, getClosedSceneCountForChar } from "../data/scenes.js";
 import { dlog } from "../lib/debug.js";
 
@@ -192,6 +192,7 @@ function buildStatUpdateSystemPrompt(settings) {
         '',
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
+        '- Per-character category visibility is authoritative. If a character is shown with only some visible/active categories, ONLY output stats/commentary/criticalStats/locks/pressure/reviews for those visible categories. Do not infer, update, propose locks for, unlock, or mention hidden categories.',
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
         '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Still provide your normal stat value for it.',
@@ -247,15 +248,17 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
         } else {
             parts.push(`  Hard-lock eligible: NO — personality is empty. Do NOT propose any hard locks for this character.`);
         }
+        const visibleCategories = getVisibleStatCategories(char);
+        parts.push(`  Visible/active stat categories for this character: ${visibleCategories.length ? visibleCategories.join(", ") : "NONE"}. Hidden categories are off-limits: do not see, update, lock, unlock, or comment on them.`);
         parts.push(`  Stats:`);
-        for (const cat of STAT_CATEGORIES) {
+        for (const cat of visibleCategories) {
             const stats = char.stats[cat];
             parts.push(`    ${cat}: trust=${stats.trust}%, openness=${stats.openness}%, support=${stats.support}%, affection=${stats.affection}%`);
         }
         // Existing hard-lock caps, if any — with pressure state + cap history.
         const lockLines = [];
         if (char.hardLocks) {
-            for (const cat of STAT_CATEGORIES) {
+            for (const cat of visibleCategories) {
                 for (const stat of STAT_NAMES) {
                     const lk = char.hardLocks[cat]?.[stat];
                     if (lk && typeof lk.cap === 'number') {
@@ -281,7 +284,7 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
         // Existing soft locks (conditional caps the LLM can mark as met)
         const softLines = [];
         if (char.softLocks) {
-            for (const cat of STAT_CATEGORIES) {
+            for (const cat of visibleCategories) {
                 for (const stat of STAT_NAMES) {
                     const sl = char.softLocks[cat]?.[stat];
                     if (sl && typeof sl.cap === 'number' && !sl.met) {
@@ -341,6 +344,180 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
     return parts.join("\n");
 }
 
+function isVisibleStatKeyForProfile(profile, statKey) {
+    if (typeof statKey !== "string") return false;
+    const [cat, stat] = statKey.toLowerCase().trim().split(".");
+    return STAT_CATEGORIES.includes(cat) && STAT_NAMES.includes(stat) && isStatCategoryVisible(profile, cat);
+}
+
+function filterStatKeyArrayForProfile(profile, arr) {
+    if (!Array.isArray(arr)) return [];
+    return arr
+        .map((x) => String(x || "").toLowerCase().trim())
+        .filter((x) => isVisibleStatKeyForProfile(profile, x));
+}
+
+function filterStatObjectByVisibleCategories(profile, obj) {
+    const filtered = {};
+    if (!obj || typeof obj !== "object") return filtered;
+    for (const cat of getVisibleStatCategories(profile)) {
+        if (obj[cat] && typeof obj[cat] === "object") {
+            filtered[cat] = obj[cat];
+        }
+    }
+    return filtered;
+}
+
+function filterStatEntryArrayForProfile(profile, arr) {
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((entry) => entry && isVisibleStatKeyForProfile(profile, entry.stat));
+}
+
+function filterCharacterDataByVisibleCategories(profile, data) {
+    if (!data || typeof data !== "object") return data;
+    const clone = { ...data };
+    clone.stats = filterStatObjectByVisibleCategories(profile, data.stats);
+    clone.commentary = filterStatObjectByVisibleCategories(profile, data.commentary);
+    clone.criticalStats = filterStatKeyArrayForProfile(profile, data.criticalStats);
+    clone.proposedHardLocks = filterStatEntryArrayForProfile(profile, data.proposedHardLocks);
+    clone.proposedSoftLocks = filterStatEntryArrayForProfile(profile, data.proposedSoftLocks);
+    clone.unlockedSoftLocks = filterStatKeyArrayForProfile(profile, data.unlockedSoftLocks);
+    clone.softLockProgress = filterStatEntryArrayForProfile(profile, data.softLockProgress);
+    clone.hardLockPressureUpdates = filterStatEntryArrayForProfile(profile, data.hardLockPressureUpdates);
+    clone.hardLockReviews = filterStatEntryArrayForProfile(profile, data.hardLockReviews);
+    return clone;
+}
+
+
+function normalizeCharacterName(name) {
+    return String(name || "").toLowerCase().trim();
+}
+
+function findParsedCharacterEntryForProfile(parsedCharacters, profile, consumedKeys = null) {
+    if (!parsedCharacters || !profile) return null;
+    const keys = Object.keys(parsedCharacters);
+    const variants = new Set(getCharacterNameVariants(profile).map(normalizeCharacterName));
+
+    // Prefer exact/canonical/alias matches first. Compare normalized strings so
+    // an LLM key like "Renee" still matches an alias saved as "renee".
+    for (const key of keys) {
+        if (consumedKeys?.has(key)) continue;
+        if (variants.has(normalizeCharacterName(key))) {
+            return { key, data: parsedCharacters[key] };
+        }
+    }
+
+    // Fuzzy fallback catches reversed names and common shortened forms.
+    for (const key of keys) {
+        if (consumedKeys?.has(key)) continue;
+        const matched = findCharacterByFuzzyName(key);
+        if (matched && matched.id === profile.id) {
+            return { key, data: parsedCharacters[key] };
+        }
+    }
+
+    return null;
+}
+
+function buildStatsFromInitialData(charData) {
+    const statsAfter = {};
+    for (const cat of STAT_CATEGORIES) {
+        statsAfter[cat] = {};
+        for (const stat of STAT_NAMES) {
+            const val = charData?.stats?.[cat]?.[stat];
+            statsAfter[cat][stat] = typeof val === "number" && !isNaN(val)
+                ? Math.max(-100, Math.min(100, val))
+                : 0;
+        }
+    }
+    return statsAfter;
+}
+
+function buildInitialCommentary(charData, statsAfter, char = null) {
+    let commentary = charData?.commentary || null;
+    if (!commentary || hasEmptyCommentary(commentary)) {
+        commentary = {};
+        for (const cat of STAT_CATEGORIES) {
+            commentary[cat] = {};
+            for (const stat of STAT_NAMES) {
+                const val = statsAfter?.[cat]?.[stat] ?? 0;
+                if (val > 0) {
+                    commentary[cat][stat] = "First impressions suggest positive feelings.";
+                } else if (val < 0) {
+                    commentary[cat][stat] = "First impressions suggest negative feelings.";
+                } else {
+                    commentary[cat][stat] = "No strong initial impression formed.";
+                }
+            }
+        }
+    } else {
+        commentary = fillMissingCommentary(commentary, char ? cloneStats(char.stats) : {}, statsAfter, char || undefined);
+    }
+    return commentary;
+}
+
+function createInitialUpdateEntry(char, charData, source = "llm_initial") {
+    const filteredData = filterCharacterDataByVisibleCategories(char, charData || {});
+    const statsAfter = buildStatsFromInitialData(filteredData);
+    const commentary = buildInitialCommentary(filteredData, statsAfter, char);
+    return {
+        characterId: char.id,
+        characterName: char.name,
+        statsBefore: cloneStats(char.stats),
+        statsAfter,
+        commentary,
+        dynamicTitleBefore: char.dynamicTitle || "",
+        dynamicTitleAfter: filteredData.dynamicTitle || char.dynamicTitle || "",
+        milestoneReached: false,
+        milestoneDetail: "",
+        narrativeSummary: filteredData.narrativeSummary || char.narrativeSummary || "",
+        criticalStats: Array.isArray(filteredData.criticalStats) ? filteredData.criticalStats : [],
+        raisedCaps: [],
+        proposedHardLocks: Array.isArray(filteredData.proposedHardLocks) ? filteredData.proposedHardLocks : [],
+        proposedSoftLocks: Array.isArray(filteredData.proposedSoftLocks) ? filteredData.proposedSoftLocks : [],
+        unlockedSoftLocks: Array.isArray(filteredData.unlockedSoftLocks) ? filteredData.unlockedSoftLocks : [],
+        softLockProgress: Array.isArray(filteredData.softLockProgress) ? filteredData.softLockProgress : [],
+        hardLockPressureUpdates: Array.isArray(filteredData.hardLockPressureUpdates) ? filteredData.hardLockPressureUpdates : [],
+        hardLockReviews: Array.isArray(filteredData.hardLockReviews) ? filteredData.hardLockReviews : [],
+        source,
+        changeCount: countChanges(cloneStats(char.stats), statsAfter),
+    };
+}
+
+function characterUpdateScore(update) {
+    if (!update) return -1;
+    let score = 0;
+    const changeCount = Number(update.changeCount || 0);
+    if (changeCount > 0) score += 1000 + changeCount;
+    if (String(update.source || "").includes("initial")) score += 100;
+    if (update.statsAfter && typeof update.statsAfter === "object") score += 50;
+    if (update.commentary && !hasEmptyCommentary(update.commentary)) score += 25;
+    if (update.dynamicTitleAfter) score += 10;
+    if (update.narrativeSummary) score += 10;
+    if (Array.isArray(update.proposedHardLocks) && update.proposedHardLocks.length) score += 5;
+    if (Array.isArray(update.proposedSoftLocks) && update.proposedSoftLocks.length) score += 5;
+    return score;
+}
+
+function dedupeCharacterUpdates(characterUpdates) {
+    if (!Array.isArray(characterUpdates) || characterUpdates.length < 2) return characterUpdates || [];
+    const byId = new Map();
+    const order = [];
+    for (const update of characterUpdates) {
+        if (!update || !update.characterId) continue;
+        const prev = byId.get(update.characterId);
+        if (!prev) {
+            byId.set(update.characterId, update);
+            order.push(update.characterId);
+            continue;
+        }
+        const chosen = characterUpdateScore(update) > characterUpdateScore(prev) ? update : prev;
+        byId.set(update.characterId, chosen);
+        dlog(`[RST] Deduped duplicate pending stat update for ${chosen.characterName || chosen.characterId}.`);
+    }
+    return order.map((id) => byId.get(id)).filter(Boolean);
+}
+
 // ─── Response Parsing ─────────────────────────────────────
 
 /**
@@ -372,31 +549,20 @@ function parseStatUpdateResponse(response, characters) {
     const sceneSummary = parsed.sceneSummary || "";
     const sceneTitle = parsed.sceneTitle || "";
     const characterUpdates = [];
+    const consumedCharacterKeys = new Set();
 
     for (const char of characters) {
-        // Try exact canonical name first, then alias variants, then fuzzy match
-        let charData = parsed.characters?.[char.name];
-        if (!charData && char.nameAliases && Array.isArray(char.nameAliases)) {
-            for (const alias of char.nameAliases) {
-                charData = parsed.characters?.[alias];
-                if (charData) break;
-            }
-        }
-        if (!charData) {
-            // Try fuzzy match: find which key in parsed.characters matches this character
-            for (const [llmKey] of Object.entries(parsed.characters || {})) {
-                const matched = findCharacterByFuzzyName(llmKey);
-                if (matched && matched.id === char.id) {
-                    charData = parsed.characters[llmKey];
-                    break;
-                }
-            }
-        }
+        // Try exact canonical name, aliases, then fuzzy match. Track the consumed
+        // LLM key so a canonical+alias pair cannot become two pending cards.
+        const charEntry = findParsedCharacterEntryForProfile(parsed.characters, char, consumedCharacterKeys);
+        let charData = charEntry?.data;
+        if (charEntry?.key) consumedCharacterKeys.add(charEntry.key);
         if (!charData) {
             // Character not found in LLM response — create a no-change entry
             characterUpdates.push(createNoChangeEntry(char));
             continue;
         }
+        charData = filterCharacterDataByVisibleCategories(char, charData);
 
         const statsBefore = cloneStats(char.stats);
         const settings = getSettings();
@@ -445,11 +611,12 @@ function parseStatUpdateResponse(response, characters) {
 
     // Handle LLM-discovered characters (in parsed.characters but not in input list)
     if (parsed && parsed.characters) {
-        const inputNames = new Set(characters.map(c => c.name));
+        const inputNameVariants = new Set(characters.flatMap(c => getCharacterNameVariants(c)).map(normalizeCharacterName));
         const allKnownChars = getAllCharacters();
-        for (const [llmName, llmData] of Object.entries(parsed.characters)) {
-            if (!inputNames.has(llmName) && llmData && llmData.stats) {
-                const lowerLlmName = llmName.toLowerCase().trim();
+        for (const [llmName, rawLlmData] of Object.entries(parsed.characters)) {
+            let llmData = rawLlmData;
+            const lowerLlmName = normalizeCharacterName(llmName);
+            if (!consumedCharacterKeys.has(llmName) && !inputNameVariants.has(lowerLlmName) && llmData && llmData.stats) {
                 // Check if this LLM name matches an existing character (by alias, exact name, or fuzzy word match)
                 const matchedExisting = allKnownChars.find(c => {
                     if (c.name.toLowerCase().trim() === lowerLlmName) return true;
@@ -461,8 +628,13 @@ function parseStatUpdateResponse(response, characters) {
                     return cWords === llmWords;
                 });
                 if (matchedExisting) {
+                    if (characterUpdates.some((u) => u.characterId === matchedExisting.id)) {
+                        dlog(`[RST] Skipping duplicate LLM-discovered key "${llmName}" for existing character "${matchedExisting.name}".`);
+                        continue;
+                    }
                     // Name matches existing character — create update entry instead of duplicate
                     dlog(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating update entry`);
+                    llmData = filterCharacterDataByVisibleCategories(matchedExisting, llmData);
                     const statsBefore = cloneStats(matchedExisting.stats);
                     const settings = getSettings();
                     const range = settings.statChangeRange || { min: -5, max: 5 };
@@ -534,7 +706,7 @@ function parseStatUpdateResponse(response, characters) {
         }
     }
 
-    return { sceneSummary, sceneTitle, characterUpdates };
+    return { sceneSummary, sceneTitle, characterUpdates: dedupeCharacterUpdates(characterUpdates) };
 }
 
 // ─── JSON Extraction Helpers ──────────────────────────────
@@ -945,7 +1117,7 @@ function getSceneCharacters(scene) {
         for (const msg of sceneMessages) {
             const speaker = msg.name || "";
             if (!speaker || msg.is_user || isExcluded(speaker)) continue;
-            // Use alias-aware fuzzy matching so "Gojo" matches "Satoru Gojo"
+            // Use alias-aware fuzzy matching so "Doe" matches "Jane Doe"
             const match = findCharacterByFuzzyName(speaker) || allKnownChars.find((c) => c.name.toLowerCase().trim() === speaker.toLowerCase().trim());
             if (match) {
                 foundIds.add(match.id);
@@ -1392,6 +1564,7 @@ function buildInitialStatSystemPrompt(settings) {
         '',
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
+        '- Per-character category visibility is authoritative. If a character is shown with only some visible/active categories, ONLY output stats/commentary/criticalStats/locks/pressure/reviews for those visible categories. Do not infer, update, propose locks for, unlock, or mention hidden categories.',
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
         '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Still provide your normal stat value for it.',
@@ -1426,6 +1599,8 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
         const aliases = getCharacterNameVariants(char).filter(a => a !== char.name.toLowerCase().trim());
         const aliasStr = aliases.length > 0 ? ` (also known as: ${aliases.join(", ")})` : "";
         parts.push("- " + char.name + aliasStr);
+        const visibleCategories = getVisibleStatCategories(char);
+        parts.push("    Visible/active stat categories: " + (visibleCategories.length ? visibleCategories.join(", ") : "NONE") + ". Hidden categories are off-limits.");
         // Personality gating for locks — same rule as the main update path. A
         // freshly-detected character usually has an empty Personality, so locks
         // must NOT be proposed until the user fills it in.
@@ -1493,80 +1668,30 @@ function parseInitialStatResponse(response, characters) {
     const sceneSummary = parsed.sceneSummary || "";
     const sceneTitle = parsed.sceneTitle || "";
     const characterUpdates = [];
+    const consumedCharacterKeys = new Set();
 
     for (const char of characters) {
-        const charData = parsed.characters?.[char.name];
+        // Initial generation must resolve aliases/fuzzy names into the existing
+        // zero-stat profile, not create a second "discovered" block for it.
+        const charEntry = findParsedCharacterEntryForProfile(parsed.characters, char, consumedCharacterKeys);
+        const charData = charEntry?.data;
+        if (charEntry?.key) consumedCharacterKeys.add(charEntry.key);
         if (!charData || !charData.stats) {
             // Character not in response — create a no-change entry at zero
             characterUpdates.push(createNoChangeEntry(char));
             continue;
         }
 
-        const statsAfter = {};
-        for (const cat of STAT_CATEGORIES) {
-            statsAfter[cat] = {};
-            for (const stat of STAT_NAMES) {
-                const val = charData.stats[cat]?.[stat];
-                statsAfter[cat][stat] = typeof val === "number" ? Math.max(-100, Math.min(100, val)) : 0;
-            }
-        }
-
-        const commentary = charData.commentary || null;
-        if (!commentary || hasEmptyCommentary(commentary)) {
-            // Since there are no "before" stats, use a generic narrative-only fallback
-            const fallback = {};
-            for (const cat of STAT_CATEGORIES) {
-                fallback[cat] = {};
-                for (const stat of STAT_NAMES) {
-                    const val = statsAfter[cat][stat];
-                    if (val > 0) {
-                        fallback[cat][stat] = "First impressions suggest positive feelings.";
-                    } else if (val < 0) {
-                        fallback[cat][stat] = "First impressions suggest negative feelings.";
-                    } else {
-                        fallback[cat][stat] = "No strong initial impression formed.";
-                    }
-                }
-            }
-            characterUpdates.push({
-                characterId: char.id,
-                characterName: char.name,
-                statsBefore: null, // No previous stats
-                statsAfter,
-                commentary: fallback,
-                dynamicTitleBefore: "",
-                dynamicTitleAfter: charData.dynamicTitle || "",
-                milestoneReached: false,
-                milestoneDetail: "",
-                narrativeSummary: charData.narrativeSummary || "",
-                source: "llm_initial",
-                changeCount: 12, // All 12 stats are "new"
-            });
-        } else {
-            characterUpdates.push({
-                characterId: char.id,
-                characterName: char.name,
-                statsBefore: null,
-                statsAfter,
-                commentary,
-                dynamicTitleBefore: "",
-                dynamicTitleAfter: charData.dynamicTitle || "",
-                milestoneReached: false,
-                milestoneDetail: "",
-                narrativeSummary: charData.narrativeSummary || "",
-                source: "llm_initial",
-                changeCount: 12,
-            });
-        }
+        characterUpdates.push(createInitialUpdateEntry(char, charData, "llm_initial"));
     }
 
     // Handle LLM-discovered characters (in parsed.characters but not in input list)
     if (parsed && parsed.characters) {
-        const inputNames = new Set(characters.map(c => c.name));
+        const inputNameVariants = new Set(characters.flatMap(c => getCharacterNameVariants(c)).map(normalizeCharacterName));
         const allKnownChars = getAllCharacters();
         for (const [llmName, llmData] of Object.entries(parsed.characters)) {
-            if (!inputNames.has(llmName) && llmData && llmData.stats) {
-                const lowerLlmName = llmName.toLowerCase().trim();
+            const lowerLlmName = normalizeCharacterName(llmName);
+            if (!consumedCharacterKeys.has(llmName) && !inputNameVariants.has(lowerLlmName) && llmData && llmData.stats) {
                 // Check if this LLM name matches an existing character (by alias, exact name, or fuzzy word match)
                 const matchedExisting = allKnownChars.find(c => {
                     if (c.name.toLowerCase().trim() === lowerLlmName) return true;
@@ -1578,55 +1703,55 @@ function parseInitialStatResponse(response, characters) {
                     return cWords === llmWords;
                 });
                 if (matchedExisting) {
-                    // Name matches existing character — create update entry instead of duplicate
+                    if (characterUpdates.some((u) => u.characterId === matchedExisting.id)) {
+                        dlog(`[RST] Skipping duplicate initial LLM key "${llmName}" for existing character "${matchedExisting.name}".`);
+                        continue;
+                    }
+                    // Name matches existing character — create one initial stat entry
+                    // against that existing profile. If the profile is still all-zero,
+                    // do NOT clamp by statChangeRange; this is first-time initialization.
                     dlog(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating initial stat update entry`);
-                    const statsAfter = {};
-                    for (const cat of STAT_CATEGORIES) {
-                        statsAfter[cat] = {};
-                        for (const stat of STAT_NAMES) {
-                            const val = llmData.stats[cat]?.[stat];
-                            statsAfter[cat][stat] = typeof val === "number" ? Math.max(-100, Math.min(100, val)) : 0;
-                        }
-                    }
-                    const statsBefore = cloneStats(matchedExisting.stats);
-                    const settings = getSettings();
-                    const range = settings.statChangeRange || { min: -5, max: 5 };
-                    // Merge LLM stats over existing stats so unmentioned ones don't default to 0
-                    const mergedStats = mergeWithExistingStats(statsBefore, statsAfter);
-                    const _site4settings = (typeof settings !== 'undefined') ? settings : getSettings();
-                    const clampedAfter = applyDeltaRange(statsBefore, mergedStats, range, llmData.criticalStats, _site4settings, matchedExisting.hardLocks, matchedExisting.softLocks, llmData.unlockedSoftLocks);
-                    const firedCriticals = clampedAfter.__criticals || [];
-                    const raisedCaps = clampedAfter.__raisedCaps || [];
-                    const unlockedSoftLocks = clampedAfter.__unlockedSoftLocks || [];
-                    let commentary = llmData.commentary || null;
-                    if (!commentary || hasEmptyCommentary(commentary)) {
-                        commentary = generateFallbackCommentary(statsBefore, clampedAfter, matchedExisting);
+                    if (isNewCharacter(matchedExisting)) {
+                        characterUpdates.push(createInitialUpdateEntry(matchedExisting, llmData, "llm_initial"));
                     } else {
-                        commentary = fillMissingCommentary(commentary, statsBefore, clampedAfter, matchedExisting);
+                        const filteredData = filterCharacterDataByVisibleCategories(matchedExisting, llmData);
+                        const statsBefore = cloneStats(matchedExisting.stats);
+                        const settings = getSettings();
+                        const range = settings.statChangeRange || { min: -5, max: 5 };
+                        const mergedStats = mergeWithExistingStats(statsBefore, filteredData.stats || {});
+                        const clampedAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range, filteredData.criticalStats, settings, matchedExisting.hardLocks, matchedExisting.softLocks, filteredData.unlockedSoftLocks);
+                        const firedCriticals = clampedAfter.__criticals || [];
+                        const raisedCaps = clampedAfter.__raisedCaps || [];
+                        const unlockedSoftLocks = clampedAfter.__unlockedSoftLocks || [];
+                        let commentary = filteredData.commentary || null;
+                        if (!commentary || hasEmptyCommentary(commentary)) {
+                            commentary = generateFallbackCommentary(statsBefore, clampedAfter, matchedExisting);
+                        } else {
+                            commentary = fillMissingCommentary(commentary, statsBefore, clampedAfter, matchedExisting);
+                        }
+                        characterUpdates.push({
+                            characterId: matchedExisting.id,
+                            characterName: matchedExisting.name,
+                            statsBefore,
+                            statsAfter: clampedAfter,
+                            commentary,
+                            dynamicTitleBefore: matchedExisting.dynamicTitle || "",
+                            dynamicTitleAfter: filteredData.dynamicTitle || matchedExisting.dynamicTitle || "",
+                            milestoneReached: false,
+                            milestoneDetail: "",
+                            narrativeSummary: filteredData.narrativeSummary || matchedExisting.narrativeSummary || "",
+                            criticalStats: firedCriticals,
+                            raisedCaps,
+                            proposedHardLocks: Array.isArray(filteredData.proposedHardLocks) ? filteredData.proposedHardLocks : [],
+                            proposedSoftLocks: Array.isArray(filteredData.proposedSoftLocks) ? filteredData.proposedSoftLocks : [],
+                            unlockedSoftLocks,
+                            softLockProgress: Array.isArray(filteredData.softLockProgress) ? filteredData.softLockProgress : [],
+                            hardLockPressureUpdates: Array.isArray(filteredData.hardLockPressureUpdates) ? filteredData.hardLockPressureUpdates : [],
+                            hardLockReviews: Array.isArray(filteredData.hardLockReviews) ? filteredData.hardLockReviews : [],
+                            source: "llm",
+                            changeCount: countChanges(statsBefore, clampedAfter),
+                        });
                     }
-                    const changeCount = countChanges(statsBefore, clampedAfter);
-                    characterUpdates.push({
-                        characterId: matchedExisting.id,
-                        characterName: matchedExisting.name,
-                        statsBefore,
-                        statsAfter: clampedAfter,
-                        commentary,
-                        dynamicTitleBefore: matchedExisting.dynamicTitle || "",
-                        dynamicTitleAfter: llmData.dynamicTitle || matchedExisting.dynamicTitle || "",
-                        milestoneReached: false,
-                        milestoneDetail: "",
-                        narrativeSummary: llmData.narrativeSummary || matchedExisting.narrativeSummary || "",
-                        criticalStats: firedCriticals,
-                        raisedCaps,
-                        proposedHardLocks: Array.isArray(llmData.proposedHardLocks) ? llmData.proposedHardLocks : [],
-                        proposedSoftLocks: Array.isArray(llmData.proposedSoftLocks) ? llmData.proposedSoftLocks : [],
-                        unlockedSoftLocks,
-                        softLockProgress: Array.isArray(llmData.softLockProgress) ? llmData.softLockProgress : [],
-                        hardLockPressureUpdates: Array.isArray(llmData.hardLockPressureUpdates) ? llmData.hardLockPressureUpdates : [],
-                        hardLockReviews: Array.isArray(llmData.hardLockReviews) ? llmData.hardLockReviews : [],
-                        source: "llm_initial",
-                        changeCount,
-                    });
                 } else {
                     // Truly new character — create new profile
                     dlog("[RST] LLM discovered additional character (initial stat):", llmName);
@@ -1693,5 +1818,5 @@ function parseInitialStatResponse(response, characters) {
         }
     }
 
-    return { sceneSummary, sceneTitle, characterUpdates };
+    return { sceneSummary, sceneTitle, characterUpdates: dedupeCharacterUpdates(characterUpdates) };
 }

@@ -1538,7 +1538,10 @@ dialog.popup .editor_maximize:hover {
 .rst-pstat { display: flex; gap: 11px; flex-shrink: 0; }
 .rst-pstat-item { text-align: center; }
 .rst-pstat-val { font-weight: 600; font-size: 13px; font-variant-numeric: tabular-nums; }
+.rst-pstat-val.p,
 .rst-pstat-val.hi { color: var(--rst-pos); }
+.rst-pstat-val.n { color: var(--rst-neg); }
+.rst-pstat-val.z { color: var(--rst-zero); }
 .rst-pstat-lbl {
     font-size: 9px; text-transform: uppercase; letter-spacing: 0.04em;
     color: var(--rst-text-muted); margin-top: 1px;

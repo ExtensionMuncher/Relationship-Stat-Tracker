@@ -14,7 +14,7 @@
  */
 
 import { getSettings } from "../data/storage.js";
-import { getAllCharacters, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
+import { getAllCharacters, STAT_CATEGORIES, STAT_NAMES, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
 import { getAllSceneSummaries } from "../data/scenes.js";
 import { makeRequest, getPersonaContext } from "./connections.js";
 import { dlog } from "../lib/debug.js";
@@ -48,9 +48,11 @@ export async function scanForLocks() {
     // onto what is already configured. Clear a character's locks manually if
     // you want them reconsidered.
     const alreadyLocked = (c) => {
+        const visibleCategories = getVisibleStatCategories(c);
+        if (visibleCategories.length === 0) return true;
         const has = (map) => {
             if (!map) return false;
-            for (const cat of STAT_CATEGORIES) for (const stat of STAT_NAMES) {
+            for (const cat of visibleCategories) for (const stat of STAT_NAMES) {
                 const e = map[cat]?.[stat];
                 if (e && typeof e.cap === "number") return true;
             }
@@ -120,7 +122,8 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
         "- HARD lock: a stat CANNOT rise above the cap through ordinary growth — a deep, trait-level limit (e.g. a profoundly guarded character who cannot trust past ~40%). Broken only by a rare critical moment.",
         "- SOFT lock: a stat is capped UNTIL the user fulfills a specific narrative condition you define, then it auto-unlocks (e.g. romantic.affection capped at 45 until they share several genuine meals together).",
         "Output ONLY a JSON object: { \"hardLocks\": [ { \"stat\": \"category.stat\", \"cap\": NUMBER, \"reason\": \"...\" } ], \"softLocks\": [ { \"stat\": \"category.stat\", \"cap\": NUMBER, \"condition\": \"...\", \"progress\": \"...\" } ] }",
-        "Categories: platonic, romantic, sexual. Stats: trust, openness, support, affection.",
+        "Only consider the visible/active categories listed in the character prompt. Hidden categories are off-limits: do not see them, reason about them, or propose locks for them.",
+        "Stats: trust, openness, support, affection.",
         "Rules:",
         "- Be CONSERVATIVE. Locks are exceptional, not routine. A typical character warrants 0-3 locks TOTAL, reserved for the few stats where their psychology creates a genuine, defining ceiling. Do not lock a stat just because it could plausibly be limited — only when NOT locking it would misrepresent who they are.",
         "- Never lock a stat merely because it is currently low; low stats can still grow naturally. Lock only true trait-level barriers.",
@@ -132,7 +135,9 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
     ].join("\n");
 
     const parts = [];
+    const visibleCategories = getVisibleStatCategories(char);
     parts.push(`CHARACTER: ${char.name}`);
+    parts.push(`VISIBLE/ACTIVE CATEGORIES: ${visibleCategories.length ? visibleCategories.join(", ") : "NONE"}. Hidden categories are off-limits and must not receive lock proposals.`);
     parts.push(`PERSONALITY: ${char.description}`);
     if (char.notes && char.notes.trim()) parts.push(`NOTES: ${char.notes}`);
 
@@ -154,7 +159,7 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
     }
 
     parts.push("\nCURRENT STATS:");
-    for (const cat of STAT_CATEGORIES) {
+    for (const cat of visibleCategories) {
         const s = char.stats[cat];
         parts.push(`  ${cat}: trust=${s.trust}%, openness=${s.openness}%, support=${s.support}%, affection=${s.affection}%`);
     }
@@ -162,7 +167,7 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
     // Existing caps (don't re-propose what's already set)
     const existing = [];
     if (char.hardLocks) {
-        for (const cat of STAT_CATEGORIES) {
+        for (const cat of visibleCategories) {
             for (const stat of STAT_NAMES) {
                 const lk = char.hardLocks[cat]?.[stat];
                 if (lk && typeof lk.cap === "number") existing.push(`${cat}.${stat}=${lk.cap}%`);
@@ -205,7 +210,7 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
     for (const l of rawHard) {
         if (!l || typeof l.stat !== "string" || typeof l.cap !== "number") continue;
         const [cat, stat] = l.stat.toLowerCase().split(".");
-        if (!STAT_CATEGORIES.includes(cat) || !STAT_NAMES.includes(stat)) continue;
+        if (!STAT_CATEGORIES.includes(cat) || !STAT_NAMES.includes(stat) || !isStatCategoryVisible(char, cat)) continue;
         let cap = Math.max(-100, Math.min(100, Math.round(l.cap)));
         const cur = char.stats[cat]?.[stat] ?? 0;
         if (cap < cur) cap = cur; // never cap below current value
@@ -223,7 +228,7 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
     for (const l of rawSoft) {
         if (!l || typeof l.stat !== "string" || typeof l.cap !== "number") continue;
         const [cat, stat] = l.stat.toLowerCase().split(".");
-        if (!STAT_CATEGORIES.includes(cat) || !STAT_NAMES.includes(stat)) continue;
+        if (!STAT_CATEGORIES.includes(cat) || !STAT_NAMES.includes(stat) || !isStatCategoryVisible(char, cat)) continue;
         if (!l.condition || !String(l.condition).trim()) continue; // soft lock needs a condition
         let cap = Math.max(-100, Math.min(100, Math.round(l.cap)));
         const cur = char.stats[cat]?.[stat] ?? 0;

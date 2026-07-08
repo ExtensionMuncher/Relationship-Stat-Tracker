@@ -67,12 +67,55 @@ export function refreshPending($pane) {
 
 // ─── Pending Updates Section ──────────────────────────────
 
+function pendingUpdateScore(update) {
+    if (!update) return -1;
+    let score = 0;
+    const changeCount = Number(update.changeCount || 0);
+    if (changeCount > 0) score += 1000 + changeCount;
+    if (String(update.source || "").includes("initial")) score += 100;
+    if (update.statsAfter && typeof update.statsAfter === "object") score += 50;
+    if (update.commentary && typeof update.commentary === "object") score += 25;
+    if (update.dynamicTitleAfter) score += 10;
+    if (update.narrativeSummary) score += 10;
+    return score;
+}
+
+function normalizePendingCharacterUpdates(pending) {
+    if (!pending || !Array.isArray(pending.characterUpdates) || pending.characterUpdates.length < 2) return pending;
+
+    const byId = new Map();
+    const order = [];
+    let changed = false;
+
+    for (const update of pending.characterUpdates) {
+        if (!update || !update.characterId) continue;
+        const prev = byId.get(update.characterId);
+        if (!prev) {
+            byId.set(update.characterId, update);
+            order.push(update.characterId);
+            continue;
+        }
+
+        changed = true;
+        const chosen = pendingUpdateScore(update) > pendingUpdateScore(prev) ? update : prev;
+        byId.set(update.characterId, chosen);
+        dlog(`[RST] Collapsed duplicate pending card for ${chosen.characterName || chosen.characterId}.`);
+    }
+
+    if (!changed) return pending;
+
+    pending.characterUpdates = order.map((id) => byId.get(id)).filter(Boolean);
+    savePendingUpdates(pending);
+    return pending;
+}
+
 /**
  * Render the pending updates section.
  * @param {jQuery} $pane
  * @param {object} pending - The pending updates object
  */
 function renderPendingSection($pane, pending) {
+    pending = normalizePendingCharacterUpdates(pending);
     const scene = getSceneById(pending.sceneId);
     const sceneLabel = scene ? `Scene ${scene.id.replace("scene_", "")} just closed` : "Scene closed";
 
@@ -386,7 +429,6 @@ function renderPresentCharacters($pane) {
                 return best;
             };
             const plat = topStat("platonic"), rom = topStat("romantic"), sex = topStat("sexual");
-            const hcls = (v) => Math.abs(v) >= 40 ? "hi" : "";
             const $chip = $(`
                 <div class="rst-pcard" style="cursor:pointer">
                     <div class="rst-av">${avContent}</div>
@@ -395,9 +437,9 @@ function renderPresentCharacters($pane) {
                         <div class="rst-pdyn">${dyn}</div>
                     </div>
                     <div class="rst-pstat">
-                        <div class="rst-pstat-item"><div class="rst-pstat-val ${hcls(plat)}">${plat}%</div><div class="rst-pstat-lbl">Plat</div></div>
-                        <div class="rst-pstat-item"><div class="rst-pstat-val ${hcls(rom)}">${rom}%</div><div class="rst-pstat-lbl">Rom</div></div>
-                        <div class="rst-pstat-item"><div class="rst-pstat-val ${hcls(sex)}">${sex}%</div><div class="rst-pstat-lbl">Sex</div></div>
+                        <div class="rst-pstat-item"><div class="rst-pstat-val ${getValueClass(plat)}">${plat}%</div><div class="rst-pstat-lbl">Plat</div></div>
+                        <div class="rst-pstat-item"><div class="rst-pstat-val ${getValueClass(rom)}">${rom}%</div><div class="rst-pstat-lbl">Rom</div></div>
+                        <div class="rst-pstat-item"><div class="rst-pstat-val ${getValueClass(sex)}">${sex}%</div><div class="rst-pstat-lbl">Sex</div></div>
                     </div>
                     <span class="rst-present-remove" data-char-id="${charId}" title="Remove from presence"><i class="fa-solid fa-xmark"></i></span>
                 </div>
@@ -411,8 +453,15 @@ function renderPresentCharacters($pane) {
 
             // Click on remove button removes character from presence
             $chip.find(".rst-present-remove").on("click", async (e) => {
+                e.preventDefault();
                 e.stopPropagation();
-                const idToRemove = $(e.target).data("char-id");
+
+                // Use currentTarget, not target. The user usually clicks the nested
+                // <i> icon inside the span; e.target is then the icon, which does
+                // not carry data-char-id and made removal a no-op.
+                const idToRemove = $(e.currentTarget).attr("data-char-id");
+                if (!idToRemove) return;
+
                 const filtered = getPresentCharacters().filter((id) => id !== idToRemove);
                 savePresentCharacters(filtered);
                 const { updateInjection } = await import("../inject/promptInjector.js");
