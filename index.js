@@ -99,10 +99,7 @@ jQuery(async () => {
         // 6. Register event handlers
         safeStep("registerEventHandlers", () => registerEventHandlers());
 
-        // 7. Register slash commands
-        safeStep("registerSlashCommands", () => registerSlashCommands());
-
-        // 8. Initial injection update
+        // 7. Initial injection update
         if (isEnabled()) {
             safeStep("updateInjection", () => updateInjection());
         }
@@ -886,13 +883,3 @@ function closeRstPopout() {
     dlog('[RST] Popout closed.');
 }
 
-// ─── Slash Commands ───────────────────────────────────────
-
-/**
- * Register slash commands for RST.
- */
-function registerSlashCommands() {
-    // These would use ST's SlashCommandParser if available
-    // For now, we'll add them as a TODO since the exact API depends on ST version
-    dlog("[RST] Slash commands registered (placeholder)");
-}
