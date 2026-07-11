@@ -9,7 +9,7 @@
 import { chat } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
 import { makeRequest, reportProgress, updateRateLimiterSettings } from "./connections.js";
-import { getSettings, getNameBlacklist } from "../data/storage.js";
+import { getSettings, getNameBlacklist, isNameBlacklisted } from "../data/storage.js";
 import { getScenes, saveScenes } from "../data/storage.js";
 import { findCharacterByName, findCharacterByFuzzyName, createCharacter, updateCharacterStats, getCharacterProfile, addUpdateLogEntry, updateCharacterProfile, getAllCharacters, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { initSceneCounter, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
@@ -164,8 +164,7 @@ export async function runBatchScan() {
     // Phase 2: Create profiles for unknown characters (filtering out {{user}} and resolved names)
     // Detect the user's persona name from chat messages
     const userNameFromChat = allMessages.find(m => m.is_user)?.name || "";
-    const blacklistNames = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
-    const userNamesToExclude = new Set([...EXCLUDED_NAMES, userNameFromChat, ...blacklistNames]);
+    const userNamesToExclude = new Set([...EXCLUDED_NAMES, userNameFromChat, ...(getNameBlacklist() || [])]);
     const profilesCreated = [];
     const allCharNames = new Set();
 
@@ -205,8 +204,7 @@ export async function runBatchScan() {
         dlog("[RST-DEBUG] Multi-character RP detected — trusting LLM character names, bypassing speaker-name filter.");
         for (const scene of detectedScenes) {
             for (const name of scene.characters) {
-                if (userNamesToExclude.has(name)) continue;
-                if (userNamesToExclude.has(name.toLowerCase())) continue;
+                if (isNameBlacklisted(name, [...userNamesToExclude])) continue;
                 const cleanName = normalizeNameForComparison(name);
                 if (!cleanName) continue;
                 dlog(`[RST-DEBUG] Phase2 (multi-char): accepting name="${name}" -> clean="${cleanName}"`);
@@ -220,8 +218,7 @@ export async function runBatchScan() {
         // "Jane Doe" that DO appear as message senders.
         for (const scene of detectedScenes) {
             for (const name of scene.characters) {
-                if (userNamesToExclude.has(name)) continue;
-                if (userNamesToExclude.has(name.toLowerCase())) continue;
+                if (isNameBlacklisted(name, [...userNamesToExclude])) continue;
                 const cleanName = normalizeNameForComparison(name);
                 const found = chatSpeakerNames.has(cleanName);
                 dlog(`[RST-DEBUG] Phase2 check: name="${name}" -> clean="${cleanName}" -> found=${found}`);
@@ -456,8 +453,7 @@ async function detectScenes(allMessages, ranges, profileName, settings, combineR
 
     // When combineRanges is enabled, merge all small ranges into a single API call
     // Build blacklist set for scene detection character filtering
-    const _blacklistNames = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
-    const _sceneBlacklist = new Set(_blacklistNames);
+    const _sceneBlacklist = new Set(getNameBlacklist() || []);
 
     if (combineRanges && ranges.length > 1) {
         const totalMessages = ranges.reduce((sum, r) => sum + (r.end - r.start + 1), 0);
@@ -626,13 +622,10 @@ function parseSceneDetectionResponse(response, ranges, blacklistSet = new Set())
         const inRange = ranges.some((r) => start >= r.start && end <= r.end);
         if (!inRange) continue;
 
-        // Filter EXCLUDED_NAMES + blacklist from characters (case-insensitive)
-        // Keep original characters reference for downstream {{user}} presence checks
+        // Filter EXCLUDED_NAMES + blacklist from characters using normalized keys.
+        // Keep original characters reference for downstream {{user}} presence checks.
         const characters = (Array.isArray(scene.characters) ? scene.characters : [])
-            .filter((name) => {
-                const n = name.toLowerCase().trim();
-                return !EXCLUDED_NAMES.has(name) && !EXCLUDED_NAMES.has(name.toLowerCase()) && !blacklistSet.has(n);
-            });
+            .filter((name) => !isNameBlacklisted(name, [...EXCLUDED_NAMES, ...(blacklistSet || [])]));
 
         validScenes.push({
             messageStart: start,

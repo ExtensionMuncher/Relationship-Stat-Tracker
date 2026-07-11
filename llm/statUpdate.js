@@ -8,7 +8,7 @@ import { chat } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
 import { getPersonaContext } from "./connections.js";
 import { makeRequest } from "./connections.js";
-import { getSettings, getNameBlacklist } from "../data/storage.js";
+import { getSettings, isNameBlacklisted } from "../data/storage.js";
 import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter, getSoftLockAvailability, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneTitle, getClosedSceneCount, getClosedSceneCountForChar } from "../data/scenes.js";
 import { dlog } from "../lib/debug.js";
@@ -1078,16 +1078,10 @@ function getSceneCharacters(scene) {
     const foundIds = new Set();
     const unknownSpeakers = new Set();
 
-    // Build exclusion set: persona name + settings blacklist
-    const settings = getSettings();
-    const personaName = (getContext().name1 || "").toLowerCase().trim();
-    const blacklistNames = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
-    const excludedNames = new Set(["{{user}}", "user", "User", personaName, ...blacklistNames]);
-
-    // Helper: check if a name is excluded
+    // Build exclusion logic: persona name + settings blacklist.
+    const personaName = getContext().name1 || "";
     function isExcluded(name) {
-        const n = (name || "").toLowerCase().trim();
-        return !n || excludedNames.has(n);
+        return isNameBlacklisted(name, ["{{user}}", "user", personaName]);
     }
 
     // Step 1: Collect any characters already registered on the scene

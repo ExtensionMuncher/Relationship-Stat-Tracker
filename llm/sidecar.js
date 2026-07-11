@@ -6,7 +6,7 @@
 import { chat } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
 import { makeRequest } from "./connections.js";
-import { getSettings, getNameBlacklist } from "../data/storage.js";
+import { getSettings, getNameBlacklist, isNameBlacklisted } from "../data/storage.js";
 import { getAllCharacters, getCharacterNameVariants, findCharacterByFuzzyName } from "../data/characters.js";
 import { dlog } from "../lib/debug.js";
 
@@ -118,8 +118,15 @@ function buildSidecarRequestPrompt(messages, knownNames) {
         '- Each name should appear only once.',
     ];
 
-    if (knownNames.length > 0) {
-        parts.push(`- Already-known characters (include if present): ${knownNames.join(", ")}`);
+    const personaName = getContext().name1 || "";
+    const ignoredNames = [...new Set([personaName, ...(getNameBlacklist() || [])].map((n) => String(n || "").trim()).filter(Boolean))];
+    if (ignoredNames.length > 0) {
+        parts.push(`- Never return ignored/user names: ${ignoredNames.join(", ")}`);
+    }
+
+    const visibleKnownNames = knownNames.filter((name) => !isNameBlacklisted(name, [personaName, "{{user}}", "user"]));
+    if (visibleKnownNames.length > 0) {
+        parts.push(`- Already-known characters (include if present): ${visibleKnownNames.join(", ")}`);
     }
 
     parts.push('');
@@ -302,16 +309,11 @@ function parseDetectedNames(response) {
 function categorizeNames(detectedNames, knownNames) {
     const allCharacters = getAllCharacters();
 
-    // Build exclusion set: persona name + settings blacklist + hardcoded placeholders
-    const settings = getSettings();
-    const personaName = (getContext().name1 || "").toLowerCase().trim();
-    const blacklistNames = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
-    const excludedNames = new Set(["{{user}}", "user", "User", personaName, ...blacklistNames]);
-
-    // Helper: check if a name should be excluded
+    // Build exclusion logic: persona name + per-chat blacklist + hardcoded placeholders.
+    // Uses normalized keys so dash/spacing/case variants don't leak through.
+    const personaName = getContext().name1 || "";
     function isExcluded(name) {
-        const n = (name || "").toLowerCase().trim();
-        return !n || excludedNames.has(n);
+        return isNameBlacklisted(name, ["{{user}}", "user", personaName]);
     }
 
     // Build a flat map: every known name variant → character profile

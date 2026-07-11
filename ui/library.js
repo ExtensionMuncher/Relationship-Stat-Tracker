@@ -1876,7 +1876,10 @@ async function showRollbackConfirmation(profile, entry) {
         detailLines.join("\n"),
     );
 
-    if (result !== POPUP_RESULT.AFFIRMATIVE) return;
+    // Popup.show.confirm resolves with a BOOLEAN (unlike popup.show(), which
+    // resolves with a POPUP_RESULT enum) — comparing it to the enum made this
+    // gate silently reject every confirmation. Accept both semantics.
+    if (result !== true && result !== POPUP_RESULT.AFFIRMATIVE) return;
 
     try {
         if (hasStatsBefore) {
@@ -1884,10 +1887,17 @@ async function showRollbackConfirmation(profile, entry) {
         }
 
         const profileUpdates = {};
-        if (entry.dynamicTitleBefore) {
-            profileUpdates.dynamicTitle = entry.dynamicTitleBefore;
-        }
-        profileUpdates.narrativeSummary = entry.narrativeSummary ?? "";
+        // Restore the title unconditionally — a character who had NO title
+        // before this update should lose the one it granted.
+        profileUpdates.dynamicTitle = entry.dynamicTitleBefore || "";
+        // Log entries carry the POST-update summary (there is no
+        // narrativeSummaryBefore field), so the true previous summary lives on
+        // the next-older entry. updateLog is newest-first (unshift order).
+        const fullProfile = getCharacterProfile(profile.id);
+        const log = Array.isArray(fullProfile?.updateLog) ? fullProfile.updateLog : [];
+        const idx = log.findIndex(e => e.timestamp === entry.timestamp);
+        const olderEntry = idx >= 0 ? log[idx + 1] : null;
+        profileUpdates.narrativeSummary = olderEntry?.narrativeSummary ?? "";
         updateCharacterProfile(profile.id, profileUpdates);
 
         const sceneRef = entry.sceneId && entry.sceneId !== "" ? entry.sceneId : "manual edit";
@@ -2104,7 +2114,7 @@ export async function showNewCharacterDetected(name) {
         { okButton: "Create entry", cancelButton: "Ignore" },
     );
 
-    if (result !== POPUP_RESULT.AFFIRMATIVE) {
+    if (result !== true && result !== POPUP_RESULT.AFFIRMATIVE) {
         return false;
     }
 

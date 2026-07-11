@@ -5,8 +5,97 @@
 
 import { chat_metadata, saveSettingsDebounced, saveChatDebounced } from "../../../../../script.js";
 import { extension_settings } from "../../../../../scripts/extensions.js";
+import { getContext } from "../../../../extensions.js";
 
 const NAMESPACE = "rst";
+
+
+// ─── Name blacklist helpers ───────────────────────────────
+
+/**
+ * Normalize names for blacklist matching without destroying the display text.
+ * Handles case, Unicode width, dash variants, stray punctuation, and whitespace.
+ * @param {string} name
+ * @returns {string}
+ */
+export function normalizeNameForMatch(name) {
+    return String(name || "")
+        .normalize("NFKC")
+        .replace(/[\u2010\u2011\u2012\u2013\u2014\u2212]/g, "-")
+        .replace(/[“”]/g, '"')
+        .replace(/[‘’]/g, "'")
+        .replace(/\s+/g, " ")
+        .trim()
+        .replace(/^[\s"'`*_.,;:!?()[\]{}<>]+|[\s"'`*_.,;:!?()[\]{}<>]+$/g, "")
+        .toLowerCase();
+}
+
+/**
+ * Matching keys used for blacklist comparison. The compact key lets
+ * "Vane-san" match "Vane san" without enabling broad substring checks.
+ * @param {string} name
+ * @returns {string[]}
+ */
+export function getNameMatchKeys(name) {
+    const normalized = normalizeNameForMatch(name);
+    if (!normalized) return [];
+    const compact = normalized.replace(/[\s._'`-]+/g, "");
+    return [...new Set([normalized, compact].filter(Boolean))];
+}
+
+/**
+ * Parse comma/newline separated blacklist text.
+ * @param {string|string[]} value
+ * @returns {string[]}
+ */
+export function parseNameBlacklist(value) {
+    if (Array.isArray(value)) {
+        return value.map((s) => String(s || "").trim()).filter(Boolean);
+    }
+    return String(value || "")
+        .split(/[,\n]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+}
+
+function nameKeysSet(names) {
+    const keys = new Set();
+    for (const name of names || []) {
+        for (const key of getNameMatchKeys(name)) keys.add(key);
+    }
+    return keys;
+}
+
+/**
+ * Check whether a name is excluded by the per-chat blacklist or optional extras.
+ * @param {string} name
+ * @param {string[]} [extraNames]
+ * @returns {boolean}
+ */
+export function isNameBlacklisted(name, extraNames = []) {
+    const candidateKeys = getNameMatchKeys(name);
+    if (candidateKeys.length === 0) return true;
+    const blacklistKeys = nameKeysSet([...(getNameBlacklist() || []), ...(extraNames || [])]);
+    return candidateKeys.some((key) => blacklistKeys.has(key));
+}
+
+/**
+ * Persist chat metadata immediately when ST exposes an immediate save API;
+ * otherwise fall back to SillyTavern's debounced chat save.
+ */
+export function persistChatNow() {
+    saveChatDebounced();
+    try {
+        const context = getContext?.();
+        if (typeof context?.saveMetadata === "function") {
+            context.saveMetadata();
+        } else if (typeof context?.saveChat === "function") {
+            context.saveChat();
+        }
+    } catch (err) {
+        console.warn("[RST] Immediate chat metadata save failed; debounced save is still queued.", err);
+    }
+}
 
 // ─── Extension Settings (Global) ──────────────────────────
 
@@ -288,10 +377,55 @@ export function getNameBlacklist() {
  * Save the per-chat name blacklist.
  * @param {Array<string>} names
  */
-export function saveNameBlacklist(names) {
+export function saveNameBlacklist(names, immediate = false) {
     ensureChatNamespace();
-    chat_metadata[NAMESPACE].nameBlacklist = Array.isArray(names) ? names : [];
-    saveChatDebounced();
+
+    // Preserve display text, but dedupe by normalized match keys so variants like
+    // "Vane-san" and "Vane san" don't need to be re-added forever.
+    const cleaned = parseNameBlacklist(names);
+    const seen = new Set();
+    const deduped = [];
+    for (const name of cleaned) {
+        const keys = getNameMatchKeys(name);
+        if (keys.length === 0) continue;
+        if (keys.some((key) => seen.has(key))) continue;
+        for (const key of keys) seen.add(key);
+        deduped.push(name);
+    }
+
+    chat_metadata[NAMESPACE].nameBlacklist = deduped;
+    if (immediate) {
+        persistChatNow();
+    } else {
+        saveChatDebounced();
+    }
+}
+
+/**
+ * Add one or more names to the per-chat blacklist without duplicating variants.
+ * @param {string|string[]} names
+ * @param {boolean} [immediate]
+ * @returns {boolean} true if the blacklist changed
+ */
+export function addNamesToBlacklist(names, immediate = false) {
+    ensureChatNamespace();
+    const current = getNameBlacklist();
+    const currentKeys = nameKeysSet(current);
+    let changed = false;
+
+    for (const name of parseNameBlacklist(names)) {
+        const keys = getNameMatchKeys(name);
+        if (keys.length === 0) continue;
+        if (keys.some((key) => currentKeys.has(key))) continue;
+        current.push(name);
+        for (const key of keys) currentKeys.add(key);
+        changed = true;
+    }
+
+    if (changed) {
+        saveNameBlacklist(current, immediate);
+    }
+    return changed;
 }
 
 /**

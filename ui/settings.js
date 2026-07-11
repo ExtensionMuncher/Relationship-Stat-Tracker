@@ -4,12 +4,21 @@
  * Connection Profiles are NOT accordion-wrapped to ensure ConnectionManager initializes properly
  */
 
-import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist, getPendingLockScan, savePendingLockScan } from "../data/storage.js";
+import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist, parseNameBlacklist, getPendingLockScan, savePendingLockScan } from "../data/storage.js";
 import { setSetting, isEnabled, exportAllData, importAllData } from "../settings.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 import { getContext } from "../../../../extensions.js";
 import { Popup, POPUP_TYPE, POPUP_RESULT } from "../../../../../scripts/popup.js";
 import { scanForLocks } from "../llm/lockScan.js";
+
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+}
 
 // ─── Accordion Helper ─────────────────────────────────────
 
@@ -766,8 +775,12 @@ function renderDetectionSettings($pane, settings) {
 
     const blacklistStr = (getNameBlacklist() || []).join(", ");
     $card.append(`
-        <div class="rst-setting-row" style="border-bottom:none"><div><div class="rst-setting-label">Name blacklist</div><div class="rst-setting-sub">Names to always exclude from sidecar detection (comma-separated). Also excludes your ST user persona name automatically.</div></div></div>
-        <div style="padding:0 0 4px"><textarea id="rst-name-blacklist" rows="2" style="width:100%;font-size:12px" placeholder="e.g. Narrator, Guide, System">${blacklistStr}</textarea></div>
+        <div class="rst-setting-row" style="border-bottom:none"><div><div class="rst-setting-label">Name blacklist</div><div class="rst-setting-sub">Names to always exclude from sidecar detection (comma or newline separated). Also excludes your ST user persona name automatically.</div></div></div>
+        <div style="padding:0 0 4px"><textarea id="rst-name-blacklist" rows="2" style="width:100%;font-size:12px" placeholder="e.g. Narrator, Guide, System">${escapeHtml(blacklistStr)}</textarea></div>
+        <div style="display:flex;align-items:center;gap:8px;padding:0 0 8px">
+            <button id="rst-save-name-blacklist" class="menu_button" type="button"><i class="fa-solid fa-floppy-disk"></i> Save blacklist</button>
+            <span id="rst-name-blacklist-status" style="font-size:12px;color:var(--rst-text-muted)"></span>
+        </div>
     `);
 
     $pane.append($card);
@@ -775,11 +788,22 @@ function renderDetectionSettings($pane, settings) {
     $("#rst-scan-freq").on("change", function () { saveSetting("scanFrequency", parseInt($(this).val(), 10)); });
     $("#rst-msg-scan").on("change", function () { saveSetting("messagesToScan", parseInt($(this).val(), 10)); });
     $("#rst-new-char-popup").on("change", function () { saveSetting("newCharPopup", $(this).prop("checked")); });
-    $("#rst-name-blacklist").on("change", function () {
-        const raw = $(this).val();
-        const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
-        saveNameBlacklist(list);
+    function saveBlacklist(immediate = false) {
+        const raw = $("#rst-name-blacklist").val();
+        const list = parseNameBlacklist(raw);
+        saveNameBlacklist(list, immediate);
+        $("#rst-name-blacklist").val((getNameBlacklist() || []).join(", "));
+        $("#rst-name-blacklist-status").text(immediate ? "Saved" : "Queued");
+        if (immediate) {
+            setTimeout(() => $("#rst-name-blacklist-status").text(""), 1600);
+        }
+    }
+
+    $("#rst-name-blacklist").on("change", function () { saveBlacklist(false); });
+    $("#rst-name-blacklist").on("input", function () {
+        $("#rst-name-blacklist-status").text("Unsaved");
     });
+    $("#rst-save-name-blacklist").on("click", function () { saveBlacklist(true); });
 }
 
 // ─── Injection Settings ───────────────────────────────────

@@ -19,7 +19,8 @@ import {
     getSettings,
     getPresentCharacters,
     savePresentCharacters,
-    getNameBlacklist,
+    addNamesToBlacklist,
+    isNameBlacklisted,
     setMessageCounter,
     syncMessageCounterToLiveCount,
     getPendingUpdates,
@@ -392,26 +393,12 @@ async function onMessageReceived(mesId, skipSidecar = false) {
 
             dlog("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length);
 
-            // Build exclusion set from ST user persona name + hardcoded placeholders + per-chat blacklist
-            const personaName = (name1 || "").toLowerCase().trim();
-            const blacklist = (getNameBlacklist() || []).map((n) => n.toLowerCase().trim()).filter(Boolean);
-            const EXCLUDED_NAMES = new Set([
-                "{{user}}",
-                "user",
-                "User",
-                personaName,
-                ...blacklist,
-            ]);
-
-            // Filter out excluded and previously-rejected names
-            const filteredDetected = result.detected.filter((name) => {
-                const n = name.toLowerCase().trim();
-                return !EXCLUDED_NAMES.has(n) && !_rejectedNames.has(n);
-            });
-            const filteredUnknown = result.unknown.filter((name) => {
-                const n = name.toLowerCase().trim();
-                return !EXCLUDED_NAMES.has(n) && !_rejectedNames.has(n);
-            });
+            // Filter out excluded and previously-rejected names using normalized keys,
+            // so case/dash/spacing variants don't leak through.
+            const personaName = name1 || "";
+            const isExcludedDetectedName = (name) => isNameBlacklisted(name, ["{{user}}", "user", personaName, ..._rejectedNames]);
+            const filteredDetected = result.detected.filter((name) => !isExcludedDetectedName(name));
+            const filteredUnknown = result.unknown.filter((name) => !isExcludedDetectedName(name));
 
             // Build detected character IDs:
             // - filteredDetected: already canonical names from categorizeNames() — map directly
@@ -450,9 +437,11 @@ async function onMessageReceived(mesId, skipSidecar = false) {
                             detectedIds.add(newChar.id);
                         }
                     } else {
-                        // User clicked "Ignore" — track to prevent repeat popups this session
+                        // User clicked "Ignore" — persist it to the per-chat blacklist so
+                        // the same rejected name doesn't return after a refresh/chat reload.
                         _rejectedNames.add(unknownName.toLowerCase().trim());
-                        dlog("[RST] Name rejected by user, added to session rejection set:", unknownName);
+                        addNamesToBlacklist(unknownName, true);
+                        dlog("[RST] Name rejected by user, added to blacklist:", unknownName);
                     }
                 }
             }

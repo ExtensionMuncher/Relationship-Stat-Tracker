@@ -49,7 +49,7 @@ export function registerStatLookupTool() {
     ToolManager.registerFunctionTool({
         name: TOOL_NAME,
         displayName: "Look Up Relationship Stats",
-        description: "Look up a character's current relationship stats toward the user, even if that character is not present in the current scene. Use when the narrative references a character who isn't on-screen and you need their trust, openness, support, or affection values to stay consistent. Returns the full relationship matrix (Platonic, Romantic, Sexual) plus any narrative summary.",
+        description: "Use when an NPC’s response depends on relationship standing, trust, locks, or progression with the persona or another character.",
         stealth: false,
         parameters: {
             type: "object",
