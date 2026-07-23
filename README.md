@@ -1,93 +1,77 @@
 # Relationship Stat Tracker (RST)
 
-Relationship Stat Tracker is a SillyTavern extension for tracking how individual characters feel about the user over time. It maintains configurable relationship stats, scene-aware updates, approval workflows, threshold locks, relationship history, and contextual relationship state while keeping the final changes under user control.
-
 ---
 
 # What's New
 
+## Deletion-Safe Sidecar Scheduling
+
+The sidecar's message counter is now treated as the live chat message count at the last scan, rather than an ever-incrementing counter. If messages are deleted (for example, OOC messages cleaned out mid-chat) and SillyTavern renumbers the chat, RST detects the shrink, clears its session-only processed-message cache, and clamps the saved counter to the current chat length. The sidecar can no longer be stranded waiting for a message number that no longer exists. RST also now listens for message deletion, edit, and swipe events (when the running SillyTavern build provides them) and resets its runtime state defensively.
+
+## Smarter Character Matching & Duplicate-Card Prevention
+
+Stat-update parsing now resolves LLM-returned character names against canonical names, saved aliases, and fuzzy matches using one shared matcher, and tracks which LLM keys have already been consumed. A canonical name and one of its aliases can no longer produce two separate pending cards for the same character. As a final safety net, pending updates are deduplicated by character ID before saving and again when the Home tab renders, keeping the strongest entry (most stat changes, richest data) if duplicates ever slip through.
+
+## Improved Initial Stat Generation
+
+Initial generation now resolves aliases and fuzzy names into the existing zero-stat profile instead of creating a second "discovered" copy of the same character. When an LLM-returned name matches an existing character that is still all-zero, the entry is treated as true first-time initialization (no clamping by the Stat Change Range); if the character already has established stats, the normal delta-range, lock, and critical handling applies.
+
+## Scene Close Responsiveness
+
+Closing a scene now updates the UI immediately, before the stat-update LLM call begins, so a slow model no longer makes the scene look stuck open. Double-clicking the close button can no longer start overlapping stat-update calls. If generation runs long, a notice after 45 seconds confirms the scene is already closed and the LLM is simply still working, and the success toast reports how long generation took. If generation fails, the scene stays closed and the error message points to the console for the underlying LLM/API error.
+
 ## Relationship Milestones
 
-RST can now identify rare, durable turning points in a relationship alongside ordinary stat updates. Proposed milestones are shown for review before being saved and can be edited or deleted later from the character's relationship history.
-
-A full-chat backfill option is also available for generating milestones from existing conversations.
+RST can now identify rare, durable turning points in a relationship alongside ordinary stat updates. Proposed milestones remain reviewable before they are saved, and existing milestones can be edited or deleted from the character library. A full-chat backfill option can also scan an existing conversation for important milestones that predate the feature.
 
 ## Temporary Relationship Conditions
 
-Characters can now carry temporary contextual relationship states such as **Guarded**, **Suspicious**, **Resentful**, **Protective**, or **Conflicted**. Conditions can be proposed, updated, or resolved as the relationship changes and are included in the approval flow and character library.
-
-Unlike milestones, conditions describe the character's current relationship state rather than a permanent turning point.
+Characters can now carry temporary relationship states such as Guarded, Suspicious, Resentful, Protective, or Conflicted. Conditions can be proposed, updated, or resolved as circumstances change. Unlike milestones, conditions represent the character's current relationship state rather than a permanent historical turning point.
 
 ## Relationship Trajectory & Inertia
 
-RST now derives a relationship trajectory from approved stat history and uses that history to keep future changes psychologically consistent.
+RST now derives relationship trajectory from approved stat history and uses that history to discourage implausibly abrupt acceleration or reversals. Relationship inertia conservatively limits unsupported stat movement while still allowing sufficiently important critical moments to break through when appropriate.
 
-Relationship inertia applies conservative limits when a proposed update would accelerate a stat too quickly or reverse an established trend without enough justification. Genuine critical moments can still bypass normal inertia when appropriate.
+## Expanded Sidecar Presence Tracking
 
-## Critical Stat Changes
+The sidecar can now distinguish more than simple physical presence, including participation through calls, messaging, surveillance, remote involvement, and parallel-scene activity where applicable. Alias matching, scene-transition handling, response validation, and malformed-output safeguards were also strengthened so invalid sidecar output fails closed instead of wiping the current presence list.
 
-Major relationship events can trigger critical increases or decreases beyond the normal configured Stat Change Range. Critical changes are reserved for sufficiently significant events rather than ordinary scene movement and remain visible in the approval flow before being committed.
+The sidecar can also be paused and resumed directly from the extension UI.
+
+## Improved Approval Flow
+
+Structural relationship changes such as milestones, conditions, and lock changes remain reviewable even when a scene produces no numeric stat changes. Approval cards and logs now expose more of the relevant relationship state before changes are committed.
+
+## Settings & Storage Improvements
+
+- Added clearer save feedback and improved persistence for the names blacklist.
+- Added an explicit **Save Stat Settings** action.
+- Added cleanup for obsolete stored evidence fields.
+
+## Bug Fixes
+
+- Fixed stale commentary in the prompt injection: the newest update-log entry is now read from the correct end of the log, so the injected commentary reflects the latest approved scene instead of the oldest.
+- Fixed the remove (✕) button on "Currently present" character cards doing nothing when the click landed on the icon inside the button.
+- Present-character cards now color their top stat values as positive/negative/neutral, matching the rest of the panel.
+- Improved protection against duplicate first-time stat proposals for pre-created zero-stat profiles.
+- Improved sidecar alias resolution and validation around scene changes.
+
+---
+
+# Implemented Relationship Systems
+
+## Critical Increase/Decreases
+
+Whenever a sufficiently significant moment occurs within the roleplay scene, the respective stat(s) can receive a critical increase or decrease beyond the normal amount set within the **Stat Change Range**. Critical changes are reserved for major relationship events and remain visible in the approval flow before being committed.
 
 ## Threshold Locks
 
 ### Hard Locks
 
-Hard Locks allow specific stats to be capped or floored based on a character's personality, psychology, history, and established relationship behavior.
+This allows the AI to set caps or floors on an NPC's stats based on their personality, psychology, history, and established relationship behavior. If an NPC has strong reasons not to trust easily, for example, a Hard Lock can limit Trust until the relationship genuinely changes enough to justify movement beyond that boundary.
 
-### Soft Locks
+### Soft Locks (Unlockable)
 
-Soft Locks are conditional limits that can prevent further movement in a stat until an appropriate narrative requirement is met. The required condition is stored with the lock so the relationship can progress naturally once the underlying obstacle has actually changed.
+This is a conditional cap or floor that may require the {{user}} to perform certain actions or meet specific narrative requirements before the respective stat can continue moving. The unlock condition is stored with the lock so relationship growth can resume naturally once the underlying obstacle has actually changed.
 
-Threshold-lock backfilling now examines raw chat history in chunks and considers existing stats, relationship trajectory, milestones, conditions, locks, and historical behavior before proposing new locks. Existing lock slots are preserved rather than overwritten unnecessarily.
-
-## Sidecar Presence Tracking Overhaul
-
-The sidecar now handles character presence with more context than a simple present/absent flag. It can distinguish participation through physical presence, calls, messaging, surveillance, remote involvement, and parallel-scene activity where applicable.
-
-Additional safeguards improve alias matching, scene-transition handling, evidence validation, and malformed-response handling. Invalid sidecar output now fails closed instead of wiping the current presence list.
-
-The sidecar can also be paused and resumed directly from the extension UI.
-
-## Deletion-Safe Sidecar Scheduling
-
-The sidecar's message counter is treated as the live chat message count at the last scan rather than an ever-incrementing counter. If messages are deleted and SillyTavern renumbers the chat, RST detects the shrink, clears its session-only processed-message cache, and clamps the saved counter to the current chat length.
-
-RST also listens for supported message deletion, edit, and swipe events and resets its runtime state defensively.
-
-## Smarter Character Matching & Duplicate-Card Prevention
-
-Stat-update parsing resolves returned character names against canonical names, saved aliases, and fuzzy matches using a shared matcher. Canonical names and aliases can no longer create duplicate pending cards for the same character.
-
-Pending updates are also deduplicated before saving and when the Home tab renders, keeping the strongest available entry if duplicates ever slip through.
-
-## Improved Initial Stat Generation
-
-Initial generation now resolves aliases and fuzzy names into an existing zero-stat profile instead of creating a second discovered copy of the same character.
-
-When a returned name matches an existing all-zero character, the entry is treated as true first-time initialization and is not clamped by the normal Stat Change Range. Established profiles continue to use normal delta-range, lock, inertia, and critical-change handling.
-
-## Improved Approval Flow
-
-Structural relationship changes such as milestones, conditions, and lock changes remain reviewable even when a scene produces no numeric stat changes.
-
-Approval cards and logs now expose more of the reasoning-relevant relationship state, including inertia, milestones, and conditions, before changes are committed.
-
-## Scene Close Responsiveness
-
-Closing a scene updates the UI immediately before the stat-update LLM call begins, so a slow model no longer makes the scene appear stuck open. Repeated clicks cannot start overlapping close/update requests.
-
-If generation takes unusually long, RST confirms that the scene itself is already closed while generation continues. Failed generation does not reopen the scene.
-
-## Settings & Storage Improvements
-
-- Added clearer save feedback for the names blacklist and improved blacklist persistence.
-- Added an explicit **Save Stat Settings** action.
-- Added cleanup for obsolete stored evidence fields.
-- Present-character cards use positive, negative, and neutral stat coloring consistently with the character library.
-
-## Additional Fixes
-
-- Fixed stale commentary in prompt injection so the newest approved update-log entry is used.
-- Fixed the remove button on **Currently Present** character cards when clicking directly on its icon.
-- Improved sidecar alias resolution and validation around scene changes.
-- Improved protection against duplicate first-time stat proposals for pre-created zero-stat profiles.
+Threshold-lock backfilling can scan raw chat history in chunks and consider current stats, trajectory, milestones, conditions, existing locks, and historical behavior before proposing new locks. Existing lock slots are preserved instead of being overwritten unnecessarily.
