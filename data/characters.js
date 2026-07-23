@@ -275,6 +275,8 @@ export function createCharacter(name, options = {}) {
 
         dynamicTitle: options.dynamicTitle || "",
         narrativeSummary: options.narrativeSummary || "",
+        relationshipMilestones: Array.isArray(options.relationshipMilestones) ? options.relationshipMilestones : [],
+        relationshipConditions: Array.isArray(options.relationshipConditions) ? options.relationshipConditions : [],
 
         updateLog: [],
     };
@@ -354,6 +356,9 @@ function normalizeProfileLocks(profile) {
             if (e && typeof e.cap === "number") ensurePressure(e);
         }
     }
+    if (!Array.isArray(profile.relationshipMilestones)) profile.relationshipMilestones = [];
+    if (!Array.isArray(profile.relationshipConditions)) profile.relationshipConditions = [];
+
     // Soft locks (added later) — same backfill treatment.
     if (!profile.softLocks) {
         profile.softLocks = createBlankSoftLocks();
@@ -416,7 +421,7 @@ export function findCharacterByName(name) {
         }
     }
 
-    // 4. Substring match (e.g., "Doe" matches inside "Jane Doe")
+    // 4. Substring match (e.g., "Jane" matches inside "Jane Doe")
     for (const c of all) {
         // Check if the name is a substring of the character's main name, or vice versa
         const cNameLower = c.name.toLowerCase().trim();
@@ -575,7 +580,7 @@ export function updateCharacterProfile(charId, updates) {
     const profile = getStoredCharacter(charId);
     if (!profile) return;
 
-    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary", "folderId", "avatar", "hardLocks", "softLocks", "suppressDescriptionInjection", "suppressNotesInjection", "statCategoryVisibility"];
+    const allowedFields = ["name", "nameAliases", "description", "notes", "source", "dynamicTitle", "narrativeSummary", "relationshipMilestones", "relationshipConditions", "folderId", "avatar", "hardLocks", "softLocks", "suppressDescriptionInjection", "suppressNotesInjection", "statCategoryVisibility"];
     for (const field of allowedFields) {
         if (updates[field] !== undefined) {
             profile[field] = updates[field];
@@ -822,6 +827,12 @@ function validateProfile(profile) {
     }
     if (profile.narrativeSummary !== undefined && typeof profile.narrativeSummary !== "string") {
         errors.push("Invalid type for 'narrativeSummary' (must be a string)");
+    }
+    if (profile.relationshipMilestones !== undefined && !Array.isArray(profile.relationshipMilestones)) {
+        errors.push("Invalid 'relationshipMilestones' (must be an array if present)");
+    }
+    if (profile.relationshipConditions !== undefined && !Array.isArray(profile.relationshipConditions)) {
+        errors.push("Invalid 'relationshipConditions' (must be an array if present)");
     }
     if (profile.source !== undefined && typeof profile.source !== "string") {
         errors.push("Invalid type for 'source' (must be a string)");

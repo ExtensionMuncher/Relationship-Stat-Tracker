@@ -310,6 +310,63 @@
     background: var(--rst-bg-hover);
 }
 
+/* Batch Scan used to inherit the avatar-label purple, which can disappear
+   against custom ST themes. Keep the action on the normal theme text color. */
+.rst-batch-scan-btn {
+    border-color: var(--rst-accent);
+    color: var(--rst-text) !important;
+    font-weight: 600;
+}
+
+.rst-milestone-scan-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 7px 0;
+    cursor: pointer;
+}
+.rst-milestone-scan-row + .rst-milestone-scan-row {
+    border-top: 0.5px solid var(--rst-border);
+}
+.rst-milestone-scan-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.rst-name-blacklist-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 0 10px;
+}
+
+.rst-save-blacklist-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    min-height: 32px;
+    padding: 6px 13px;
+    border-color: var(--rst-accent);
+    color: var(--rst-text);
+    font-weight: 500;
+}
+
+.rst-save-blacklist-btn i {
+    color: var(--rst-accent);
+}
+
+.rst-save-blacklist-btn:disabled {
+    cursor: wait;
+    opacity: 0.7;
+}
+
+.rst-name-blacklist-status {
+    min-width: 52px;
+    font-size: 12px;
+    color: var(--rst-text-muted);
+}
+
 .rst-btn-approve {
     font-size: 12px;
     padding: 5px 11px;
@@ -1496,6 +1553,33 @@ dialog.popup .editor_maximize:hover {
     background: var(--rst-text-muted);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--rst-text-muted) 20%, transparent);
 }
+
+.rst-sidecar-pause-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 9px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #888) 18%, transparent);
+    border-radius: 7px;
+    background: transparent;
+    color: var(--rst-text-muted);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.rst-sidecar-pause-btn:hover:not(:disabled) {
+    background: var(--rst-bg-hover);
+    color: var(--rst-text);
+}
+.rst-sidecar-pause-btn.is-paused {
+    color: var(--rst-neg);
+    border-color: color-mix(in srgb, var(--rst-neg) 40%, transparent);
+}
+.rst-sidecar-pause-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
 .rst-status-title { font-weight: 500; font-size: 14px; }
 .rst-status-sub { font-size: 12px; color: var(--rst-text-muted); margin-top: 1px; }
 
@@ -1798,3 +1882,150 @@ dialog.popup .editor_maximize:hover {
 }
 .rst-pressure-review-rec { font-size: 12px; margin-bottom: 4px; }
 .rst-pressure-review-reason { font-size: 11px; color: var(--rst-text-muted); line-height: 1.5; }
+
+/* ─── Relationship trajectory (read-only, derived from update history) ─── */
+.rst-trajectory-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+    margin-bottom: 4px;
+}
+
+.rst-trajectory-label {
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--rst-text-muted);
+}
+
+.rst-trajectory-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 3px 9px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #888) 22%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #888) 8%, transparent);
+    color: var(--rst-text);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: help;
+}
+
+
+.rst-pending-system {
+    margin: 8px 0 10px;
+    padding: 9px 10px;
+    border: 1px solid var(--rst-border);
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #888) 5%, transparent);
+    font-size: 11px;
+    line-height: 1.5;
+}
+.rst-pending-system-title { font-weight: 600; margin-bottom: 6px; }
+.rst-pending-system-title i { margin-right: 5px; }
+.rst-pending-system-item + .rst-pending-system-item { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--rst-border); }
+.rst-pending-system-name { font-weight: 600; }
+.rst-pending-system-resolution { color: var(--rst-text-muted); margin-top: 2px; }
+
+.rst-condition-wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+    margin-bottom: 4px;
+}
+.rst-condition-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 25px;
+    padding: 3px 9px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #888) 24%, transparent);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #888) 9%, transparent);
+    color: var(--rst-text);
+    font-size: 11px;
+    cursor: pointer;
+}
+.rst-condition-badge:hover { filter: brightness(1.08); }
+.rst-condition-badge i { font-size: 10px; }
+
+.rst-milestones {
+    margin-top: 10px;
+    border-top: 1px solid var(--rst-border);
+    padding-top: 8px;
+}
+.rst-milestones summary {
+    cursor: pointer;
+    color: var(--rst-text-muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+.rst-milestone-list { margin-top: 7px; }
+.rst-milestone-item {
+    padding: 8px 0;
+    border-top: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #888) 12%, transparent);
+}
+.rst-milestone-item:first-child { border-top: 0; }
+.rst-milestone-title { font-size: 12px; font-weight: 600; }
+.rst-milestone-description { font-size: 11px; line-height: 1.5; margin-top: 2px; }
+
+.rst-inertia-note {
+    margin-top: 4px;
+    font-size: 10px;
+    line-height: 1.45;
+    color: var(--rst-text-muted);
+}
+.rst-inertia-note i { margin-right: 4px; opacity: 0.8; }
+
+/* Milestone maintenance controls */
+.rst-milestone-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+}
+.rst-milestone-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 0 auto;
+}
+.rst-milestone-action {
+    border: 0.5px solid var(--rst-border);
+    background: transparent;
+    color: var(--rst-text-muted);
+    border-radius: 5px;
+    min-width: 25px;
+    height: 25px;
+    padding: 0 6px;
+    cursor: pointer;
+}
+.rst-milestone-action:hover {
+    color: var(--rst-text);
+    background: rgba(127, 127, 127, 0.12);
+}
+.rst-milestone-action.danger:hover {
+    color: var(--rst-danger, #d85b63);
+}
+.rst-milestone-edit input[type="text"],
+.rst-milestone-edit textarea {
+    width: 100%;
+    box-sizing: border-box;
+}
+.rst-milestone-domain-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    margin: 4px 0 10px;
+}
+.rst-milestone-domain-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+}

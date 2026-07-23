@@ -4,7 +4,7 @@
  * and appends it to ST's extension settings area
  */
 
-import { isEnabled, toggleEnabled, getSetting } from "../settings.js";
+import { isEnabled, toggleEnabled, getSetting, setSetting } from "../settings.js";
 import { getOpenScene } from "../data/scenes.js";
 
 // ─── Tab Definitions ──────────────────────────────────────
@@ -162,6 +162,7 @@ export function getActiveTab() {
  */
 export function renderHomeHeader($pane) {
     const enabled = isEnabled();
+    const sidecarPaused = getSetting("sidecarPaused", false);
 
     // Remove existing header to prevent duplicates
     $pane.find("#rst-header-wrap").remove();
@@ -173,6 +174,10 @@ export function renderHomeHeader($pane) {
                 <div class="rst-status-title">Relationship Stat Tracker</div>
                 <div id="rst-ext-lbl" class="rst-status-sub">${buildStatusSub(enabled)}</div>
             </div>
+            <button id="rst-sidecar-pause-btn" class="rst-sidecar-pause-btn${sidecarPaused ? " is-paused" : ""}" type="button" title="${sidecarPaused ? "Resume automatic character presence detection" : "Pause automatic character presence detection"}" ${enabled ? "" : "disabled"}>
+                <i class="fa-solid ${sidecarPaused ? "fa-play" : "fa-pause"}"></i>
+                <span>${sidecarPaused ? "Resume sidecar" : "Pause sidecar"}</span>
+            </button>
             <label class="rst-toggle">
                 <input type="checkbox" ${enabled ? "checked" : ""}>
                 <span class="rst-slider"></span>
@@ -185,7 +190,21 @@ export function renderHomeHeader($pane) {
         toggleEnabled(newState);
         $("#rst-ext-lbl").text(buildStatusSub(newState));
         $("#rst-header-wrap").toggleClass("rst-disabled-bar", !newState);
+        $("#rst-sidecar-pause-btn").prop("disabled", !newState);
         $(document).trigger("rst:toggle", [newState]);
+    });
+
+    $header.find("#rst-sidecar-pause-btn").on("click", function () {
+        const paused = !getSetting("sidecarPaused", false);
+        setSetting("sidecarPaused", paused);
+        const $button = $(this);
+        $button.toggleClass("is-paused", paused);
+        $button.attr("title", paused
+            ? "Resume automatic character presence detection"
+            : "Pause automatic character presence detection");
+        $button.find("i").attr("class", `fa-solid ${paused ? "fa-play" : "fa-pause"}`);
+        $button.find("span").text(paused ? "Resume sidecar" : "Pause sidecar");
+        $("#rst-ext-lbl").text(buildStatusSub(isEnabled()));
     });
 
     $pane.prepend($header);
@@ -196,11 +215,14 @@ export function renderHomeHeader($pane) {
  */
 function buildStatusSub(enabled) {
     if (!enabled) return "Disabled";
+    const sidecarPaused = getSetting("sidecarPaused", false);
     const freq = getSetting("scanFrequency", 5);
     let openLabel = "no open scene";
     try {
         const open = getOpenScene();
         if (open) openLabel = `Scene ${String(open.id).replace("scene_", "")} open`;
     } catch (e) { /* ignore */ }
-    return `Active · scanning every ${freq} messages · ${openLabel}`;
+    return sidecarPaused
+        ? `Active · sidecar paused · ${openLabel}`
+        : `Active · scanning every ${freq} messages · ${openLabel}`;
 }

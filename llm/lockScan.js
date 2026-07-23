@@ -1,35 +1,24 @@
 /**
- * llm/lockScan.js — "Scan for Locks" (debug/maintenance feature)
+ * llm/lockScan.js — retroactive threshold-lock audit.
  *
- * Reads each character's Personality (description) + Notes, plus existing scene
- * summaries for context, and asks the stat-update LLM to propose hard-lock caps
- * grounded in that character's established psychology.
- *
- * STRICT RULE: characters whose Personality (description) is empty are SKIPPED
- * entirely — the model is never asked to guess locks on a blank slate. This
- * saves tokens and avoids freestyled, ungrounded caps.
- *
- * Proposed locks are returned to the caller for user review/confirmation before
- * anything is written — this never silently mutates profiles.
+ * Uses the same visible-message/chunk indexing as Batch Scan. Raw history is
+ * read in chunks first to extract compact lock-relevant signals, then each
+ * character is evaluated with Personality, Notes, current relationship state,
+ * trajectory, milestones, conditions, summaries, existing locks, and those
+ * historical signals. Existing lock slots are never silently overwritten.
  */
 
 import { getSettings } from "../data/storage.js";
 import { getAllCharacters, STAT_CATEGORIES, STAT_NAMES, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
 import { getAllSceneSummaries } from "../data/scenes.js";
-import { makeRequest, getPersonaContext } from "./connections.js";
+import { deriveRelationshipTrajectory } from "../data/trajectory.js";
+import { makeRequest, getPersonaContext, updateRateLimiterSettings } from "./connections.js";
+import { buildHistoricalScanChunks } from "./batchScan.js";
 import { dlog } from "../lib/debug.js";
 
-// Max characters preserved for lock free-text fields (reason/condition/progress).
-// Generous so psychologically detailed locks are never chopped after a complete
-// LLM response. Truncation beyond this only guards against pathological output.
 const LOCK_TEXT_MAX = 1500;
+const MAX_HISTORY_SIGNALS_PER_CHARACTER = 24;
 
-/**
- * Run a lock scan across the library.
- * @returns {Promise<Array<{characterId, characterName, hardLocks: Array, softLocks: Array}>>}
- *          Proposed locks per character. Characters with no personality, or no
- *          proposals, are omitted.
- */
 export async function scanForLocks() {
     const settings = getSettings();
     const profileName = settings.connections?.statUpdateLLM;
@@ -38,61 +27,59 @@ export async function scanForLocks() {
         return [];
     }
 
+    updateRateLimiterSettings(settings.batchScan || {});
+
     const all = getAllCharacters();
-    // Only scan characters whose Personality (description) is filled...
     const withPersona = all.filter((c) => c.description && c.description.trim().length > 0);
     const noPersonaCount = all.length - withPersona.length;
 
-    // ...AND that do not already have ANY lock set. Characters with existing
-    // hard or soft locks are excluded so a re-scan never overwrites or stacks
-    // onto what is already configured. Clear a character's locks manually if
-    // you want them reconsidered.
-    const alreadyLocked = (c) => {
-        const visibleCategories = getVisibleStatCategories(c);
-        if (visibleCategories.length === 0) return true;
-        const has = (map) => {
-            if (!map) return false;
-            for (const cat of visibleCategories) for (const stat of STAT_NAMES) {
-                const e = map[cat]?.[stat];
-                if (e && typeof e.cap === "number") return true;
+    const hasOpenSlot = (c) => {
+        for (const cat of getVisibleStatCategories(c)) {
+            for (const stat of STAT_NAMES) {
+                const hard = c.hardLocks?.[cat]?.[stat];
+                const soft = c.softLocks?.[cat]?.[stat];
+                const hardOccupied = hard && typeof hard.cap === "number";
+                const softOccupied = soft && typeof soft.cap === "number";
+                if (!hardOccupied && !softOccupied) return true;
             }
-            return false;
-        };
-        return has(c.hardLocks) || has(c.softLocks);
+        }
+        return false;
     };
-    const eligible = withPersona.filter((c) => !alreadyLocked(c));
-    const lockedSkipped = withPersona.length - eligible.length;
+    const eligible = withPersona.filter(hasOpenSlot);
+    const fullSkipped = withPersona.length - eligible.length;
 
     if (eligible.length === 0) {
-        const why = noPersonaCount > 0 && lockedSkipped > 0
-            ? "Every character either has no Personality filled in or already has locks set."
-            : lockedSkipped > 0
-                ? "Every eligible character already has locks set. Clear a character's locks to re-scan them."
+        const why = noPersonaCount > 0 && fullSkipped > 0
+            ? "Every character either has no Personality filled in or all visible lock slots are already occupied."
+            : fullSkipped > 0
+                ? "Every eligible character already has locks covering all visible stat slots."
                 : "No characters have a Personality filled in — nothing to scan.";
         toastr?.info?.(why, "Relationship Stat Tracker");
         return [];
     }
 
-    dlog(`[RST] Lock scan: ${eligible.length} eligible, ${noPersonaCount} skipped (no personality), ${lockedSkipped} skipped (already locked)`);
-
+    const configuredChunkSize = Number(settings.batchScan?.chunkSize);
+    const maxMessages = Number.isFinite(configuredChunkSize)
+        ? Math.max(10, Math.min(60, Math.round(configuredChunkSize)))
+        : 30;
+    const chunks = buildHistoricalScanChunks({ maxMessages, maxChars: 60000 });
+    const historyByCharacter = await collectHistoricalLockSignals(chunks, eligible, profileName, settings);
     const pastSummaries = getAllSceneSummaries();
+
+    dlog(`[RST] Lock scan: ${eligible.length} eligible, ${noPersonaCount} skipped (no personality), ${fullSkipped} skipped (all visible lock slots occupied), ${chunks.length} history chunks.`);
+
     const results = [];
     let errorCount = 0;
     let proposedNoneCount = 0;
 
     for (const char of eligible) {
         try {
-            const proposed = await scanOneCharacter(char, pastSummaries, profileName);
-            if (proposed && proposed.error) { errorCount++; continue; }
-            const hard = (proposed && proposed.hardLocks) || [];
-            const soft = (proposed && proposed.softLocks) || [];
-            if (hard.length > 0 || soft.length > 0) {
-                results.push({
-                    characterId: char.id,
-                    characterName: char.name,
-                    hardLocks: hard,
-                    softLocks: soft,
-                });
+            const proposed = await scanOneCharacter(char, pastSummaries, historyByCharacter.get(char.id) || [], profileName);
+            if (proposed?.error) { errorCount++; continue; }
+            const hard = proposed?.hardLocks || [];
+            const soft = proposed?.softLocks || [];
+            if (hard.length || soft.length) {
+                results.push({ characterId: char.id, characterName: char.name, hardLocks: hard, softLocks: soft });
             } else {
                 proposedNoneCount++;
             }
@@ -103,107 +90,151 @@ export async function scanForLocks() {
     }
 
     dlog(`[RST] Lock scan complete: ${eligible.length} scanned, ${results.length} with proposals, ${proposedNoneCount} returned none, ${errorCount} errored.`);
-    // If every character errored, that is a real failure (connection/parse), not
-    // a legitimate "no locks needed" result — tell the user so they can act.
     if (errorCount > 0 && results.length === 0) {
-        toastr?.warning?.(`Lock scan hit errors on ${errorCount} character(s) and got no usable proposals. Check the console (F12) — likely a connection or response-format issue with the Stat Update LLM.`, "Relationship Stat Tracker", { timeOut: 9000 });
+        toastr?.warning?.(`Lock scan hit errors on ${errorCount} character(s) and got no usable proposals. Check F12.`, "Relationship Stat Tracker", { timeOut: 9000 });
     }
-
     return results;
 }
 
-/**
- * Ask the LLM to propose locks for a single character.
- */
-async function scanOneCharacter(char, pastSummaries, profileName) {
+async function collectHistoricalLockSignals(chunks, characters, profileName, settings) {
+    const result = new Map(characters.map((c) => [c.id, []]));
+    if (!chunks.length) return result;
+    const validIds = new Set(characters.map((c) => c.id));
+    const roster = characters.map((c) => `- ${c.id}: ${c.name}${Array.isArray(c.nameAliases) && c.nameAliases.length ? ` (aliases: ${c.nameAliases.slice(0, 6).join(", ")})` : ""}`).join("\n");
+
     const systemPrompt = [
-        "You set relationship-stat locks for a character based on their established psychology.",
-        "There are TWO lock types:",
-        "- HARD lock: a stat CANNOT rise above the cap through ordinary growth — a deep, trait-level limit (e.g. a profoundly guarded character who cannot trust past ~40%). Broken only by a rare critical moment.",
-        "- SOFT lock: a stat is capped UNTIL the user fulfills a specific narrative condition you define, then it auto-unlocks (e.g. romantic.affection capped at 45 until they share several genuine meals together).",
-        "Output ONLY a JSON object: { \"hardLocks\": [ { \"stat\": \"category.stat\", \"cap\": NUMBER, \"reason\": \"...\" } ], \"softLocks\": [ { \"stat\": \"category.stat\", \"cap\": NUMBER, \"condition\": \"...\", \"progress\": \"...\" } ] }",
-        "Only consider the visible/active categories listed in the character prompt. Hidden categories are off-limits: do not see them, reason about them, or propose locks for them.",
-        "Stats: trust, openness, support, affection.",
-        "Rules:",
-        "- Be CONSERVATIVE. Locks are exceptional, not routine. A typical character warrants 0-3 locks TOTAL, reserved for the few stats where their psychology creates a genuine, defining ceiling. Do not lock a stat just because it could plausibly be limited — only when NOT locking it would misrepresent who they are.",
-        "- Never lock a stat merely because it is currently low; low stats can still grow naturally. Lock only true trait-level barriers.",
-        "- Prefer leaving a stat unlocked when in doubt. An empty result for a character is a perfectly valid and common outcome.",
-        "- Ground every lock in the provided personality text. Never invent traits not present.",
-        "- Use a HARD lock for fixed trait ceilings; use a SOFT lock when deeper growth should be earned through a specific milestone.",
-        "- cap is -100 to 100. Do NOT set a cap below the stat's current value.",
-        "- If nothing is justified, return { \"hardLocks\": [], \"softLocks\": [] }.",
+        "You are extracting compact HISTORY SIGNALS for a later RST threshold-lock audit.",
+        "Do NOT decide caps yet. Read the raw roleplay chunk and identify only behavior that may reveal a stable psychological ceiling (hard-lock signal) or a specific condition that must be met before deeper growth is plausible (soft-lock signal).",
+        "Useful signals include repeated guardedness, refusal to rely on the persona, rigid principles, persistent avoidance, explicit prerequisites, or a demonstrated pattern that contradicts easy relationship growth.",
+        "Do not treat a currently low stat, one bad mood, one argument, or ordinary dramatic tension as a lock by itself.",
+        "Use ONLY supplied character IDs.",
+        "Output JSON only: {\"characters\":{\"char_id\":[{\"kind\":\"hard\",\"stat\":\"platonic.openness\",\"summary\":\"...\"}]}}.",
     ].join("\n");
 
-    const parts = [];
-    const visibleCategories = getVisibleStatCategories(char);
-    parts.push(`CHARACTER: ${char.name}`);
-    parts.push(`VISIBLE/ACTIVE CATEGORIES: ${visibleCategories.length ? visibleCategories.join(", ") : "NONE"}. Hidden categories are off-limits and must not receive lock proposals.`);
-    parts.push(`PERSONALITY: ${char.description}`);
-    if (char.notes && char.notes.trim()) parts.push(`NOTES: ${char.notes}`);
-
-    // Persona context — soft-lock conditions are about what the USER must do,
-    // so name the user explicitly and include their persona description if set.
     const persona = getPersonaContext();
-    parts.push(`\nTHE USER (the person this character relates to): ${persona.name}`);
-    if (persona.description) parts.push(`USER PERSONA: ${persona.description}`);
-    parts.push(`When writing soft-lock conditions, refer to the user as "${persona.name}" rather than a generic "the user".`);
+    for (const chunk of chunks) {
+        const userPrompt = [
+            `PERSONA: ${persona.name}`,
+            persona.description ? `PERSONA CONTEXT: ${persona.description}` : "",
+            "KNOWN CHARACTERS:", roster,
+            "\nHISTORY CHUNK:", chunk.text,
+            "\nReturn JSON only.",
+        ].filter(Boolean).join("\n");
+        try {
+            const maxTokens = Math.max(2500, Number(settings.batchScan?.initialStatMaxTokens) || 3000);
+            const raw = await makeRequest(profileName, systemPrompt, userPrompt, maxTokens, 0.15);
+            const parsed = extractLockJson(raw);
+            const charMap = parsed?.characters && typeof parsed.characters === "object" ? parsed.characters : {};
+            for (const [charId, items] of Object.entries(charMap)) {
+                if (!validIds.has(charId) || !Array.isArray(items)) continue;
+                const bucket = result.get(charId);
+                for (const item of items) {
+                    if (!item || !["hard", "soft"].includes(String(item.kind || "").toLowerCase())) continue;
+                    const statPath = String(item.stat || "").toLowerCase();
+                    const [cat, stat] = statPath.split(".");
+                    if (!STAT_CATEGORIES.includes(cat) || !STAT_NAMES.includes(stat)) continue;
+                    const summary = String(item.summary || "").trim().slice(0, 800);
+                    if (!summary) continue;
+                    bucket.push({
+                        kind: String(item.kind).toLowerCase(),
+                        stat: `${cat}.${stat}`,
+                        summary,
+                    });
+                    if (bucket.length >= MAX_HISTORY_SIGNALS_PER_CHARACTER) break;
+                }
+            }
+        } catch (err) {
+            console.error(`[RST] Lock history extraction failed for chunk ${chunk.start}-${chunk.end}:`, err);
+        }
+    }
+    return result;
+}
 
-    // Current relationship dynamic — the title + narrative capture where this
-    // relationship stands right now, which grounds soft-lock conditions in the
-    // actual arc rather than personality alone.
-    if (char.dynamicTitle && char.dynamicTitle.trim()) {
-        parts.push(`\nCURRENT DYNAMIC: ${char.dynamicTitle}`);
-    }
-    if (char.narrativeSummary && char.narrativeSummary.trim()) {
-        parts.push(`CURRENT NARRATIVE: ${char.narrativeSummary}`);
-    }
+async function scanOneCharacter(char, pastSummaries, historicalSignals, profileName) {
+    const systemPrompt = [
+        "You set relationship-stat threshold locks for a character based on established psychology AND grounded relationship history.",
+        "There are TWO lock types:",
+        "- HARD lock: a stat cannot rise above the cap through ordinary growth because of a deep trait-level limit. Broken only by a rare fired critical moment.",
+        "- SOFT lock: a stat is capped until the persona fulfills a specific narrative condition; then it can unlock.",
+        "Output ONLY JSON: {\"hardLocks\":[{\"stat\":\"category.stat\",\"cap\":NUMBER,\"reason\":\"...\"}],\"softLocks\":[{\"stat\":\"category.stat\",\"cap\":NUMBER,\"condition\":\"...\",\"progress\":\"...\"}]}",
+        "Only visible/active categories are allowed.",
+        "Be CONSERVATIVE. Locks are exceptional. A typical character warrants 0-3 total, not a lock on every stat.",
+        "Never lock merely because a stat is low. Require a defining personality barrier and/or a sustained historical pattern.",
+        "Existing lock slots are READ-ONLY in this maintenance scan. Never replace, loosen, tighten, duplicate, or reinterpret them. Propose only for currently empty slots.",
+        "Ground hard locks primarily in stable psychology corroborated by history. Ground soft locks in a specific relationship prerequisite supported by history/current dynamic.",
+        "cap is -100 to 100 and may not be below the current stat value.",
+        "If nothing new is justified, return empty arrays.",
+    ].join("\n");
+
+    const visibleCategories = getVisibleStatCategories(char);
+    const persona = getPersonaContext();
+    const trajectory = deriveRelationshipTrajectory(char);
+    const parts = [
+        `CHARACTER: ${char.name}`,
+        `VISIBLE/ACTIVE CATEGORIES: ${visibleCategories.join(", ") || "NONE"}`,
+        `PERSONALITY: ${char.description}`,
+    ];
+    if (char.notes?.trim()) parts.push(`NOTES: ${char.notes}`);
+    parts.push(`\nPERSONA: ${persona.name}`);
+    if (persona.description) parts.push(`PERSONA CONTEXT: ${persona.description}`);
+    parts.push(`When writing soft-lock conditions, refer to the persona as "${persona.name}".`);
+
+    if (char.dynamicTitle?.trim()) parts.push(`\nCURRENT DYNAMIC: ${char.dynamicTitle}`);
+    if (char.narrativeSummary?.trim()) parts.push(`CURRENT NARRATIVE: ${char.narrativeSummary}`);
+    parts.push(`CURRENT TRAJECTORY: ${trajectory.label} — ${trajectory.explanation}`);
 
     parts.push("\nCURRENT STATS:");
     for (const cat of visibleCategories) {
-        const s = char.stats[cat];
-        parts.push(`  ${cat}: trust=${s.trust}%, openness=${s.openness}%, support=${s.support}%, affection=${s.affection}%`);
+        const s = char.stats?.[cat] || {};
+        parts.push(`  ${cat}: trust=${s.trust ?? 0}%, openness=${s.openness ?? 0}%, support=${s.support ?? 0}%, affection=${s.affection ?? 0}%`);
     }
 
-    // Existing caps (don't re-propose what's already set)
     const existing = [];
-    if (char.hardLocks) {
-        for (const cat of visibleCategories) {
-            for (const stat of STAT_NAMES) {
-                const lk = char.hardLocks[cat]?.[stat];
-                if (lk && typeof lk.cap === "number") existing.push(`${cat}.${stat}=${lk.cap}%`);
-            }
+    for (const cat of visibleCategories) {
+        for (const stat of STAT_NAMES) {
+            const hard = char.hardLocks?.[cat]?.[stat];
+            const soft = char.softLocks?.[cat]?.[stat];
+            if (hard && typeof hard.cap === "number") existing.push(`${cat}.${stat}: HARD ${hard.cap}% — ${hard.reason || "no reason"}`);
+            if (soft && typeof soft.cap === "number") existing.push(`${cat}.${stat}: SOFT ${soft.cap}% until ${soft.condition || "condition unspecified"}${soft.met ? " (resolved history)" : ""}`);
         }
     }
-    if (existing.length > 0) {
-        parts.push(`\nEXISTING CAPS (already set — only propose NEW or tighter ones): ${existing.join(", ")}`);
+    if (existing.length) {
+        parts.push("\nEXISTING LOCKS — READ ONLY, DO NOT REPLACE:");
+        parts.push(...existing.map((x) => `  - ${x}`));
     }
 
-    // A little scene context for grounding (kept short to save tokens)
-    if (pastSummaries && pastSummaries.length > 0) {
-        const recent = pastSummaries.slice(-4).map((s, i) => `  [${i}] ${typeof s === "string" ? s : (s.summary || s.llmSummary || "")}`);
-        parts.push("\nRECENT SCENE CONTEXT (for grounding only):");
-        parts.push(...recent);
+    const milestones = Array.isArray(char.relationshipMilestones) ? char.relationshipMilestones.slice(-8) : [];
+    if (milestones.length) {
+        parts.push("\nRELATIONSHIP MILESTONES:");
+        parts.push(...milestones.map((m) => `  - ${m.title}: ${m.description}`));
+    }
+    const conditions = Array.isArray(char.relationshipConditions) ? char.relationshipConditions.filter((c) => c && c.active !== false).slice(-8) : [];
+    if (conditions.length) {
+        parts.push("\nACTIVE TEMPORARY CONDITIONS:");
+        parts.push(...conditions.map((c) => `  - ${c.label || c.type || "Condition"}: ${c.reason || c.effect || ""}`));
+    }
+
+    if (historicalSignals.length) {
+        parts.push("\nFULL-HISTORY PATTERNS EXTRACTED FROM RAW CHAT CHUNKS:");
+        for (const signal of historicalSignals) {
+            parts.push(`  - ${signal.kind.toUpperCase()} candidate ${signal.stat}: ${signal.summary}`);
+        }
+    } else {
+        parts.push("\nFULL-HISTORY PATTERNS: No strong lock-specific pattern was extracted from the raw chat. This strongly favors proposing no new locks unless Personality/current state independently makes a defining ceiling unmistakable.");
+    }
+
+    if (pastSummaries?.length) {
+        const recent = pastSummaries.slice(-6).map((s, i) => `  [${i}] ${typeof s === "string" ? s : (s.summary || s.llmSummary || "")}`);
+        parts.push("\nRECENT SCENE SUMMARIES (secondary context):", ...recent);
     }
 
     parts.push("\nReturn JSON only.");
-
-    const userPrompt = parts.join("\n");
-    const resultText = await makeRequest(profileName, systemPrompt, userPrompt, 20000, 0.3);
-    if (!resultText) {
-        dlog(`[RST] Lock scan: no response for ${char.name}`);
-        return { hardLocks: [], softLocks: [], error: "no_response" };
-    }
-    dlog(`[RST] Lock scan raw response for ${char.name}:`, resultText.slice(0, 500));
+    const resultText = await makeRequest(profileName, systemPrompt, parts.join("\n"), 20000, 0.2);
+    if (!resultText) return { hardLocks: [], softLocks: [], error: "no_response" };
 
     const parsed = extractLockJson(resultText);
-    if (!parsed) {
-        dlog(`[RST] Lock scan: could not parse JSON for ${char.name}. Raw:`, resultText.slice(0, 300));
-        return { hardLocks: [], softLocks: [], error: "parse_failed" };
-    }
-
-    // Back-compat: an older response may use { locks: [...] } for hard locks.
-    const rawHard = Array.isArray(parsed.hardLocks) ? parsed.hardLocks
-        : (Array.isArray(parsed.locks) ? parsed.locks : []);
+    if (!parsed) return { hardLocks: [], softLocks: [], error: "parse_failed" };
+    const rawHard = Array.isArray(parsed.hardLocks) ? parsed.hardLocks : (Array.isArray(parsed.locks) ? parsed.locks : []);
     const rawSoft = Array.isArray(parsed.softLocks) ? parsed.softLocks : [];
 
     const validHard = [];
@@ -211,17 +242,15 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
         if (!l || typeof l.stat !== "string" || typeof l.cap !== "number") continue;
         const [cat, stat] = l.stat.toLowerCase().split(".");
         if (!STAT_CATEGORIES.includes(cat) || !STAT_NAMES.includes(stat) || !isStatCategoryVisible(char, cat)) continue;
+        const hardExisting = char.hardLocks?.[cat]?.[stat];
+        const softExisting = char.softLocks?.[cat]?.[stat];
+        if ((hardExisting && typeof hardExisting.cap === "number") || (softExisting && typeof softExisting.cap === "number")) continue;
         let cap = Math.max(-100, Math.min(100, Math.round(l.cap)));
-        const cur = char.stats[cat]?.[stat] ?? 0;
-        if (cap < cur) cap = cur; // never cap below current value
-        const hardReasonRaw = String(l.reason || "").trim();
-        const hardReasonStored = hardReasonRaw.slice(0, LOCK_TEXT_MAX);
-        if (hardReasonRaw.length > hardReasonStored.length) {
-            dlog(`[RST] Lock scan: hard reason for ${cat}.${stat} TRUNCATED by extension slice — raw ${hardReasonRaw.length} chars, stored ${hardReasonStored.length}. Raise LOCK_TEXT_MAX if this is unwanted.`);
-        } else {
-            dlog(`[RST] Lock scan: hard reason for ${cat}.${stat} stored intact (${hardReasonStored.length} chars).`);
-        }
-        validHard.push({ stat: `${cat}.${stat}`, cap, reason: hardReasonStored });
+        const cur = char.stats?.[cat]?.[stat] ?? 0;
+        if (cap < cur) cap = cur;
+        const reason = String(l.reason || "").trim().slice(0, LOCK_TEXT_MAX);
+        if (!reason) continue;
+        validHard.push({ stat: `${cat}.${stat}`, cap, reason });
     }
 
     const validSoft = [];
@@ -229,44 +258,34 @@ async function scanOneCharacter(char, pastSummaries, profileName) {
         if (!l || typeof l.stat !== "string" || typeof l.cap !== "number") continue;
         const [cat, stat] = l.stat.toLowerCase().split(".");
         if (!STAT_CATEGORIES.includes(cat) || !STAT_NAMES.includes(stat) || !isStatCategoryVisible(char, cat)) continue;
-        if (!l.condition || !String(l.condition).trim()) continue; // soft lock needs a condition
+        const hardExisting = char.hardLocks?.[cat]?.[stat];
+        const softExisting = char.softLocks?.[cat]?.[stat];
+        if ((hardExisting && typeof hardExisting.cap === "number") || (softExisting && typeof softExisting.cap === "number")) continue;
+        const condition = String(l.condition || "").trim().slice(0, LOCK_TEXT_MAX);
+        if (!condition) continue;
         let cap = Math.max(-100, Math.min(100, Math.round(l.cap)));
-        const cur = char.stats[cat]?.[stat] ?? 0;
+        const cur = char.stats?.[cat]?.[stat] ?? 0;
         if (cap < cur) cap = cur;
-        const condRaw = String(l.condition || "").trim();
-        const condStored = condRaw.slice(0, LOCK_TEXT_MAX);
-        const progRaw = String(l.progress || "").trim();
-        const progStored = progRaw.slice(0, LOCK_TEXT_MAX);
-        if (condRaw.length > condStored.length || progRaw.length > progStored.length) {
-            dlog(`[RST] Lock scan: soft text for ${cat}.${stat} TRUNCATED by extension slice — condition raw ${condRaw.length}/stored ${condStored.length}, progress raw ${progRaw.length}/stored ${progStored.length}.`);
-        } else {
-            dlog(`[RST] Lock scan: soft text for ${cat}.${stat} stored intact (condition ${condStored.length}, progress ${progStored.length} chars).`);
-        }
-        validSoft.push({ stat: `${cat}.${stat}`, cap, condition: condStored, progress: progStored });
+        validSoft.push({
+            stat: `${cat}.${stat}`,
+            cap,
+            condition,
+            progress: String(l.progress || "").trim().slice(0, LOCK_TEXT_MAX),
+        });
     }
-
     return { hardLocks: validHard, softLocks: validSoft };
 }
 
-/**
- * Minimal JSON extractor for the lock-scan response.
- */
 function extractLockJson(text) {
+    if (!text) return null;
     const raw = String(text).trim();
-    // Try fenced or raw
     const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
     const candidate = fence ? fence[1].trim() : raw;
-    try {
-        return JSON.parse(candidate);
-    } catch (e) {
-        // Greedy first { ... last }
-        const start = candidate.indexOf("{");
-        const end = candidate.lastIndexOf("}");
-        if (start !== -1 && end > start) {
-            try {
-                return JSON.parse(candidate.slice(start, end + 1));
-            } catch (e2) { /* fall through */ }
-        }
+    try { return JSON.parse(candidate); } catch { /* continue */ }
+    const start = candidate.indexOf("{");
+    const end = candidate.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+        try { return JSON.parse(candidate.slice(start, end + 1)); } catch { /* ignore */ }
     }
     return null;
 }

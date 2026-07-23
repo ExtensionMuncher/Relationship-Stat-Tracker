@@ -38,6 +38,8 @@ import {
 } from "../data/characters.js";
 import { generateProfile } from "../llm/profileGen.js";
 import { formatTimeAgo } from "../data/scenes.js";
+import { deriveRelationshipTrajectory } from "../data/trajectory.js";
+import { getRelationshipConditionDefinition } from "../data/conditions.js";
 import { Popup, POPUP_RESULT, POPUP_TYPE } from "../../../../../scripts/popup.js";
 import { showPanelLoading, hidePanelLoading } from "./panel.js";
 
@@ -683,6 +685,66 @@ function renderCharacterCard($pane, profile) {
         }
     }
 
+    // ── Read-only trajectory, derived from the character's own update log ──
+    const trajectory = deriveRelationshipTrajectory(profile);
+    const $trajectory = $('<div class="rst-trajectory-row"></div>');
+    $trajectory.append('<span class="rst-trajectory-label">Trajectory</span>');
+    const $trajectoryBadge = $('<span class="rst-trajectory-badge"></span>')
+        .text(trajectory.label)
+        .attr('title', trajectory.explanation)
+        .attr('data-trajectory', trajectory.key);
+    $trajectory.append($trajectoryBadge);
+    $card.append($trajectory);
+
+    const activeConditions = Array.isArray(profile.relationshipConditions) ? profile.relationshipConditions : [];
+    if (activeConditions.length) {
+        const $conditionWrap = $('<div class="rst-condition-wrap"></div>');
+        for (const condition of activeConditions) {
+            const def = getRelationshipConditionDefinition(condition.type);
+            if (!def) continue;
+            const $badge = $('<button type="button" class="rst-condition-badge"></button>')
+                .attr('title', `Temporary condition: ${def.label}`)
+                .append($(`<i class="fa-solid ${def.icon}"></i>`))
+                .append($('<span></span>').text(def.label));
+            $badge.on('click', () => showRelationshipConditionDetail(profile, condition));
+            $conditionWrap.append($badge);
+        }
+        $card.append($conditionWrap);
+    }
+
+    const milestones = Array.isArray(profile.relationshipMilestones) ? profile.relationshipMilestones : [];
+    if (milestones.length) {
+        const $details = $('<details class="rst-milestones"></details>');
+        $details.append($('<summary></summary>').text(`Relationship milestones (${milestones.length})`));
+        const $list = $('<div class="rst-milestone-list"></div>');
+        const indexedMilestones = milestones.map((milestone, originalIndex) => ({ milestone, originalIndex })).reverse();
+        for (const { milestone, originalIndex } of indexedMilestones) {
+            const $item = $('<div class="rst-milestone-item"></div>');
+            const $head = $('<div class="rst-milestone-head"></div>');
+            $head.append($('<div class="rst-milestone-title"></div>').text(milestone.title || 'Milestone'));
+            const $actions = $('<div class="rst-milestone-actions"></div>');
+            const $edit = $('<button type="button" class="rst-milestone-action" title="Edit milestone"><i class="fa-solid fa-pen"></i></button>');
+            const $delete = $('<button type="button" class="rst-milestone-action danger" title="Delete milestone"><i class="fa-solid fa-trash"></i></button>');
+            $edit.on('click', async (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                await editRelationshipMilestone(profile.id, milestone, originalIndex);
+            });
+            $delete.on('click', async (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                await deleteRelationshipMilestone(profile.id, milestone, originalIndex);
+            });
+            $actions.append($edit, $delete);
+            $head.append($actions);
+            $item.append($head);
+            $item.append($('<div class="rst-milestone-description"></div>').text(milestone.description || ''));
+            $list.append($item);
+        }
+        $details.append($list);
+        $card.append($details);
+    }
+
     // ── Dossier: relationship matrix ──
     $card.append('<div class="rst-d-section-lbl" style="margin-top:14px">Relationship matrix</div>');
     const $matrix = $('<div class="rst-d-matrix"></div>');
@@ -692,6 +754,122 @@ function renderCharacterCard($pane, profile) {
     $card.append($matrix);
 
     $pane.append($card);
+}
+
+
+async function editRelationshipMilestone(characterId, milestone, fallbackIndex) {
+    const safe = (value) => $("<div>").text(String(value ?? "")).html();
+    const domains = new Set(Array.isArray(milestone?.domains) ? milestone.domains : []);
+    const domainChecks = STAT_CATEGORIES.map((cat) => `
+        <label class="rst-milestone-domain-check">
+            <input type="checkbox" data-rst-ms-domain="${cat}" ${domains.has(cat) ? "checked" : ""}>
+            ${cat.charAt(0).toUpperCase() + cat.slice(1)}
+        </label>`).join("");
+
+    const html = `
+        <div class="rst-milestone-edit">
+            <div class="rst-lockedit-title">Edit relationship milestone</div>
+            <div class="rst-lockedit-hint">Correct the milestone wording or relationship domains. This does not alter relationship stats, Trajectory, or update history.</div>
+            <label class="rst-lockedit-label">Title</label>
+            <input type="text" id="rst-ms-title" value="${safe(milestone?.title || "")}" maxlength="160">
+            <label class="rst-lockedit-label">Description</label>
+            <textarea id="rst-ms-description" rows="6" maxlength="1200">${safe(milestone?.description || "")}</textarea>
+            <label class="rst-lockedit-label">Domains</label>
+            <div class="rst-milestone-domain-row">${domainChecks}</div>
+        </div>`;
+
+    const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Save milestone", cancelButton: "Cancel" });
+    const showPromise = popup.show();
+    const $dlg = $("dialog.popup").last();
+    const result = await showPromise;
+    if (result !== POPUP_RESULT.AFFIRMATIVE) return;
+
+    const title = String($dlg.find("#rst-ms-title").val() || "").trim().slice(0, 160);
+    const description = String($dlg.find("#rst-ms-description").val() || "").trim().slice(0, 1200);
+    if (!title || !description) {
+        toastr?.warning?.("Milestones need both a title and description.");
+        return;
+    }
+
+    const selectedDomains = [];
+    $dlg.find("[data-rst-ms-domain]").each(function () {
+        if (this.checked && STAT_CATEGORIES.includes(this.dataset.rstMsDomain)) selectedDomains.push(this.dataset.rstMsDomain);
+    });
+
+    const latest = getCharacterProfile(characterId);
+    if (!latest) return;
+    const current = Array.isArray(latest.relationshipMilestones) ? [...latest.relationshipMilestones] : [];
+    const index = findMilestoneIndex(current, milestone, fallbackIndex);
+    if (index < 0) {
+        toastr?.warning?.("That milestone no longer exists. Refresh the profile and try again.");
+        return;
+    }
+    const cleaned = { ...current[index] };
+    delete cleaned.evidenceRefs;
+    delete cleaned.messageRange;
+    delete cleaned.evidencePreview;
+    delete cleaned.candidateIds;
+    current[index] = {
+        ...cleaned,
+        title,
+        description,
+        domains: selectedDomains,
+        editedAt: Date.now(),
+    };
+    updateCharacterProfile(characterId, { relationshipMilestones: current });
+    toastr?.success?.("Milestone updated.");
+    reRenderCharacterList($("#rst-p-lib"));
+}
+
+async function deleteRelationshipMilestone(characterId, milestone, fallbackIndex) {
+    const confirmed = await Popup.show.confirm(
+        "Delete Relationship Milestone",
+        `Delete “${milestone?.title || "this milestone"}”? This removes only the milestone record; relationship stats and update logs are unchanged.`
+    );
+    if (!confirmed) return;
+
+    const latest = getCharacterProfile(characterId);
+    if (!latest) return;
+    const current = Array.isArray(latest.relationshipMilestones) ? [...latest.relationshipMilestones] : [];
+    const index = findMilestoneIndex(current, milestone, fallbackIndex);
+    if (index < 0) {
+        toastr?.warning?.("That milestone no longer exists. Refresh the profile and try again.");
+        return;
+    }
+    current.splice(index, 1);
+    updateCharacterProfile(characterId, { relationshipMilestones: current });
+    toastr?.success?.("Milestone deleted.");
+    reRenderCharacterList($("#rst-p-lib"));
+}
+
+function findMilestoneIndex(milestones, milestone, fallbackIndex) {
+    if (milestone?.id) {
+        const byId = milestones.findIndex((item) => item?.id === milestone.id);
+        if (byId >= 0) return byId;
+    }
+    if (Number.isInteger(fallbackIndex) && fallbackIndex >= 0 && fallbackIndex < milestones.length) return fallbackIndex;
+    return milestones.findIndex((item) => item === milestone);
+}
+
+async function showRelationshipConditionDetail(profile, condition) {
+    const def = getRelationshipConditionDefinition(condition?.type);
+    if (!def) return;
+    const safe = (value) => $("<div>").text(String(value || "")).html();
+    const html = `
+        <div style="text-align:left;font-size:13px;line-height:1.6">
+            <div style="display:flex;align-items:center;gap:8px;font-size:16px;font-weight:600;margin-bottom:8px">
+                <i class="fa-solid ${def.icon}"></i> ${safe(def.label)}
+            </div>
+            <div style="margin-bottom:10px">${safe(def.meaning)}</div>
+            <div style="font-weight:600;margin-top:8px">Current effect</div>
+            <div>${safe(def.effect)}</div>
+            <div style="font-weight:600;margin-top:8px">Why it is active</div>
+            <div>${safe(condition.reason || "No specific reason recorded.")}</div>
+            <div style="font-weight:600;margin-top:8px">Resolves when</div>
+            <div>${safe(condition.resolution || "No resolution condition recorded.")}</div>
+        </div>`;
+    const popup = new Popup(html, POPUP_TYPE.TEXT, `${def.label} — ${profile.name}`, { okButton: "Close" });
+    await popup.show();
 }
 
 // ─── Profile Picture: Upload, Crop, Remove ────────────────
@@ -1648,7 +1826,7 @@ async function editSoftLock(profile, cat, stat) {
             <label class="rst-lockedit-label">Cap %</label>
             <input type="number" id="rst-sl-cap" class="rst-lockedit-cap" value="${curCap}" min="-100" max="100" placeholder="e.g. 45">
             <label class="rst-lockedit-label">Condition to unlock</label>
-            <textarea id="rst-sl-cond" class="rst-lockedit-reason" rows="3" placeholder="What must happen for this stat to unlock — e.g. '{{user}} must reveal a genuine vulnerability of their own before this guard comes down.'">${$("<div>").text(curCond).html()}</textarea>
+            <textarea id="rst-sl-cond" class="rst-lockedit-reason" rows="3" placeholder="What must happen for this stat to unlock — e.g. 'Mira must reveal a genuine vulnerability of her own before he lowers this guard.'">${$("<div>").text(curCond).html()}</textarea>
             <label class="rst-lockedit-label">Progress notes</label>
             <textarea id="rst-sl-prog" class="rst-lockedit-reason" rows="3" placeholder="Running notes toward the condition (optional).">${$("<div>").text(curProg).html()}</textarea>
             ${sl.met ? `<label class="rst-scan-discard"><input type="checkbox" id="rst-sl-relock"> Re-lock this (treat condition as not yet met)</label>` : ""}
@@ -1797,9 +1975,13 @@ function renderLogEntry(entry, profile) {
             if (!changed) continue;
 
             const statTitle = stat.charAt(0).toUpperCase() + stat.slice(1);
+            const statKey = cat + "." + stat;
             const commentary = entry.commentary?.[cat]?.[stat] || "";
-            const isCritical = Array.isArray(entry.criticalStats) && entry.criticalStats.includes(cat + "." + stat);
-            rows.push({ statTitle, delta, cls, commentary, isCritical });
+            const isCritical = Array.isArray(entry.criticalStats) && entry.criticalStats.includes(statKey);
+            const inertiaAdjustment = Array.isArray(entry.inertiaAdjustments)
+                ? entry.inertiaAdjustments.find((item) => item?.stat === statKey)
+                : null;
+            rows.push({ statTitle, delta, cls, commentary, isCritical, inertiaAdjustment });
         }
 
         if (rows.length === 0) continue;
@@ -1813,6 +1995,7 @@ function renderLogEntry(entry, profile) {
                         <span class="rst-log-stat-delta ${r.cls}">${r.delta}</span>
                     </div>
                     ${r.commentary ? `<div class="rst-log-stat-com">${r.commentary}</div>` : ""}
+                    ${r.inertiaAdjustment ? `<div class="rst-inertia-note"><i class="fa-solid fa-anchor"></i> Inertia guard: ${r.inertiaAdjustment.proposedDelta > 0 ? "+" : ""}${r.inertiaAdjustment.proposedDelta} → ${r.inertiaAdjustment.adjustedDelta > 0 ? "+" : ""}${r.inertiaAdjustment.adjustedDelta}</div>` : ""}
                 </div>
             `);
         }
@@ -1862,6 +2045,10 @@ async function showRollbackConfirmation(profile, entry) {
             `• Dynamic title to: "${entry.dynamicTitleBefore || "None"}"`,
             "• Narrative summary to previous version",
         );
+        const systemChanges = entry.profileSystemChanges || {};
+        if ((systemChanges.milestonesAdded || []).length) detailLines.push(`• Remove ${systemChanges.milestonesAdded.length} milestone(s) created by this update`);
+        if ((systemChanges.conditionsAdded || []).length) detailLines.push(`• Remove ${systemChanges.conditionsAdded.length} temporary condition(s) created by this update`);
+        if ((systemChanges.conditionsResolved || []).length) detailLines.push(`• Restore ${systemChanges.conditionsResolved.length} temporary condition(s) resolved by this update`);
     } else {
         detailLines.push(
             "⚠ No previous stats recorded for this entry.",
@@ -1898,6 +2085,25 @@ async function showRollbackConfirmation(profile, entry) {
         const idx = log.findIndex(e => e.timestamp === entry.timestamp);
         const olderEntry = idx >= 0 ? log[idx + 1] : null;
         profileUpdates.narrativeSummary = olderEntry?.narrativeSummary ?? "";
+
+        const systemChanges = entry.profileSystemChanges || {};
+        if (Array.isArray(fullProfile?.relationshipMilestones)) {
+            const removeMilestoneIds = new Set(systemChanges.milestonesAdded || []);
+            profileUpdates.relationshipMilestones = fullProfile.relationshipMilestones.filter((ms) => !removeMilestoneIds.has(ms?.id));
+        }
+        if (Array.isArray(fullProfile?.relationshipConditions)) {
+            const removeConditionIds = new Set(systemChanges.conditionsAdded || []);
+            const restored = Array.isArray(systemChanges.conditionsResolved) ? systemChanges.conditionsResolved : [];
+            let conditions = fullProfile.relationshipConditions.filter((condition) => !removeConditionIds.has(condition?.id));
+            const existingIds = new Set(conditions.map((condition) => condition?.id));
+            for (const condition of restored) {
+                if (condition?.id && !existingIds.has(condition.id)) {
+                    conditions.push(structuredClone(condition));
+                    existingIds.add(condition.id);
+                }
+            }
+            profileUpdates.relationshipConditions = conditions;
+        }
         updateCharacterProfile(profile.id, profileUpdates);
 
         const sceneRef = entry.sceneId && entry.sceneId !== "" ? entry.sceneId : "manual edit";

@@ -4,12 +4,13 @@
  * Connection Profiles are NOT accordion-wrapped to ensure ConnectionManager initializes properly
  */
 
-import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist, parseNameBlacklist, getPendingLockScan, savePendingLockScan } from "../data/storage.js";
+import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist, parseNameBlacklist, getPendingLockScan, savePendingLockScan, getPendingMilestoneScan, savePendingMilestoneScan } from "../data/storage.js";
 import { setSetting, isEnabled, exportAllData, importAllData } from "../settings.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 import { getContext } from "../../../../extensions.js";
 import { Popup, POPUP_TYPE, POPUP_RESULT } from "../../../../../scripts/popup.js";
 import { scanForLocks } from "../llm/lockScan.js";
+import { scanHistoricalMilestones } from "../llm/milestoneScan.js";
 
 
 function escapeHtml(value) {
@@ -105,10 +106,20 @@ function renderDebugSettings($pane, settings) {
             </div>
             <label class="rst-toggle"><input type="checkbox" id="rst-debug-toggle" ${settings.debug ? "checked" : ""}><span class="rst-slider"></span></label>
         </div>
+        <div class="rst-setting-row">
+            <div>
+                <div class="rst-setting-label">Backfill Relationship Milestones</div>
+                <div class="rst-setting-sub">Retroactively read the full visible chat in Batch-Scan-compatible chunks and propose durable relationship turning points for existing character profiles. Read-only history only; stats are never changed. Every proposal is reviewed before commit.</div>
+            </div>
+            <div style="display:flex;gap:6px;flex-shrink:0">
+                <button id="rst-review-milestones-btn" class="rst-btn" style="display:${getPendingMilestoneScan() ? 'inline-flex' : 'none'}"><i class="fa-solid fa-list-check"></i> Review</button>
+                <button id="rst-scan-milestones-btn" class="rst-btn"><i class="fa-solid fa-flag"></i> Backfill</button>
+            </div>
+        </div>
         <div class="rst-setting-row" style="border-bottom:none">
             <div>
-                <div class="rst-setting-label">Scan for Locks</div>
-                <div class="rst-setting-sub">Have the Stat Update LLM read each character's Personality, Notes, and past scenes to propose hard AND soft locks. Characters with an empty Personality are skipped. You review every proposal before anything is applied.</div>
+                <div class="rst-setting-label">Scan for Threshold Locks</div>
+                <div class="rst-setting-sub">Read the full visible chat in chunks, then combine that history with Personality, Notes, current stats, trajectory, milestones, conditions, summaries, and existing locks. Existing lock slots are preserved; this pass only proposes missing locks. You review everything before apply.</div>
             </div>
             <div style="display:flex;gap:6px;flex-shrink:0">
                 <button id="rst-review-scan-btn" class="rst-btn" style="display:${getPendingLockScan() ? 'inline-flex' : 'none'}"><i class="fa-solid fa-list-check"></i> Review</button>
@@ -124,10 +135,40 @@ function renderDebugSettings($pane, settings) {
         toastr?.info?.(`Debug logging ${on ? "enabled" : "disabled"}.`, "Relationship Stat Tracker");
     });
 
+    $card.find("#rst-review-milestones-btn").on("click", async function () {
+        const pending = getPendingMilestoneScan();
+        if (!pending || pending.length === 0) {
+            toastr?.info?.("No pending milestone backfill to review.");
+            $card.find("#rst-review-milestones-btn").hide();
+            return;
+        }
+        await reviewMilestoneScanResults(pending);
+    });
+
+    $card.find("#rst-scan-milestones-btn").on("click", async function () {
+        const $btn = $(this);
+        $btn.prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Scanning...');
+        try {
+            const results = await scanHistoricalMilestones();
+            if (!results || results.length === 0) {
+                toastr?.info?.("Milestone backfill complete — no durable milestones were proposed.", "Relationship Stat Tracker");
+                return;
+            }
+            savePendingMilestoneScan(results);
+            $card.find("#rst-review-milestones-btn").show();
+            await reviewMilestoneScanResults(results);
+        } catch (err) {
+            console.error("[RST] Milestone backfill error:", err);
+            toastr?.error?.("Milestone backfill failed. Check the console and connection settings.");
+        } finally {
+            $btn.prop("disabled", false).html('<i class="fa-solid fa-flag"></i> Backfill');
+        }
+    });
+
     $card.find("#rst-review-scan-btn").on("click", async function () {
         const pending = getPendingLockScan();
         if (!pending || pending.length === 0) {
-            toastr?.info?.("No pending scan to review.");
+            toastr?.info?.("No pending lock scan to review.");
             $card.find("#rst-review-scan-btn").hide();
             return;
         }
@@ -143,8 +184,6 @@ function renderDebugSettings($pane, settings) {
                 toastr?.info?.("Scan complete — no new locks proposed.", "Relationship Stat Tracker");
                 return;
             }
-            // Persist results so dismissing the dialog (e.g. Esc) does not waste
-            // the scan — it can be reopened via the "Review pending scan" button.
             savePendingLockScan(results);
             $card.find("#rst-review-scan-btn").show();
             await reviewLockScanResults(results);
@@ -155,6 +194,104 @@ function renderDebugSettings($pane, settings) {
             $btn.prop("disabled", false).html('<i class="fa-solid fa-lock"></i> Scan');
         }
     });
+}
+
+// ─── Milestone-backfill review (reopenable) ───────────────
+
+async function reviewMilestoneScanResults(results) {
+    const blocks = [];
+    let total = 0;
+    for (const r of results) {
+        const rows = (r.milestones || []).map((m, index) => {
+            total++;
+            const domains = Array.isArray(m.domains) && m.domains.length
+                ? `<span class="rst-scan-cap">${m.domains.join(" / ")}</span>`
+                : "";
+            return `<label class="rst-milestone-scan-row">
+                <input type="checkbox" class="rst-milestone-scan-pick" data-charid="${escapeHtml(r.characterId)}" data-index="${index}" checked>
+                <div class="rst-milestone-scan-content">
+                    <div><span class="rst-scan-tag soft">MILESTONE</span> <span class="rst-scan-stat">${escapeHtml(m.title || "Milestone")}</span> ${domains}</div>
+                    <div class="rst-scan-why">${escapeHtml(m.description || "")}</div>
+                </div>
+            </label>`;
+        }).join("");
+        if (!rows) continue;
+        blocks.push(`<details class="rst-scan-char" open>
+            <summary><span class="rst-scan-name">${escapeHtml(r.characterName)}</span><span class="rst-scan-count">${r.milestones.length}</span></summary>
+            <div class="rst-scan-locks">${rows}</div>
+        </details>`);
+    }
+
+    const html = `<div class="rst-scan-review">
+        <div class="rst-scan-summary">Proposed <b>${total}</b> retroactive relationship milestone${total === 1 ? "" : "s"}. Untick anything that should not become permanent read-only history. Closing keeps this scan for later review.</div>
+        ${blocks.join("")}
+        <label class="rst-scan-discard"><input type="checkbox" id="rst-milestone-discard-chk"> Discard this milestone scan instead of keeping it</label>
+    </div>`;
+    const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Apply selected", cancelButton: "Close" });
+    const showPromise = popup.show();
+    const $dlg = $("dialog.popup").last();
+    const result = await showPromise;
+    const proceed = result === POPUP_RESULT.AFFIRMATIVE;
+    const discardChecked = !!($dlg.find("#rst-milestone-discard-chk")[0]?.checked);
+
+    if (!proceed) {
+        if (discardChecked) {
+            savePendingMilestoneScan(null);
+            $("#rst-review-milestones-btn").hide();
+            toastr?.info?.("Milestone scan discarded.");
+        } else {
+            toastr?.info?.("Milestone scan kept — reopen it any time with Review.");
+        }
+        return;
+    }
+
+    const selected = new Map();
+    $dlg.find(".rst-milestone-scan-pick").each(function () {
+        if (!this.checked) return;
+        const charId = this.dataset.charid;
+        const index = Number(this.dataset.index);
+        if (!charId || !Number.isInteger(index)) return;
+        if (!selected.has(charId)) selected.set(charId, new Set());
+        selected.get(charId).add(index);
+    });
+
+    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    let applied = 0;
+    const now = Date.now();
+    for (const r of results) {
+        const picks = selected.get(r.characterId);
+        if (!picks?.size) continue;
+        const profile = getCharacterProfile(r.characterId);
+        if (!profile) continue;
+        const milestones = Array.isArray(profile.relationshipMilestones) ? [...profile.relationshipMilestones] : [];
+        const existingTitles = new Set(milestones.map((m) => String(m?.title || "").toLowerCase().trim()));
+
+        for (const index of [...picks].sort((a, b) => a - b)) {
+            const m = r.milestones?.[index];
+            if (!m) continue;
+            const titleKey = String(m.title || "").toLowerCase().trim();
+            if (!titleKey || existingTitles.has(titleKey)) continue;
+            milestones.push({
+                id: `milestone_backfill_${now}_${r.characterId}_${index}`,
+                title: String(m.title || "Milestone").slice(0, 160),
+                description: String(m.description || "").slice(0, 1200),
+                domains: Array.isArray(m.domains) ? [...m.domains] : [],
+                timestamp: now,
+                source: "milestone_backfill",
+            });
+            existingTitles.add(titleKey);
+            applied++;
+        }
+        updateCharacterProfile(r.characterId, { relationshipMilestones: milestones });
+    }
+
+    savePendingMilestoneScan(null);
+    $("#rst-review-milestones-btn").hide();
+    toastr?.success?.(`Applied ${applied} retroactive milestone${applied === 1 ? "" : "s"}.`, "Relationship Stat Tracker");
+
+    const { renderLibraryTab } = await import("./library.js");
+    const { getPane } = await import("./panel.js");
+    renderLibraryTab(getPane("lib"));
 }
 
 // ─── Lock-scan review (reopenable) ────────────────────────
@@ -173,20 +310,20 @@ async function reviewLockScanResults(results) {
     for (const r of results) {
         const hardRows = (r.hardLocks || []).map((l) => {
             totalHard++;
-            const reason = (l.reason || "").toString().replace(/</g, "&lt;");
+            const reason = escapeHtml(l.reason || "");
             return `<div class="rst-scan-lock">
                 <span class="rst-scan-tag hard">HARD</span>
-                <span class="rst-scan-stat">${l.stat}</span>
+                <span class="rst-scan-stat">${escapeHtml(l.stat)}</span>
                 <span class="rst-scan-cap">${l.cap}%</span>
                 ${reason ? `<div class="rst-scan-why">${reason}</div>` : ""}
             </div>`;
         }).join("");
         const softRows = (r.softLocks || []).map((l) => {
             totalSoft++;
-            const cond = (l.condition || "").toString().replace(/</g, "&lt;");
+            const cond = escapeHtml(l.condition || "");
             return `<div class="rst-scan-lock">
                 <span class="rst-scan-tag soft">SOFT</span>
-                <span class="rst-scan-stat">${l.stat}</span>
+                <span class="rst-scan-stat">${escapeHtml(l.stat)}</span>
                 <span class="rst-scan-cap">${l.cap}%</span>
                 ${cond ? `<div class="rst-scan-why">until: ${cond}</div>` : ""}
             </div>`;
@@ -241,7 +378,9 @@ async function reviewLockScanResults(results) {
                 const [cat, stat] = String(l.stat).split(".");
                 if (!prof.hardLocks[cat] || !prof.hardLocks[cat][stat]) continue;
                 const cur = prof.hardLocks[cat][stat].cap;
-                if (cur === null || l.cap > cur) {
+                const softSlot = prof.softLocks?.[cat]?.[stat];
+                const softOccupied = softSlot && typeof softSlot.cap === "number";
+                if (cur === null && !softOccupied) {
                     prof.hardLocks[cat][stat] = { cap: l.cap, reason: l.reason || "Lock scan" };
                     appliedHard++;
                 }
@@ -260,7 +399,9 @@ async function reviewLockScanResults(results) {
                     const [cat, stat] = String(l.stat).split(".");
                     const slot = prof.softLocks[cat]?.[stat];
                     if (!slot) continue;
-                    if ((slot.cap === null || slot.met) && l.condition && String(l.condition).trim()) {
+                    const hardSlot = prof.hardLocks?.[cat]?.[stat];
+                    const hardOccupied = hardSlot && typeof hardSlot.cap === "number";
+                    if (slot.cap === null && !hardOccupied && l.condition && String(l.condition).trim()) {
                         prof.softLocks[cat][stat] = { cap: l.cap, condition: l.condition || "", progress: l.progress || "", met: false, setAtScene: sceneCount };
                         appliedSoft++;
                         addedForChar++;
@@ -394,7 +535,7 @@ function renderBatchScan($pane, settings) {
                 Scan existing or long chats to auto-detect scenes and characters. Creates blank character profiles,
                 scene summaries, and an initial stat block per character. Runs once — does not compound on existing data.
             </div>
-            <button class="rst-btn" style="border-color:var(--rst-accent);color:var(--rst-avatar-text)" id="rst-batch-scan">Run batch scan</button>
+            <button class="rst-btn rst-batch-scan-btn" id="rst-batch-scan">Run Batch Scan</button>
 
             <div id="rst-batch-progress" style="display:none;margin-top:10px">
                 <div class="rst-progress-bar-container">
@@ -710,15 +851,45 @@ function renderStatSettings($pane, settings) {
                 </div>
                 <input type="number" id="rst-softlocks-max" value="${settings.softLocks?.maxActive ?? 1}" min="1" max="3" style="width:56px;text-align:center;flex-shrink:0">
             </div>
+            <div class="rst-setting-row" style="border-bottom:none;justify-content:flex-end">
+                <button id="rst-save-stat-settings" class="rst-btn"><i class="fa-solid fa-floppy-disk"></i> Save Stat Settings</button>
+            </div>
         </div>
     `);
 
-    $card.find("#rst-range-min").on("change", function () {
-        saveSetting("statChangeRange.min", parseInt($(this).val(), 10));
+    // Commit the range explicitly as one object. Per-input change/blur saving
+    // could lose a typed value if the panel closed before the browser emitted
+    // the field change event. The button also snapshots the rest of Stat Settings.
+    $card.find("#rst-save-stat-settings").on("click", function () {
+        let min = parseInt($card.find("#rst-range-min").val(), 10);
+        let max = parseInt($card.find("#rst-range-max").val(), 10);
+        let chance = parseInt($card.find("#rst-crit-chance").val(), 10);
+        let maxSoftLocks = parseInt($card.find("#rst-softlocks-max").val(), 10);
+
+        if (!Number.isFinite(min)) min = -5;
+        if (!Number.isFinite(max)) max = 5;
+        min = Math.max(-20, Math.min(0, min));
+        max = Math.max(0, Math.min(20, max));
+        if (!Number.isFinite(chance)) chance = 15;
+        chance = Math.max(0, Math.min(100, chance));
+        if (!Number.isFinite(maxSoftLocks)) maxSoftLocks = 1;
+        maxSoftLocks = Math.max(1, Math.min(3, maxSoftLocks));
+
+        $card.find("#rst-range-min").val(min);
+        $card.find("#rst-range-max").val(max);
+        $card.find("#rst-crit-chance").val(chance);
+        $card.find("#rst-softlocks-max").val(maxSoftLocks);
+
+        saveSetting("statChangeRange", { min, max });
+        saveSetting("criticalChanges.enabled", $card.find("#rst-crit-enabled").prop("checked"));
+        saveSetting("criticalChanges.chance", chance);
+        saveSetting("hardLocks.enabled", $card.find("#rst-hardlocks-enabled").prop("checked"));
+        saveSetting("softLocks.enabled", $card.find("#rst-softlocks-enabled").prop("checked"));
+        saveSetting("softLocks.maxActive", maxSoftLocks);
+
+        toastr?.success?.(`Stat settings saved. Normal range: ${min} to +${max}.`, "Relationship Stat Tracker");
     });
-    $card.find("#rst-range-max").on("change", function () {
-        saveSetting("statChangeRange.max", parseInt($(this).val(), 10));
-    });
+
     $card.find("#rst-crit-enabled").on("change", function () {
         saveSetting("criticalChanges.enabled", $(this).prop("checked"));
     });
@@ -777,33 +948,74 @@ function renderDetectionSettings($pane, settings) {
     $card.append(`
         <div class="rst-setting-row" style="border-bottom:none"><div><div class="rst-setting-label">Name blacklist</div><div class="rst-setting-sub">Names to always exclude from sidecar detection (comma or newline separated). Also excludes your ST user persona name automatically.</div></div></div>
         <div style="padding:0 0 4px"><textarea id="rst-name-blacklist" rows="2" style="width:100%;font-size:12px" placeholder="e.g. Narrator, Guide, System">${escapeHtml(blacklistStr)}</textarea></div>
-        <div style="display:flex;align-items:center;gap:8px;padding:0 0 8px">
-            <button id="rst-save-name-blacklist" class="menu_button" type="button"><i class="fa-solid fa-floppy-disk"></i> Save blacklist</button>
-            <span id="rst-name-blacklist-status" style="font-size:12px;color:var(--rst-text-muted)"></span>
+        <div class="rst-name-blacklist-actions">
+            <button id="rst-save-name-blacklist" class="rst-btn rst-save-blacklist-btn" type="button"><i class="fa-solid fa-floppy-disk"></i><span>Save blacklist</span></button>
+            <span id="rst-name-blacklist-status" class="rst-name-blacklist-status" aria-live="polite"></span>
         </div>
     `);
 
     $pane.append($card);
 
-    $("#rst-scan-freq").on("change", function () { saveSetting("scanFrequency", parseInt($(this).val(), 10)); });
-    $("#rst-msg-scan").on("change", function () { saveSetting("messagesToScan", parseInt($(this).val(), 10)); });
-    $("#rst-new-char-popup").on("change", function () { saveSetting("newCharPopup", $(this).prop("checked")); });
-    function saveBlacklist(immediate = false) {
-        const raw = $("#rst-name-blacklist").val();
+    const $scanFrequency = $card.find("#rst-scan-freq");
+    const $messagesToScan = $card.find("#rst-msg-scan");
+    const $newCharacterPopup = $card.find("#rst-new-char-popup");
+    const $blacklistInput = $card.find("#rst-name-blacklist");
+    const $blacklistButton = $card.find("#rst-save-name-blacklist");
+    const $blacklistStatus = $card.find("#rst-name-blacklist-status");
+
+    $scanFrequency.on("change", function () { saveSetting("scanFrequency", parseInt($(this).val(), 10)); });
+    $messagesToScan.on("change", function () { saveSetting("messagesToScan", parseInt($(this).val(), 10)); });
+    $newCharacterPopup.on("change", function () { saveSetting("newCharPopup", $(this).prop("checked")); });
+
+    async function saveBlacklist(immediate = false) {
+        const $button = $blacklistButton;
+        const $status = $blacklistStatus;
+        const raw = $blacklistInput.val();
         const list = parseNameBlacklist(raw);
-        saveNameBlacklist(list, immediate);
-        $("#rst-name-blacklist").val((getNameBlacklist() || []).join(", "));
-        $("#rst-name-blacklist-status").text(immediate ? "Saved" : "Queued");
+
         if (immediate) {
-            setTimeout(() => $("#rst-name-blacklist-status").text(""), 1600);
+            $button.prop("disabled", true).addClass("is-saving");
+            $button.find("span").text("Saving...");
+            $status.text("Saving...");
         }
+
+        let saved = false;
+        try {
+            saved = await Promise.resolve(saveNameBlacklist(list, immediate));
+            $blacklistInput.val((getNameBlacklist() || []).join(", "));
+        } catch (err) {
+            console.warn("[RST] Failed to save name blacklist.", err);
+        }
+
+        if (!immediate) {
+            $status.text(saved === false ? "Unsaved" : "Queued");
+            return;
+        }
+
+        $button.prop("disabled", false).removeClass("is-saving");
+        $button.find("span").text("Save blacklist");
+
+        if (saved === false) {
+            $status.text("Save failed");
+            toastr?.error?.("Name blacklist could not be saved. Check the console for details.", "Relationship Stat Tracker");
+        } else {
+            $status.text("Saved");
+            const count = (getNameBlacklist() || []).length;
+            toastr?.success?.(`Name blacklist saved (${count} entr${count === 1 ? "y" : "ies"}).`, "Relationship Stat Tracker");
+        }
+
+        setTimeout(() => $status.text(""), 1800);
     }
 
-    $("#rst-name-blacklist").on("change", function () { saveBlacklist(false); });
-    $("#rst-name-blacklist").on("input", function () {
-        $("#rst-name-blacklist-status").text("Unsaved");
+    $blacklistInput.on("change", function () { saveBlacklist(false); });
+    $blacklistInput.on("input", function () {
+        $blacklistStatus.text("Unsaved");
     });
-    $("#rst-save-name-blacklist").on("click", function () { saveBlacklist(true); });
+    $blacklistButton.on("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        saveBlacklist(true);
+    });
 }
 
 // ─── Injection Settings ───────────────────────────────────

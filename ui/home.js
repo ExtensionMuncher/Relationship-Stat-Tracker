@@ -12,6 +12,7 @@ import { renderLibraryTab } from "./library.js";
 import { switchTab, getPane, showPanelLoading, hidePanelLoading } from "./panel.js";
 import { Popup, POPUP_RESULT, POPUP_TYPE } from "../../../../../scripts/popup.js";
 import { dlog } from "../lib/debug.js";
+import { getRelationshipConditionDefinition, MAX_ACTIVE_RELATIONSHIP_CONDITIONS } from "../data/conditions.js";
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -67,6 +68,19 @@ export function refreshPending($pane) {
 
 // ─── Pending Updates Section ──────────────────────────────
 
+function hasMeaningfulCharacterUpdate(update) {
+    if (!update) return false;
+    if (Number(update.changeCount || 0) > 0) return true;
+    const arrayFields = [
+        "proposedHardLocks", "proposedSoftLocks", "unlockedSoftLocks", "softLockProgress",
+        "hardLockPressureUpdates", "hardLockReviews", "proposedMilestones",
+        "proposedConditions", "resolvedConditions", "inertiaAdjustments",
+    ];
+    if (arrayFields.some((field) => Array.isArray(update[field]) && update[field].length > 0)) return true;
+    if ((update.dynamicTitleBefore || "") !== (update.dynamicTitleAfter || "")) return true;
+    return false;
+}
+
 function pendingUpdateScore(update) {
     if (!update) return -1;
     let score = 0;
@@ -77,6 +91,12 @@ function pendingUpdateScore(update) {
     if (update.commentary && typeof update.commentary === "object") score += 25;
     if (update.dynamicTitleAfter) score += 10;
     if (update.narrativeSummary) score += 10;
+    if (Array.isArray(update.proposedMilestones) && update.proposedMilestones.length) score += 8;
+    if (Array.isArray(update.proposedConditions) && update.proposedConditions.length) score += 8;
+    if (Array.isArray(update.resolvedConditions) && update.resolvedConditions.length) score += 8;
+    if (Array.isArray(update.proposedHardLocks) && update.proposedHardLocks.length) score += 6;
+    if (Array.isArray(update.proposedSoftLocks) && update.proposedSoftLocks.length) score += 6;
+    if (Array.isArray(update.hardLockPressureUpdates) && update.hardLockPressureUpdates.length) score += 6;
     return score;
 }
 
@@ -132,11 +152,13 @@ function renderPendingSection($pane, pending) {
     // Scene summary card
     renderSceneSummaryCard($section, pending);
 
-    // Per-character pending updates — skip entries with 0 changes (no actual stat changes to review)
+    // Per-character pending updates. Structural relationship changes (locks,
+    // milestones, conditions) remain reviewable even when the numeric matrix
+    // itself did not move.
     if (pending.characterUpdates) {
-        const meaningfulUpdates = pending.characterUpdates.filter(u => u.changeCount > 0);
+        const meaningfulUpdates = pending.characterUpdates.filter(hasMeaningfulCharacterUpdate);
         if (meaningfulUpdates.length === 0) {
-            $section.append(`<div style="font-size:12px;color:var(--rst-text-muted);padding:12px 0">No stat changes detected for any characters.</div>`);
+            $section.append(`<div style="font-size:12px;color:var(--rst-text-muted);padding:12px 0">No relationship changes detected for any characters.</div>`);
         } else {
             for (const charUpdate of meaningfulUpdates) {
                 renderCharacterPending($section, charUpdate, pending.sceneId);
@@ -246,7 +268,7 @@ function renderCharacterPending($container, charUpdate, sceneId) {
     // Stat grid
     const $statGrid = $('<div class="rst-stat-grid" style="margin-bottom:10px"></div>');
     for (const cat of STAT_CATEGORIES) {
-        $statGrid.append(renderStatCategory(cat, charUpdate));
+        $statGrid.append(renderStatCategory(cat, charUpdate, sceneId));
     }
     $body.append($statGrid);
 
@@ -262,6 +284,42 @@ function renderCharacterPending($container, charUpdate, sceneId) {
         $body.append(
             `<div class="rst-narr" style="margin-bottom:10px">${charUpdate.narrativeSummary}</div>`
         );
+    }
+
+    if (Array.isArray(charUpdate.proposedMilestones) && charUpdate.proposedMilestones.length) {
+        const $msWrap = $('<div class="rst-pending-system"></div>');
+        $msWrap.append('<div class="rst-pending-system-title"><i class="fa-solid fa-flag"></i> Relationship milestone</div>');
+        for (const ms of charUpdate.proposedMilestones) {
+            const $item = $('<div class="rst-pending-system-item"></div>');
+            $item.append($('<div class="rst-pending-system-name"></div>').text(ms.title || "Milestone"));
+            $item.append($('<div></div>').text(ms.description || ""));
+            $msWrap.append($item);
+        }
+        $body.append($msWrap);
+    }
+
+    if ((Array.isArray(charUpdate.proposedConditions) && charUpdate.proposedConditions.length) || (Array.isArray(charUpdate.resolvedConditions) && charUpdate.resolvedConditions.length)) {
+        const $condWrap = $('<div class="rst-pending-system"></div>');
+        $condWrap.append('<div class="rst-pending-system-title"><i class="fa-solid fa-tags"></i> Temporary relationship conditions</div>');
+        for (const condition of (charUpdate.proposedConditions || [])) {
+            const def = getRelationshipConditionDefinition(condition.type);
+            if (!def) continue;
+            const $item = $('<div class="rst-pending-system-item"></div>');
+            $item.append($('<div class="rst-pending-system-name"></div>').text(`Add: ${def.label}`));
+            $item.append($('<div></div>').text(condition.reason || ""));
+            $item.append($('<div class="rst-pending-system-resolution"></div>').text(`Resolves when: ${condition.resolution || ""}`));
+            $condWrap.append($item);
+        }
+        for (const condition of (charUpdate.resolvedConditions || [])) {
+            const prof = getCharacterProfile(charUpdate.characterId);
+            const active = (prof?.relationshipConditions || []).find((c) => c.id === condition.id);
+            const def = active ? getRelationshipConditionDefinition(active.type) : null;
+            const $item = $('<div class="rst-pending-system-item"></div>');
+            $item.append($('<div class="rst-pending-system-name"></div>').text(`Resolve: ${def?.label || condition.id}`));
+            if (condition.reason) $item.append($('<div></div>').text(condition.reason));
+            $condWrap.append($item);
+        }
+        $body.append($condWrap);
     }
 
     // Action buttons
@@ -308,7 +366,7 @@ function renderCharacterPending($container, charUpdate, sceneId) {
  * @param {object} charUpdate
  * @returns {jQuery}
  */
-function renderStatCategory(cat, charUpdate) {
+function renderStatCategory(cat, charUpdate, sceneId) {
     const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
     const $cat = $(`<div class="rst-stat-cat open"></div>`);
     $cat.append(`<div class="rst-sct">${catTitle} <span style="font-weight:400;font-size:10px">▾</span></div>`);
@@ -327,15 +385,22 @@ function renderStatCategory(cat, charUpdate) {
             ? `<span class="rst-sv ${beforeClass}">${formatPercent(before)}</span> → <span class="rst-sv ${afterClass}">${formatPercent(after)}</span>`
             : `<span class="rst-sv ${afterClass}">${formatPercent(after)}</span>`;
 
-        const isCritical = Array.isArray(charUpdate.criticalStats) && charUpdate.criticalStats.includes(cat + "." + stat);
+        const statKey = cat + "." + stat;
+        const isCritical = Array.isArray(charUpdate.criticalStats) && charUpdate.criticalStats.includes(statKey);
         const critBadge = isCritical ? ' <span class="rst-crit-badge"><i class="fa-solid fa-bolt"></i> critical</span>' : '';
+        const inertiaAdjustment = Array.isArray(charUpdate.inertiaAdjustments)
+            ? charUpdate.inertiaAdjustments.find((item) => item?.stat === statKey)
+            : null;
+        const inertia = inertiaAdjustment
+            ? `<div class="rst-inertia-note"><i class="fa-solid fa-anchor"></i> Inertia guard: ${inertiaAdjustment.proposedDelta > 0 ? "+" : ""}${inertiaAdjustment.proposedDelta} → ${inertiaAdjustment.adjustedDelta > 0 ? "+" : ""}${inertiaAdjustment.adjustedDelta}. ${inertiaAdjustment.reason}</div>`
+            : "";
 
         $cat.append(`
             <div class="rst-sr">
                 <span class="rst-sn">${stat.charAt(0).toUpperCase() + stat.slice(1)}${critBadge}</span>
                 <span>${display}</span>
             </div>
-            <div class="rst-sc">${commentary}</div>
+            <div class="rst-sc">${commentary}${inertia}</div>
         `);
     }
 
@@ -730,6 +795,60 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
             ? { start: scene.messageStart, end: scene.messageEnd }
             : null; // No scene available — skip message range in log entry
 
+        // Commit read-only milestones + temporary conditions only after the user
+        // approves the same stat-update card. This keeps all three systems in sync.
+        const profileSystemChanges = { milestonesAdded: [], conditionsAdded: [], conditionsResolved: [] };
+        const profileState = getCharacterProfile(charUpdate.characterId);
+        if (profileState) {
+            const now = Date.now();
+            let milestones = Array.isArray(profileState.relationshipMilestones) ? [...profileState.relationshipMilestones] : [];
+            for (const ms of (charUpdate.proposedMilestones || [])) {
+                if (!ms?.title || !ms?.description) continue;
+                const milestone = {
+                    id: `milestone_${now}_${milestones.length}`,
+                    title: String(ms.title).trim().slice(0, 120),
+                    description: String(ms.description).trim().slice(0, 1200),
+                    domains: Array.isArray(ms.domains) ? ms.domains.slice(0, 3) : [],
+                    sceneId: sceneId || "",
+                    timestamp: now,
+                };
+                milestones.push(milestone);
+                profileSystemChanges.milestonesAdded.push(milestone.id);
+            }
+
+            let conditions = Array.isArray(profileState.relationshipConditions) ? [...profileState.relationshipConditions] : [];
+            const resolvedIds = new Set((charUpdate.resolvedConditions || []).map((c) => c?.id).filter(Boolean));
+            if (resolvedIds.size) {
+                profileSystemChanges.conditionsResolved = conditions
+                    .filter((condition) => resolvedIds.has(condition.id))
+                    .map((condition) => structuredClone(condition));
+                conditions = conditions.filter((condition) => !resolvedIds.has(condition.id));
+            }
+
+            const activeTypes = new Set(conditions.map((condition) => condition?.type).filter(Boolean));
+            for (const proposal of (charUpdate.proposedConditions || [])) {
+                if (conditions.length >= MAX_ACTIVE_RELATIONSHIP_CONDITIONS) break;
+                const def = getRelationshipConditionDefinition(proposal?.type);
+                if (!def || activeTypes.has(proposal.type)) continue;
+                const condition = {
+                    id: `condition_${proposal.type}_${now}_${conditions.length}`,
+                    type: proposal.type,
+                    reason: String(proposal.reason || "").trim().slice(0, 1200),
+                    resolution: String(proposal.resolution || "").trim().slice(0, 1200),
+                    sceneId: sceneId || "",
+                    startedAt: now,
+                };
+                conditions.push(condition);
+                profileSystemChanges.conditionsAdded.push(condition.id);
+                activeTypes.add(proposal.type);
+            }
+
+            updateCharacterProfile(charUpdate.characterId, {
+                relationshipMilestones: milestones,
+                relationshipConditions: conditions,
+            });
+        }
+
         // Create update log entry
         dlog("[RST] Adding update log entry for:", charUpdate.characterName, { statsBefore: charUpdate.statsBefore, statsAfter: charUpdate.statsAfter, commentary: charUpdate.commentary });
         addUpdateLogEntry(charUpdate.characterId, {
@@ -743,6 +862,8 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
             dynamicTitleAfter: charUpdate.dynamicTitleAfter,
             narrativeSummary: charUpdate.narrativeSummary,
             criticalStats: charUpdate.criticalStats || [],
+            inertiaAdjustments: Array.isArray(charUpdate.inertiaAdjustments) ? charUpdate.inertiaAdjustments : [],
+            profileSystemChanges,
             source: charUpdate.source || "unknown",
         });
 

@@ -12,6 +12,9 @@ import { getSettings, isNameBlacklisted } from "../data/storage.js";
 import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter, getSoftLockAvailability, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneTitle, getClosedSceneCount, getClosedSceneCountForChar } from "../data/scenes.js";
 import { dlog } from "../lib/debug.js";
+import { deriveRelationshipTrajectory } from "../data/trajectory.js";
+import { applyRelationshipInertia, getRelationshipInertiaContext } from "../data/inertia.js";
+import { getRelationshipConditionCatalogForPrompt, getRelationshipConditionDefinition, MAX_ACTIVE_RELATIONSHIP_CONDITIONS, MAX_NEW_CONDITIONS_PER_UPDATE } from "../data/conditions.js";
 
 // ─── Auto-created Character Tracking ──────────────────────
 // Tracks which character IDs were auto-created during a generation cycle
@@ -111,7 +114,7 @@ export async function generateStatUpdate(sceneId, guidance = "") {
 
             if (!resultText) throw new Error("No response from LLM");
 
-            const parsed = parseStatUpdateResponse(resultText, existingChars);
+            const parsed = parseStatUpdateResponse(resultText, existingChars, sceneMessages.length);
             // Only use initial scene summary if no new chars generated one
             if (!sceneSummary) {
                 sceneSummary = parsed.sceneSummary || "";
@@ -175,6 +178,9 @@ function buildStatUpdateSystemPrompt(settings) {
         '          "romantic": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"},',
         '          "sexual": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"}',
         '        },',
+        '        "proposedMilestones": [{"title":"...","description":"...","domains":["platonic"]}],',
+        '        "proposedConditions": [{"type":"guarded","reason":"why it is active now","resolution":"what would resolve it"}],',
+        '        "resolvedConditions": [{"id":"condition id shown in current profile","reason":"why it resolved"}],',
         '        "dynamicTitle": "...",',
         '        "milestoneReached": false,',
         '        "criticalStats": ["category.stat for any stat where a narratively pivotal moment justifies an unusually large shift"],',
@@ -195,13 +201,19 @@ function buildStatUpdateSystemPrompt(settings) {
         '- Per-character category visibility is authoritative. If a character is shown with only some visible/active categories, ONLY output stats/commentary/criticalStats/locks/pressure/reviews for those visible categories. Do not infer, update, propose locks for, unlock, or mention hidden categories.',
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
-        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Still provide your normal stat value for it.',
+        '- proposedMilestones: OPTIONAL and RARE. RST milestones are ONLY about THIS CHARACTER <-> {{user}}. Never create a milestone for a relationship/event between two NPCs or other characters. A milestone must materially and durably redefine how this character and {{user}} relate to each other: major rupture/reconciliation, explicit commitment or vow, decisive betrayal/rescue, serious boundary violation, or comparably consequential disclosure/action. A thank-you, meal, ordinary comfort/encouragement, first meeting, routine apology, generic fight, or single vulnerable line is NOT enough by itself. Most scenes have zero. At most 1 milestone per character per scene. Give a short factual title/description and relevant domains.',
+        `- proposedConditions: OPTIONAL. Conditions are temporary contextual lenses, not permanent personality traits or buffs. At most ${MAX_NEW_CONDITIONS_PER_UPDATE} new condition per character per scene and never more than ${MAX_ACTIVE_RELATIONSHIP_CONDITIONS} active total. Allowed types: ${getRelationshipConditionCatalogForPrompt()}. Give why it is active and what specific narrative development should resolve it.`,
+        '- resolvedConditions: ONLY for an active condition whose stated resolution has actually occurred in this scene. Use the exact condition id shown in CURRENT CHARACTER STATS and explain why it resolved.',
+        '- Conditions influence how evidence should be interpreted, but NEVER override hard locks, soft locks, critical-change rules, or established personality. Example: Possessive can raise attention/affection without implying trust; Guarded can make ordinary warmth insufficient for openness.',
+        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Only a critical that actually fires mechanically bypasses relationship inertia. Still provide your normal stat value for it.',
         '- proposedHardLocks: OPTIONAL. ONLY for characters marked "Hard-lock eligible: YES". If "NO", you MUST leave this empty for that character. When eligible, and if the character\'s defined personality/psychology/history makes a stat realistically incapable of exceeding a certain level (e.g. a deeply traumatized character who cannot trust past ~40%), propose a cap as {"stat":"category.stat","cap":NUMBER,"reason":"..."}. Propose ONLY when strongly justified \u2014 a hard lock is exceptional, reserved for a true defining ceiling, never routine. Most scenes should propose ZERO. Do not lock a stat just because it is plausible or currently low. When in doubt, leave it empty. Grounded in their stated personality — never guess on a blank slate. Leave empty for most characters. Do NOT propose caps below the stat\'s current value.',
         '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If no slots are open, propose NONE. The "Soft-lock slots OPEN" number is a CEILING, not a target — propose anywhere from zero up to that many, and zero or one is the typical, expected answer. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Each entry: {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. Never propose a lock just to use an available slot — only when it is genuinely warranted by the story.',
         '- unlockedSoftLocks: for any EXISTING soft lock listed in the character\'s data, if its condition was FULFILLED during this scene, list its "category.stat" here. The stat will then auto-unlock and resume normal growth. Only include locks that are genuinely satisfied by what happened.',
         '- softLockProgress: for existing soft locks that are NOT yet met, optionally provide an updated prose progress note reflecting movement toward the condition this scene.',
         '- hardLockPressureUpdates: ONLY for stats that ALREADY have a hard lock (shown with "pressure X/5"). NEVER create pressure for an unlocked stat. Pressure tracks EVIDENCE the character is acting against the lock\'s psychological REASON; it does NOT change the stat value. Scale: +2 major sustained contradiction; +1 meaningful contradiction; 0 no change (default for almost every scene); -1 reinforced the locked pattern; -2 severe regression. Changes must be RARE and evidence-based. Possessiveness, jealousy, attraction, fascination, sexual tension, protectiveness, or angst do NOT count unless the behavior directly contradicts the specific lock reason. COUNTS: relying on {{user}}\'s judgment without controlling the outcome (contradicts a belief that reliance is weakness). Does NOT count: becoming more fascinated (not structural), or protecting {{user}} because they consider {{user}} theirs (possessive protection reinforces the lock).',
         '- hardLockReviews: include an entry ONLY when a hard lock pressure reaches max (5/5) this scene. Shape {"stat":"category.stat","recommendation":"maintain|raise_cap|convert_to_soft|remove","recommendedCap":NUMBER,"reason":"..."}. Recommend a modest raise (+5/+10) unless evidence is overwhelming (+15 max). You only recommend; the user decides.',
+        '- RELATIONSHIP INERTIA: trajectory/history are context, NOT a momentum bonus. Repeated positive scenes do not justify progressively larger positive changes. Established psychologically rigid characters may require qualitatively specific evidence to move entrenched stats; merely accumulating pleasant interactions is insufficient. Likewise, one ordinary awkward scene should not violently reverse a deeply established direction. Use criticalStats for genuinely pivotal evidence rather than softening or hardening a character through repetition alone.',
+        '- Affection, fascination, jealousy, protectiveness, possessiveness, sexual interest, or obsession MUST NOT be used as shortcuts for trust/openness/support. A character can become more attached while remaining internally rigid.',
         '- Range: -100 to 100. 0 = neutral.',
         `- Each stat MUST stay within ${range.min} to ${range.max} points of its current (pre-scene) value. For example, if Trust is currently 30 and the range is -5 to +5, the new Trust must be between 25 and 35.`,
         '- Stats are ABSOLUTE values (not deltas), but each must respect the per-scene change limit above.',
@@ -241,6 +253,27 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
         parts.push(`\n${char.name}${aliasStr}:`);
         parts.push(`  Current dynamic title: "${char.dynamicTitle || "None"}"`);
         parts.push(`  Current narrative: "${char.narrativeSummary || "None"}"`);
+        const trajectory = deriveRelationshipTrajectory(char);
+        parts.push(`  Relationship trajectory: ${trajectory.label} (${trajectory.explanation})`);
+        const inertiaHistory = getRelationshipInertiaContext(char);
+        if (inertiaHistory.length) {
+            parts.push(`  Recent approved per-stat movement for inertia (newest first; descriptive only, never a bonus):`);
+            for (const line of inertiaHistory) parts.push(`    ${line}`);
+        }
+        const recentMilestones = Array.isArray(char.relationshipMilestones) ? char.relationshipMilestones.slice(-3) : [];
+        if (recentMilestones.length) {
+            parts.push(`  Recent relationship milestones (historical anchors; do not repeat unless a NEW turning point occurs):`);
+            for (const ms of recentMilestones) parts.push(`    - ${ms.title}: ${ms.description}`);
+        }
+        const activeConditions = Array.isArray(char.relationshipConditions) ? char.relationshipConditions : [];
+        if (activeConditions.length) {
+            parts.push(`  ACTIVE TEMPORARY RELATIONSHIP CONDITIONS:`);
+            for (const condition of activeConditions) {
+                const def = getRelationshipConditionDefinition(condition.type);
+                if (!def) continue;
+                parts.push(`    [${condition.id}] ${def.label}: ${def.meaning} Effect: ${def.effect} Current reason: ${condition.reason || ""} Resolves when: ${condition.resolution || ""}`);
+            }
+        }
         if (char.description && char.description.trim()) {
             parts.push(`  Personality/description: ${char.description}`);
             if (char.notes && char.notes.trim()) parts.push(`  Notes: ${char.notes}`);
@@ -373,11 +406,66 @@ function filterStatEntryArrayForProfile(profile, arr) {
     return arr.filter((entry) => entry && isVisibleStatKeyForProfile(profile, entry.stat));
 }
 
+function normalizeProposedMilestones(profile, arr) {
+    if (!Array.isArray(arr)) return [];
+    const visible = new Set(getVisibleStatCategories(profile));
+    const result = [];
+    for (const raw of arr) {
+        if (!raw || typeof raw !== "object") continue;
+        const title = String(raw.title || "").trim().slice(0, 120);
+        const description = String(raw.description || "").trim().slice(0, 1200);
+        if (!title || !description) continue;
+        const domains = [...new Set((Array.isArray(raw.domains) ? raw.domains : [])
+            .map((x) => String(x || "").toLowerCase().trim())
+            .filter((x) => visible.has(x)))];
+        result.push({ title, description, domains });
+        if (result.length >= 1) break;
+    }
+    return result;
+}
+
+function normalizeProposedConditions(profile, arr) {
+    if (!Array.isArray(arr)) return [];
+    const activeTypes = new Set((profile.relationshipConditions || []).map((c) => c?.type).filter(Boolean));
+    const result = [];
+    for (const raw of arr) {
+        if (!raw || typeof raw !== "object") continue;
+        const type = String(raw.type || "").trim();
+        if (!getRelationshipConditionDefinition(type) || activeTypes.has(type)) continue;
+        const reason = String(raw.reason || "").trim().slice(0, 1200);
+        const resolution = String(raw.resolution || "").trim().slice(0, 1200);
+        if (!reason || !resolution) continue;
+        result.push({ type, reason, resolution });
+        if (result.length >= MAX_NEW_CONDITIONS_PER_UPDATE) break;
+    }
+    return result;
+}
+
+function normalizeResolvedConditions(profile, arr) {
+    if (!Array.isArray(arr)) return [];
+    const activeIds = new Set((profile.relationshipConditions || []).map((c) => c?.id).filter(Boolean));
+    const result = [];
+    for (const raw of arr) {
+        if (!raw || typeof raw !== "object") continue;
+        const id = String(raw.id || "").trim();
+        if (!activeIds.has(id)) continue;
+        result.push({
+            id,
+            reason: String(raw.reason || "").trim().slice(0, 1200),
+        });
+    }
+    return result;
+}
+
 function filterCharacterDataByVisibleCategories(profile, data) {
     if (!data || typeof data !== "object") return data;
     const clone = { ...data };
+    delete clone.evidenceRefs;
     clone.stats = filterStatObjectByVisibleCategories(profile, data.stats);
     clone.commentary = filterStatObjectByVisibleCategories(profile, data.commentary);
+    clone.proposedMilestones = Array.isArray(data.proposedMilestones) ? data.proposedMilestones : [];
+    clone.proposedConditions = Array.isArray(data.proposedConditions) ? data.proposedConditions : [];
+    clone.resolvedConditions = Array.isArray(data.resolvedConditions) ? data.resolvedConditions : [];
     clone.criticalStats = filterStatKeyArrayForProfile(profile, data.criticalStats);
     clone.proposedHardLocks = filterStatEntryArrayForProfile(profile, data.proposedHardLocks);
     clone.proposedSoftLocks = filterStatEntryArrayForProfile(profile, data.proposedSoftLocks);
@@ -399,7 +487,7 @@ function findParsedCharacterEntryForProfile(parsedCharacters, profile, consumedK
     const variants = new Set(getCharacterNameVariants(profile).map(normalizeCharacterName));
 
     // Prefer exact/canonical/alias matches first. Compare normalized strings so
-    // an LLM key like "Renee" still matches an alias saved as "renee".
+    // an LLM key like "Mira" still matches an alias saved as "mira".
     for (const key of keys) {
         if (consumedKeys?.has(key)) continue;
         if (variants.has(normalizeCharacterName(key))) {
@@ -456,7 +544,7 @@ function buildInitialCommentary(charData, statsAfter, char = null) {
     return commentary;
 }
 
-function createInitialUpdateEntry(char, charData, source = "llm_initial") {
+function createInitialUpdateEntry(char, charData, source = "llm_initial", messageCount = Infinity) {
     const filteredData = filterCharacterDataByVisibleCategories(char, charData || {});
     const statsAfter = buildStatsFromInitialData(filteredData);
     const commentary = buildInitialCommentary(filteredData, statsAfter, char);
@@ -466,12 +554,16 @@ function createInitialUpdateEntry(char, charData, source = "llm_initial") {
         statsBefore: cloneStats(char.stats),
         statsAfter,
         commentary,
+        proposedMilestones: normalizeProposedMilestones(char, filteredData.proposedMilestones),
+        proposedConditions: normalizeProposedConditions(char, filteredData.proposedConditions),
+        resolvedConditions: [],
         dynamicTitleBefore: char.dynamicTitle || "",
         dynamicTitleAfter: filteredData.dynamicTitle || char.dynamicTitle || "",
         milestoneReached: false,
         milestoneDetail: "",
         narrativeSummary: filteredData.narrativeSummary || char.narrativeSummary || "",
         criticalStats: Array.isArray(filteredData.criticalStats) ? filteredData.criticalStats : [],
+        inertiaAdjustments: [],
         raisedCaps: [],
         proposedHardLocks: Array.isArray(filteredData.proposedHardLocks) ? filteredData.proposedHardLocks : [],
         proposedSoftLocks: Array.isArray(filteredData.proposedSoftLocks) ? filteredData.proposedSoftLocks : [],
@@ -496,6 +588,9 @@ function characterUpdateScore(update) {
     if (update.narrativeSummary) score += 10;
     if (Array.isArray(update.proposedHardLocks) && update.proposedHardLocks.length) score += 5;
     if (Array.isArray(update.proposedSoftLocks) && update.proposedSoftLocks.length) score += 5;
+    if (Array.isArray(update.proposedMilestones) && update.proposedMilestones.length) score += 4;
+    if (Array.isArray(update.proposedConditions) && update.proposedConditions.length) score += 4;
+    if (Array.isArray(update.resolvedConditions) && update.resolvedConditions.length) score += 4;
     return score;
 }
 
@@ -526,7 +621,7 @@ function dedupeCharacterUpdates(characterUpdates) {
  * @param {Array} characters - Character profiles
  * @returns {{sceneSummary: string, characterUpdates: Array}}
  */
-function parseStatUpdateResponse(response, characters) {
+function parseStatUpdateResponse(response, characters, messageCount = Infinity) {
     // Try primary JSON extraction
     let parsed = extractJsonFromResponse(response);
 
@@ -569,8 +664,10 @@ function parseStatUpdateResponse(response, characters) {
         const range = settings.statChangeRange || { min: -5, max: 5 };
         // Merge LLM stats over existing stats so unmentioned ones don't default to 0
         const mergedStats = mergeWithExistingStats(statsBefore, charData.stats || {});
-        const statsAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range, charData.criticalStats, settings, char.hardLocks, char.softLocks, charData.unlockedSoftLocks);
-        const firedCriticals = statsAfter.__criticals || [];
+        const trajectory = deriveRelationshipTrajectory(char);
+        const firedCriticals = resolveFiredCriticalStats(charData.criticalStats, settings);
+        const inertiaResult = applyRelationshipInertia(char, statsBefore, clampStats(mergedStats), firedCriticals, trajectory.label, range);
+        const statsAfter = applyDeltaRange(statsBefore, inertiaResult.statsAfter, range, charData.criticalStats, settings, char.hardLocks, char.softLocks, charData.unlockedSoftLocks, firedCriticals);
         const raisedCaps = statsAfter.__raisedCaps || [];
         const unlockedSoftLocks = statsAfter.__unlockedSoftLocks || [];
         // Use LLM commentary if provided, otherwise generate fallback
@@ -591,12 +688,16 @@ function parseStatUpdateResponse(response, characters) {
             statsBefore,
             statsAfter,
             commentary,
+            proposedMilestones: normalizeProposedMilestones(char, charData.proposedMilestones),
+            proposedConditions: normalizeProposedConditions(char, charData.proposedConditions),
+            resolvedConditions: normalizeResolvedConditions(char, charData.resolvedConditions),
             dynamicTitleBefore: char.dynamicTitle || "",
             dynamicTitleAfter: charData.dynamicTitle || char.dynamicTitle || "",
             milestoneReached: charData.milestoneReached || false,
             milestoneDetail: charData.milestoneDetail || "",
             narrativeSummary: charData.narrativeSummary || char.narrativeSummary || "",
             criticalStats: firedCriticals,
+            inertiaAdjustments: inertiaResult.adjustments,
             raisedCaps,
             proposedHardLocks: Array.isArray(charData.proposedHardLocks) ? charData.proposedHardLocks : [],
             proposedSoftLocks: Array.isArray(charData.proposedSoftLocks) ? charData.proposedSoftLocks : [],
@@ -640,8 +741,10 @@ function parseStatUpdateResponse(response, characters) {
                     const range = settings.statChangeRange || { min: -5, max: 5 };
                     // Merge LLM stats over existing stats so unmentioned ones don't default to 0
                     const mergedStats = mergeWithExistingStats(statsBefore, llmData.stats || {});
-                    const statsAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range, llmData.criticalStats, settings, matchedExisting.hardLocks, matchedExisting.softLocks, llmData.unlockedSoftLocks);
-                    const firedCriticals = statsAfter.__criticals || [];
+                    const trajectory = deriveRelationshipTrajectory(matchedExisting);
+                    const firedCriticals = resolveFiredCriticalStats(llmData.criticalStats, settings);
+                    const inertiaResult = applyRelationshipInertia(matchedExisting, statsBefore, clampStats(mergedStats), firedCriticals, trajectory.label, range);
+                    const statsAfter = applyDeltaRange(statsBefore, inertiaResult.statsAfter, range, llmData.criticalStats, settings, matchedExisting.hardLocks, matchedExisting.softLocks, llmData.unlockedSoftLocks, firedCriticals);
                     const raisedCaps = statsAfter.__raisedCaps || [];
                     const unlockedSoftLocks = statsAfter.__unlockedSoftLocks || [];
                     let commentary = llmData.commentary || null;
@@ -663,6 +766,7 @@ function parseStatUpdateResponse(response, characters) {
                         milestoneDetail: llmData.milestoneDetail || "",
                         narrativeSummary: llmData.narrativeSummary || matchedExisting.narrativeSummary || "",
                         criticalStats: firedCriticals,
+                        inertiaAdjustments: inertiaResult.adjustments,
                         raisedCaps,
                         proposedHardLocks: Array.isArray(llmData.proposedHardLocks) ? llmData.proposedHardLocks : [],
                         proposedSoftLocks: Array.isArray(llmData.proposedSoftLocks) ? llmData.proposedSoftLocks : [],
@@ -1014,7 +1118,9 @@ function parseStatUpdateAnalysisText(text, characters) {
         const range = settings.statChangeRange || { min: -5, max: 5 };
         // Merge analysis-text stats over existing stats so unmentioned ones don't default to 0
         const mergedStats = mergeWithExistingStats(statsBefore, statsAfter);
-        const clampedAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range);
+        const fallbackTrajectory = deriveRelationshipTrajectory(char);
+        const fallbackInertia = applyRelationshipInertia(char, statsBefore, clampStats(mergedStats), [], fallbackTrajectory.label, range);
+        const clampedAfter = applyDeltaRange(statsBefore, fallbackInertia.statsAfter, range);
         // Preserve old commentary for unchanged stats via fillMissingCommentary
         const filledCommentary = fillMissingCommentary(commentary, statsBefore, clampedAfter, char);
 
@@ -1024,6 +1130,10 @@ function parseStatUpdateAnalysisText(text, characters) {
             statsBefore,
             statsAfter: clampedAfter,
             commentary: filledCommentary,
+            proposedMilestones: [],
+            proposedConditions: [],
+            resolvedConditions: [],
+            inertiaAdjustments: fallbackInertia.adjustments,
             dynamicTitleBefore: char.dynamicTitle || "",
             dynamicTitleAfter,
             milestoneReached: false,
@@ -1111,7 +1221,7 @@ function getSceneCharacters(scene) {
         for (const msg of sceneMessages) {
             const speaker = msg.name || "";
             if (!speaker || msg.is_user || isExcluded(speaker)) continue;
-            // Use alias-aware fuzzy matching so "Doe" matches "Jane Doe"
+            // Use alias-aware fuzzy matching so "Jane" matches "Jane Doe"
             const match = findCharacterByFuzzyName(speaker) || allKnownChars.find((c) => c.name.toLowerCase().trim() === speaker.toLowerCase().trim());
             if (match) {
                 foundIds.add(match.id);
@@ -1205,6 +1315,27 @@ function clampStats(stats) {
 }
 
 /**
+ * Resolve which LLM-flagged critical candidates actually fire. RNG is resolved
+ * before inertia so a candidate that loses its roll receives ordinary inertia.
+ */
+function resolveFiredCriticalStats(criticalStats = null, settings = null) {
+    const crit = settings?.criticalChanges || {};
+    if (crit.enabled === false || !Array.isArray(criticalStats) || criticalStats.length === 0) return [];
+
+    const chance = typeof crit.chance === "number" ? Math.max(0, Math.min(100, crit.chance)) : 7;
+    const fired = [];
+    const seen = new Set();
+    for (const entry of criticalStats) {
+        if (typeof entry !== "string") continue;
+        const key = entry.toLowerCase().trim();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        if ((Math.random() * 100) < chance) fired.push(key);
+    }
+    return fired;
+}
+
+/**
  * Apply the configured stat change range to clamp statsAfter relative to statsBefore.
  * Ensures each stat stays within [range.min, range.max] of its current value.
  * This prevents LLM from making wild jumps beyond the configured per-scene limit.
@@ -1213,7 +1344,7 @@ function clampStats(stats) {
  * @param {{min: number, max: number}} range - Allowed delta range from settings
  * @returns {object} Clamped statsAfter values
  */
-function applyDeltaRange(statsBefore, statsAfter, range, criticalStats = null, settings = null, hardLocks = null, softLocks = null, metSoftLocks = null) {
+function applyDeltaRange(statsBefore, statsAfter, range, criticalStats = null, settings = null, hardLocks = null, softLocks = null, metSoftLocks = null, preResolvedCriticalStats = null) {
     // Resolve critical-change config. A stat goes critical only if (a) the feature
     // is enabled, (b) the LLM flagged it in criticalStats, AND (c) it wins an RNG
     // roll against the configured chance. Winners get a multiplier x wider ceiling.
@@ -1240,7 +1371,10 @@ function applyDeltaRange(statsBefore, statsAfter, range, criticalStats = null, s
         }
     }
 
-    // Track which stats actually went critical, and which caps got raised.
+    // Track which stats actually went critical, and which caps got raised. If
+    // preResolvedCriticalStats is supplied, RNG already ran before inertia.
+    const preResolved = Array.isArray(preResolvedCriticalStats);
+    const preResolvedSet = new Set(preResolved ? preResolvedCriticalStats.map((x) => String(x || "").toLowerCase().trim()) : []);
     const firedCriticals = [];
     const raisedCaps = []; // [{ stat: 'cat.stat', from: number, to: number }]
     const unlockedSoftLocks = []; // ['cat.stat', ...] conditions met this scene
@@ -1255,13 +1389,19 @@ function applyDeltaRange(statsBefore, statsAfter, range, criticalStats = null, s
             let loMul = range.min;
             let hiMul = range.max;
 
-            // Critical gate: flagged AND wins the RNG roll -> widen the ceiling x mult.
+            // Critical gate: use the already-resolved winner set on the normal
+            // relationship path, otherwise retain legacy inline RNG for callers
+            // that do not use inertia. A flagged-but-lost candidate stays ordinary.
             let isCrit = false;
-            if (critEnabled && flagged.has(cat + '.' + stat)) {
-                if ((Math.random() * 100) < critChance) {
+            const statKey = cat + '.' + stat;
+            if (critEnabled && flagged.has(statKey)) {
+                const fired = preResolved
+                    ? preResolvedSet.has(statKey)
+                    : ((Math.random() * 100) < critChance);
+                if (fired) {
                     loMul = range.min * critMult;
                     hiMul = range.max * critMult;
-                    firedCriticals.push(cat + '.' + stat);
+                    firedCriticals.push(statKey);
                     isCrit = true;
                 }
             }
@@ -1515,7 +1655,7 @@ async function generateInitialStatsForScene(messages, characters, profileName, s
         return { sceneSummary: "", characterUpdates: [] };
     }
 
-    return parseInitialStatResponse(result, characters);
+    return parseInitialStatResponse(result, characters, messages.length);
 }
 
 /**
@@ -1545,6 +1685,8 @@ function buildInitialStatSystemPrompt(settings) {
         '          "romantic": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"},',
         '          "sexual": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"}',
         '        },',
+        '        "proposedMilestones": [{"title":"...","description":"...","domains":["platonic"]}],',
+        '        "proposedConditions": [{"type":"guarded","reason":"why it is active now","resolution":"what would resolve it"}],',
         '        "dynamicTitle": "...",',
         '        "narrativeSummary": "...",',
         '        "criticalStats": ["category.stat for any stat where a narratively pivotal moment justifies an unusually large shift"],',
@@ -1561,7 +1703,9 @@ function buildInitialStatSystemPrompt(settings) {
         '- Per-character category visibility is authoritative. If a character is shown with only some visible/active categories, ONLY output stats/commentary/criticalStats/locks/pressure/reviews for those visible categories. Do not infer, update, propose locks for, unlock, or mention hidden categories.',
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
-        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Still provide your normal stat value for it.',
+        '- proposedMilestones: OPTIONAL and RARE. RST milestones are ONLY about THIS CHARACTER <-> {{user}}; never use an NPC<->NPC event. Require a durable, consequential relationship redefinition, not a thank-you, food/comfort gesture, ordinary encouragement, first meeting, routine apology, generic fight, or single vulnerable line. At most 1 per character, with factual title/description and relevant domains.',
+        `- proposedConditions: OPTIONAL. At most ${MAX_NEW_CONDITIONS_PER_UPDATE} new temporary relationship condition. Allowed types: ${getRelationshipConditionCatalogForPrompt()}. Give why it is active and a specific resolution condition. Conditions are contextual lenses, not permanent personality traits or stat bonuses.`,
+        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Only a critical that actually fires mechanically bypasses relationship inertia. Still provide your normal stat value for it.',
         '- proposedHardLocks: OPTIONAL. ONLY for characters marked "Hard-lock eligible: YES". If "NO", you MUST leave this empty for that character. When eligible, and if the character\'s defined personality/psychology/history makes a stat realistically incapable of exceeding a certain level (e.g. a deeply traumatized character who cannot trust past ~40%), propose a cap as {"stat":"category.stat","cap":NUMBER,"reason":"..."}. Propose ONLY when strongly justified \u2014 a hard lock is exceptional, reserved for a true defining ceiling, never routine. Most scenes should propose ZERO. Do not lock a stat just because it is plausible or currently low. When in doubt, leave it empty. Grounded in their stated personality — never guess on a blank slate. Leave empty for most characters. Do NOT propose caps below the stat\'s current value.',
         '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If no slots are open, propose NONE. The "Soft-lock slots OPEN" number is a CEILING, not a target — propose anywhere from zero up to that many, and zero or one is the typical, expected answer. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Each entry: {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. Never propose a lock just to use an available slot — only when it is genuinely warranted by the story.',
         '- unlockedSoftLocks: for any EXISTING soft lock listed in the character\'s data, if its condition was FULFILLED during this scene, list its "category.stat" here. The stat will then auto-unlock and resume normal growth. Only include locks that are genuinely satisfied by what happened.',
@@ -1641,7 +1785,7 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
  * @param {Array} characters - Character profiles
  * @returns {{sceneSummary: string, characterUpdates: Array}}
  */
-function parseInitialStatResponse(response, characters) {
+function parseInitialStatResponse(response, characters, messageCount = Infinity) {
     const parsed = extractJsonFromResponse(response);
     if (!parsed) {
         // Try analysis-text fallback before giving up on character data
@@ -1676,7 +1820,7 @@ function parseInitialStatResponse(response, characters) {
             continue;
         }
 
-        characterUpdates.push(createInitialUpdateEntry(char, charData, "llm_initial"));
+        characterUpdates.push(createInitialUpdateEntry(char, charData, "llm_initial", messageCount));
     }
 
     // Handle LLM-discovered characters (in parsed.characters but not in input list)
@@ -1706,15 +1850,17 @@ function parseInitialStatResponse(response, characters) {
                     // do NOT clamp by statChangeRange; this is first-time initialization.
                     dlog(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating initial stat update entry`);
                     if (isNewCharacter(matchedExisting)) {
-                        characterUpdates.push(createInitialUpdateEntry(matchedExisting, llmData, "llm_initial"));
+                        characterUpdates.push(createInitialUpdateEntry(matchedExisting, llmData, "llm_initial", messageCount));
                     } else {
                         const filteredData = filterCharacterDataByVisibleCategories(matchedExisting, llmData);
                         const statsBefore = cloneStats(matchedExisting.stats);
                         const settings = getSettings();
                         const range = settings.statChangeRange || { min: -5, max: 5 };
                         const mergedStats = mergeWithExistingStats(statsBefore, filteredData.stats || {});
-                        const clampedAfter = applyDeltaRange(statsBefore, clampStats(mergedStats), range, filteredData.criticalStats, settings, matchedExisting.hardLocks, matchedExisting.softLocks, filteredData.unlockedSoftLocks);
-                        const firedCriticals = clampedAfter.__criticals || [];
+                        const matchedTrajectory = deriveRelationshipTrajectory(matchedExisting);
+                        const firedCriticals = resolveFiredCriticalStats(filteredData.criticalStats, settings);
+                        const matchedInertia = applyRelationshipInertia(matchedExisting, statsBefore, clampStats(mergedStats), firedCriticals, matchedTrajectory.label, range);
+                        const clampedAfter = applyDeltaRange(statsBefore, matchedInertia.statsAfter, range, filteredData.criticalStats, settings, matchedExisting.hardLocks, matchedExisting.softLocks, filteredData.unlockedSoftLocks, firedCriticals);
                         const raisedCaps = clampedAfter.__raisedCaps || [];
                         const unlockedSoftLocks = clampedAfter.__unlockedSoftLocks || [];
                         let commentary = filteredData.commentary || null;
@@ -1729,12 +1875,16 @@ function parseInitialStatResponse(response, characters) {
                             statsBefore,
                             statsAfter: clampedAfter,
                             commentary,
+                                            proposedMilestones: [],
+                            proposedConditions: [],
+                            resolvedConditions: [],
                             dynamicTitleBefore: matchedExisting.dynamicTitle || "",
                             dynamicTitleAfter: filteredData.dynamicTitle || matchedExisting.dynamicTitle || "",
                             milestoneReached: false,
                             milestoneDetail: "",
                             narrativeSummary: filteredData.narrativeSummary || matchedExisting.narrativeSummary || "",
                             criticalStats: firedCriticals,
+                            inertiaAdjustments: matchedInertia.adjustments,
                             raisedCaps,
                             proposedHardLocks: Array.isArray(filteredData.proposedHardLocks) ? filteredData.proposedHardLocks : [],
                             proposedSoftLocks: Array.isArray(filteredData.proposedSoftLocks) ? filteredData.proposedSoftLocks : [],

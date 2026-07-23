@@ -21,6 +21,125 @@ import { dlog } from "../lib/debug.js";
 const EXCLUDED_NAMES = new Set(["{{user}}", "user", "User"]);
 
 /**
+ * Build reusable full-history chunks for maintenance/backfill scanners.
+ *
+ * This deliberately reuses Batch Scan's visible-message indexing and existing
+ * scene ranges so milestone/lock backfills speak the same "message number"
+ * dialect as the rest of RST. Closed scenes are treated as atomic boundaries
+ * where practical; uncovered history is still included so the scan remains a
+ * true full-history pass rather than "scene summaries only".
+ *
+ * @param {{maxMessages?: number, maxChars?: number}} [options]
+ * @returns {Array<{start:number,end:number,sceneIds:string[],characterIds:string[],messages:Array,text:string}>}
+ */
+export function buildHistoricalScanChunks(options = {}) {
+    const maxMessages = Math.max(10, Math.min(100, Number(options.maxMessages) || 30));
+    const maxChars = Math.max(20000, Math.min(120000, Number(options.maxChars) || 60000));
+    const visibleMessages = (chat || []).filter((m) => !m?.is_system);
+    if (visibleMessages.length === 0) return [];
+
+    const closedScenes = (getScenes() || [])
+        .filter((scene) => scene && scene.status === "closed" && Number.isInteger(scene.messageStart) && Number.isInteger(scene.messageEnd))
+        .map((scene) => ({
+            id: String(scene.id || ""),
+            start: Math.max(0, scene.messageStart),
+            end: Math.min(visibleMessages.length - 1, scene.messageEnd),
+            characterIds: Array.isArray(scene.charactersPresent) ? scene.charactersPresent.filter(Boolean) : [],
+        }))
+        .filter((scene) => scene.end >= scene.start)
+        .sort((a, b) => a.start - b.start || a.end - b.end);
+
+    // Convert scene ranges + gaps into non-overlapping atomic segments. Existing
+    // Batch Scan scenes guide chunk boundaries, but gaps are preserved too.
+    const segments = [];
+    let cursor = 0;
+    for (const scene of closedScenes) {
+        if (scene.end < cursor) continue;
+        const start = Math.max(cursor, scene.start);
+        if (start > cursor) {
+            segments.push({ start: cursor, end: start - 1, sceneIds: [], characterIds: [] });
+        }
+        segments.push({ start, end: scene.end, sceneIds: scene.id ? [scene.id] : [], characterIds: [...scene.characterIds] });
+        cursor = scene.end + 1;
+    }
+    if (cursor < visibleMessages.length) {
+        segments.push({ start: cursor, end: visibleMessages.length - 1, sceneIds: [], characterIds: [] });
+    }
+    if (segments.length === 0) {
+        segments.push({ start: 0, end: visibleMessages.length - 1, sceneIds: [], characterIds: [] });
+    }
+
+    const chunks = [];
+    let current = null;
+
+    function pushCurrent() {
+        if (!current) return;
+        const messages = [];
+        const lines = [];
+        for (let i = current.start; i <= current.end; i++) {
+            const m = visibleMessages[i];
+            if (!m) continue;
+            const speaker = String(m.name || "Unknown");
+            const text = String(m.mes || "");
+            messages.push({ index: i, name: speaker, isUser: !!m.is_user, text });
+            lines.push(`[${i}] ${speaker}: ${text}`);
+        }
+        chunks.push({
+            start: current.start,
+            end: current.end,
+            sceneIds: [...current.sceneIds],
+            characterIds: [...current.characterIds],
+            messages,
+            text: lines.join("\n"),
+        });
+        current = null;
+    }
+
+    function appendRange(start, end, sceneIds = [], characterIds = []) {
+        let partStart = start;
+        while (partStart <= end) {
+            let partEnd = partStart - 1;
+            let chars = 0;
+            let count = 0;
+            while (partEnd + 1 <= end && count < maxMessages) {
+                const nextIndex = partEnd + 1;
+                const m = visibleMessages[nextIndex];
+                const nextChars = String(m?.mes || "").length + String(m?.name || "").length + 16;
+                if (count > 0 && chars + nextChars > maxChars) break;
+                partEnd = nextIndex;
+                chars += nextChars;
+                count++;
+            }
+            if (partEnd < partStart) partEnd = partStart;
+
+            const partCount = partEnd - partStart + 1;
+            if (!current) {
+                current = { start: partStart, end: partEnd, sceneIds: new Set(sceneIds), characterIds: new Set(characterIds), approxChars: chars };
+            } else {
+                const combinedCount = partEnd - current.start + 1;
+                if (combinedCount > maxMessages || current.approxChars + chars > maxChars) {
+                    pushCurrent();
+                    current = { start: partStart, end: partEnd, sceneIds: new Set(sceneIds), characterIds: new Set(characterIds), approxChars: chars };
+                } else {
+                    current.end = partEnd;
+                    current.approxChars += chars;
+                    for (const id of sceneIds) current.sceneIds.add(id);
+                    for (const id of characterIds) current.characterIds.add(id);
+                }
+            }
+            partStart = partEnd + 1;
+        }
+    }
+
+    for (const segment of segments) {
+        appendRange(segment.start, segment.end, segment.sceneIds, segment.characterIds);
+    }
+    pushCurrent();
+
+    return chunks;
+}
+
+/**
  * Normalize a name for comparison by stripping parenthetical annotations,
  * normalizing diacritics (ō -> o, ū -> u, etc.), and lowercasing.
  * This allows LLM-returned names like "José Muñoz" or "Renée Dubois (referenced)"
@@ -31,7 +150,7 @@ const EXCLUDED_NAMES = new Set(["{{user}}", "user", "User"]);
 function normalizeNameForComparison(name) {
     if (!name) return "";
     let cleaned = name
-        // Strip parenthetical annotations: "(referenced)", "(Renee)", etc.
+        // Strip parenthetical annotations: "(referenced)", "(Mira)", etc.
         .replace(/\s*\([^)]*\)\s*/g, "")
         .trim();
     if (!cleaned) return "";
@@ -180,7 +299,7 @@ export async function runBatchScan() {
     // --- Multi-character RP detection ---
     // In multi-character roleplay, a single {{char}} card generates ALL character dialogue,
     // so every assistant message has msg.name = the character card's display name
-    // (e.g., "High School AU RPG"). Individual character names like "Renee", "José"
+    // (e.g., "Fantasy Academy AU RPG"). Individual character names like "Mira", "Kellan"
     // never appear as sender names in message metadata.
     //
     // We detect this scenario: if there's only 1 unique non-user speaker name but the LLM
@@ -215,7 +334,7 @@ export async function runBatchScan() {
         // Single-character RP (or ambiguous): use speaker-name verification filter.
         // This prevents descriptive {{char}} titles (e.g., "Fantasy AU RPG") from being
         // treated as character names, while preserving legitimate character names like
-        // "Jane Doe" that DO appear as message senders.
+        // "Doe Jane" that DO appear as message senders.
         for (const scene of detectedScenes) {
             for (const name of scene.characters) {
                 if (isNameBlacklisted(name, [...userNamesToExclude])) continue;

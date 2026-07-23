@@ -19,6 +19,8 @@ import {
     getSettings,
     getPresentCharacters,
     savePresentCharacters,
+    savePresenceModes,
+    getPresenceModes,
     addNamesToBlacklist,
     isNameBlacklisted,
     setMessageCounter,
@@ -359,6 +361,16 @@ async function onMessageReceived(mesId, skipSidecar = false) {
     // high-water counter. That means deleted OOC messages cannot strand it in
     // the future.
     const settings = getSettings();
+
+    // Manual sidecar pause: keep the baseline current so resuming does not
+    // immediately process a backlog of messages written while paused.
+    if (settings.sidecarPaused === true) {
+        syncMessageCounterToLiveCount(liveCount);
+        setMessageCounter(liveCount);
+        dlog("[RST] Sidecar paused — skipping presence detection (liveCount=" + liveCount + ")");
+        return;
+    }
+
     const frequency = settings.scanFrequency || 5;
     const sync = syncMessageCounterToLiveCount(liveCount);
     const lastScanCount = sync.counter;
@@ -391,7 +403,23 @@ async function onMessageReceived(mesId, skipSidecar = false) {
         try {
             const result = await detectCharacters();
 
-            dlog("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length);
+            // The user may pause the sidecar while a request is already in flight.
+            // In that case, discard the result instead of changing presence state.
+            if (getSetting("sidecarPaused", false)) {
+                dlog("[RST] Sidecar paused during generation — discarding result");
+                return;
+            }
+
+            dlog("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length, "valid:", result.valid);
+
+            // Malformed, truncated, or otherwise invalid sidecar output fails closed.
+            // Preserve the current list rather than clearing it or accepting parser noise.
+            if (result.valid === false) {
+                dlog("[RST] Presence reconciliation skipped; preserving current list. Reason:", result.reason || "invalid response");
+                return;
+            }
+
+            const resultModes = result.modes && typeof result.modes === "object" ? result.modes : {};
 
             // Filter out excluded and previously-rejected names using normalized keys,
             // so case/dash/spacing variants don't leak through.
@@ -407,16 +435,23 @@ async function onMessageReceived(mesId, skipSidecar = false) {
             // - filteredUnknown: raw LLM names that didn't match any known character —
             //   give them ONE pass of fuzzy matching as a second chance.
             const detectedIds = new Set();
+            const detectedModes = {};
+            const normalizePresenceMode = (value) => {
+                const mode = String(value || "").toLowerCase();
+                return ["physical", "call", "surveillance", "message", "remote", "parallel"].includes(mode) ? mode : "unknown";
+            };
             for (const name of filteredDetected) {
                 const existing = findCharacterByName(name);
                 if (existing) {
                     detectedIds.add(existing.id);
+                    detectedModes[existing.id] = normalizePresenceMode(resultModes[name]);
                 }
             }
             for (const unknownName of filteredUnknown) {
                 const existing = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
                 if (existing && !detectedIds.has(existing.id)) {
                     detectedIds.add(existing.id);
+                    detectedModes[existing.id] = normalizePresenceMode(resultModes[unknownName]);
                 }
             }
 
@@ -435,6 +470,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
                         if (newChar && !detectedIds.has(newChar.id)) {
                             newDetected.push(newChar.id);
                             detectedIds.add(newChar.id);
+                            detectedModes[newChar.id] = normalizePresenceMode(resultModes[unknownName]);
                         }
                     } else {
                         // User clicked "Ignore" — persist it to the per-chat blacklist so
@@ -448,15 +484,26 @@ async function onMessageReceived(mesId, skipSidecar = false) {
 
             // Only update present characters + injection if the list actually changed
             const currentPresent = getPresentCharacters();
-            const changed = newDetected.length !== currentPresent.length ||
-                !newDetected.every((id) => currentPresent.includes(id));
+            const uniqueDetected = [...new Set(newDetected)];
+            const currentModes = getPresenceModes();
+            const nextModes = {};
+            for (const id of uniqueDetected) {
+                nextModes[id] = detectedModes[id] || currentModes[id] || "unknown";
+            }
+
+            const changed = uniqueDetected.length !== currentPresent.length ||
+                !uniqueDetected.every((id) => currentPresent.includes(id));
+            const modesChanged = Object.keys(nextModes).length !== Object.keys(currentModes).length ||
+                Object.entries(nextModes).some(([id, mode]) => currentModes[id] !== mode);
 
             if (changed) {
-                dlog("[RST] Present characters changed — old:", currentPresent.length, "new:", newDetected.length, ". Updating.");
+                dlog("[RST] Present characters changed — old:", currentPresent.length, "new:", uniqueDetected.length, ". Updating.");
                 // Always save — if empty, clears the present list; if non-empty, updates it
-                savePresentCharacters(newDetected);
+                savePresentCharacters(uniqueDetected);
+                savePresenceModes(nextModes);
                 updateInjection();
             } else {
+                if (modesChanged) savePresenceModes(nextModes);
                 dlog("[RST] Present characters unchanged — skipping injection update.");
             }
 

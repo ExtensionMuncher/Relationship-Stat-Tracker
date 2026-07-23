@@ -9,6 +9,71 @@ import { getContext } from "../../../../extensions.js";
 
 const NAMESPACE = "rst";
 
+function stripEvidenceFields(obj, keys) {
+    if (!obj || typeof obj !== "object") return false;
+    let changed = false;
+    for (const key of keys) {
+        if (Object.prototype.hasOwnProperty.call(obj, key)) {
+            delete obj[key];
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+function scrubLegacyRelationshipEvidence(data) {
+    if (!data || typeof data !== "object") return false;
+    let changed = false;
+    const characters = data.characters && typeof data.characters === "object" ? data.characters : {};
+    for (const profile of Object.values(characters)) {
+        if (!profile || typeof profile !== "object") continue;
+        for (const milestone of (Array.isArray(profile.relationshipMilestones) ? profile.relationshipMilestones : [])) {
+            changed = stripEvidenceFields(milestone, ["evidenceRefs", "messageRange", "evidencePreview", "candidateIds"]) || changed;
+        }
+        for (const condition of (Array.isArray(profile.relationshipConditions) ? profile.relationshipConditions : [])) {
+            changed = stripEvidenceFields(condition, ["evidenceRefs"]) || changed;
+        }
+        for (const entry of (Array.isArray(profile.updateLog) ? profile.updateLog : [])) {
+            changed = stripEvidenceFields(entry, ["evidenceRefs"]) || changed;
+        }
+    }
+
+    const pending = data.pendingUpdates;
+    for (const update of (Array.isArray(pending?.characterUpdates) ? pending.characterUpdates : [])) {
+        changed = stripEvidenceFields(update, ["evidenceRefs"]) || changed;
+        for (const item of (Array.isArray(update.proposedMilestones) ? update.proposedMilestones : [])) {
+            changed = stripEvidenceFields(item, ["evidence"]) || changed;
+        }
+        for (const item of (Array.isArray(update.proposedConditions) ? update.proposedConditions : [])) {
+            changed = stripEvidenceFields(item, ["evidence"]) || changed;
+        }
+        for (const item of (Array.isArray(update.resolvedConditions) ? update.resolvedConditions : [])) {
+            changed = stripEvidenceFields(item, ["evidence"]) || changed;
+        }
+    }
+
+    for (const result of (Array.isArray(data.pendingMilestoneScan) ? data.pendingMilestoneScan : [])) {
+        for (const milestone of (Array.isArray(result?.milestones) ? result.milestones : [])) {
+            changed = stripEvidenceFields(milestone, ["evidenceRefs", "messageRange", "evidencePreview", "candidateIds"]) || changed;
+        }
+    }
+    return changed;
+}
+
+function scrubPendingLockEvidence(results) {
+    if (!Array.isArray(results)) return false;
+    let changed = false;
+    for (const result of results) {
+        for (const lock of [
+            ...(Array.isArray(result?.hardLocks) ? result.hardLocks : []),
+            ...(Array.isArray(result?.softLocks) ? result.softLocks : []),
+        ]) {
+            changed = stripEvidenceFields(lock, ["evidenceRefs", "evidence"]) || changed;
+        }
+    }
+    return changed;
+}
+
 
 // ─── Name blacklist helpers ───────────────────────────────
 
@@ -83,17 +148,23 @@ export function isNameBlacklisted(name, extraNames = []) {
  * Persist chat metadata immediately when ST exposes an immediate save API;
  * otherwise fall back to SillyTavern's debounced chat save.
  */
-export function persistChatNow() {
-    saveChatDebounced();
+export async function persistChatNow() {
     try {
+        saveChatDebounced();
+        if (typeof saveChatDebounced.flush === "function") {
+            await Promise.resolve(saveChatDebounced.flush());
+        }
+
         const context = getContext?.();
         if (typeof context?.saveMetadata === "function") {
-            context.saveMetadata();
+            await Promise.resolve(context.saveMetadata());
         } else if (typeof context?.saveChat === "function") {
-            context.saveChat();
+            await Promise.resolve(context.saveChat());
         }
+        return true;
     } catch (err) {
         console.warn("[RST] Immediate chat metadata save failed; debounced save is still queued.", err);
+        return false;
     }
 }
 
@@ -111,6 +182,9 @@ function ensureSettingsNamespace() {
     }
     if (!extension_settings[NAMESPACE].settings) {
         extension_settings[NAMESPACE].settings = getDefaultSettings();
+    }
+    if (scrubPendingLockEvidence(extension_settings[NAMESPACE].pendingLockScan)) {
+        saveSettingsDebounced();
     }
 }
 
@@ -256,11 +330,16 @@ function ensureChatNamespace() {
     const data = chat_metadata[NAMESPACE];
     if (!Array.isArray(data.scenes)) data.scenes = [];
     if (data.pendingUpdates === undefined) data.pendingUpdates = null;
+    if (data.pendingMilestoneScan === undefined) data.pendingMilestoneScan = null;
     if (!Array.isArray(data.presentCharacters)) data.presentCharacters = [];
+    if (!data.presenceModes || typeof data.presenceModes !== "object" || Array.isArray(data.presenceModes)) data.presenceModes = {};
     if (typeof data.messageCounter !== "number") data.messageCounter = 0;
     if (!data.characters || typeof data.characters !== "object" || Array.isArray(data.characters)) data.characters = {};
     if (!Array.isArray(data.folders)) data.folders = [];
     if (!Array.isArray(data.nameBlacklist)) data.nameBlacklist = [];
+    if (scrubLegacyRelationshipEvidence(data)) {
+        saveChatDebounced();
+    }
 }
 
 /**
@@ -315,6 +394,26 @@ export function savePendingUpdates(pending) {
 }
 
 /**
+ * Pending retroactive milestone scan for the current chat. Kept per-chat so a
+ * review from one roleplay can never leak into another.
+ * @returns {Array|null}
+ */
+export function getPendingMilestoneScan() {
+    ensureChatNamespace();
+    return chat_metadata[NAMESPACE].pendingMilestoneScan || null;
+}
+
+/**
+ * Save or clear the current chat's pending milestone backfill results.
+ * @param {Array|null} results
+ */
+export function savePendingMilestoneScan(results) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].pendingMilestoneScan = results || null;
+    saveChatDebounced();
+}
+
+/**
  * Pending lock-scan results (library-wide, so stored globally in
  * extension_settings rather than per-chat). Persisted so that dismissing the
  * review dialog does not throw away an expensive scan — it can be reopened.
@@ -322,7 +421,9 @@ export function savePendingUpdates(pending) {
  */
 export function getPendingLockScan() {
     if (!extension_settings[NAMESPACE]) return null;
-    return extension_settings[NAMESPACE].pendingLockScan || null;
+    const pending = extension_settings[NAMESPACE].pendingLockScan || null;
+    if (scrubPendingLockEvidence(pending)) saveSettingsDebounced();
+    return pending;
 }
 
 /**
@@ -356,7 +457,53 @@ export function getPresentCharacters() {
  */
 export function savePresentCharacters(charIds) {
     ensureChatNamespace();
-    chat_metadata[NAMESPACE].presentCharacters = Array.isArray(charIds) ? charIds : [];
+    const safeIds = Array.isArray(charIds) ? [...new Set(charIds.filter((id) => typeof id === "string" && id))] : [];
+    chat_metadata[NAMESPACE].presentCharacters = safeIds;
+
+    // Keep presence-mode metadata aligned with the active list. Manual additions
+    // default to unknown until the sidecar observes physical/remote evidence.
+    const previousModes = chat_metadata[NAMESPACE].presenceModes || {};
+    const nextModes = {};
+    for (const id of safeIds) {
+        const mode = String(previousModes[id] || "").toLowerCase();
+        nextModes[id] = ["physical", "call", "surveillance", "message", "remote", "parallel"].includes(mode) ? mode : "unknown";
+    }
+    chat_metadata[NAMESPACE].presenceModes = nextModes;
+    saveChatDebounced();
+}
+
+/**
+ * Get per-character presence modes for the current chat.
+ * @returns {Record<string, "physical"|"call"|"surveillance"|"message"|"remote"|"parallel"|"unknown">}
+ */
+export function getPresenceModes() {
+    ensureChatNamespace();
+    if (!chat_metadata[NAMESPACE].presenceModes
+        || typeof chat_metadata[NAMESPACE].presenceModes !== "object"
+        || Array.isArray(chat_metadata[NAMESPACE].presenceModes)) {
+        chat_metadata[NAMESPACE].presenceModes = {};
+        saveChatDebounced();
+    }
+    return chat_metadata[NAMESPACE].presenceModes;
+}
+
+/**
+ * Save per-character presence modes, pruned to currently present character IDs.
+ * @param {Record<string, string>} modes
+ */
+export function savePresenceModes(modes) {
+    ensureChatNamespace();
+    const presentIds = new Set(getPresentCharacters());
+    const next = {};
+    for (const [id, rawMode] of Object.entries(modes || {})) {
+        if (!presentIds.has(id)) continue;
+        const mode = String(rawMode || "").toLowerCase();
+        next[id] = ["physical", "call", "surveillance", "message", "remote", "parallel"].includes(mode) ? mode : "unknown";
+    }
+    for (const id of presentIds) {
+        if (!(id in next)) next[id] = "unknown";
+    }
+    chat_metadata[NAMESPACE].presenceModes = next;
     saveChatDebounced();
 }
 
@@ -395,10 +542,10 @@ export function saveNameBlacklist(names, immediate = false) {
 
     chat_metadata[NAMESPACE].nameBlacklist = deduped;
     if (immediate) {
-        persistChatNow();
-    } else {
-        saveChatDebounced();
+        return persistChatNow();
     }
+    saveChatDebounced();
+    return true;
 }
 
 /**
@@ -546,6 +693,7 @@ export function getDefaultSettings() {
 
         messagesToScan: 10,
         scanFrequency: 5,
+        sidecarPaused: false,
         newCharPopup: true,
         statChangeRange: { min: -5, max: 5 },
         criticalChanges: {

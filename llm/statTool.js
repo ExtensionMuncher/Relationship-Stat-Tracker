@@ -9,8 +9,8 @@
  *
  * Why this exists:
  *   - Passive injection only covers characters the sidecar detects as present.
- *   - Sometimes the narrative references an absent character ("Alex wonders
- *     how Sam feels about them now") and the model needs that character's
+ *   - Sometimes the narrative references an absent character ("Mira wonders
+ *     how Kellan feels about him now") and the model needs that character's
  *     current stats to stay consistent.
  *   - Rather than injecting the entire library every message (expensive), the
  *     model deliberately asks for one character on demand.
@@ -30,6 +30,8 @@ import {
     getAllCharacters,
 } from "../data/characters.js";
 import { buildCharacterBlock } from "../inject/promptInjector.js";
+import { deriveRelationshipTrajectory } from "../data/trajectory.js";
+import { getRelationshipConditionDefinition } from "../data/conditions.js";
 
 const TOOL_NAME = "lookup_relationship_stats";
 
@@ -49,7 +51,7 @@ export function registerStatLookupTool() {
     ToolManager.registerFunctionTool({
         name: TOOL_NAME,
         displayName: "Look Up Relationship Stats",
-        description: "Use when an NPC’s response depends on relationship standing, trust, locks, or progression with the persona or another character.",
+        description: "Use when an NPC’s response depends on relationship standing, trajectory, temporary conditions, milestones, trust, locks, or progression with the persona or another character.",
         stealth: false,
         parameters: {
             type: "object",
@@ -117,5 +119,27 @@ async function lookupStats(characterName) {
         return `${profile.name} exists in the library but has no stat data yet.`;
     }
 
-    return block;
+    const extras = [];
+    const trajectory = deriveRelationshipTrajectory(profile);
+    extras.push(`Trajectory: ${trajectory.label}`);
+
+    const conditions = Array.isArray(profile.relationshipConditions) ? profile.relationshipConditions : [];
+    if (conditions.length) {
+        extras.push("Active temporary conditions:");
+        for (const condition of conditions) {
+            const def = getRelationshipConditionDefinition(condition.type);
+            if (!def) continue;
+            extras.push(`- ${def.label}: ${condition.reason || def.meaning} Effect: ${def.effect}`);
+        }
+    }
+
+    const milestones = Array.isArray(profile.relationshipMilestones) ? profile.relationshipMilestones.slice(-3) : [];
+    if (milestones.length) {
+        extras.push("Recent relationship milestones:");
+        for (const milestone of milestones) {
+            extras.push(`- ${milestone.title}: ${milestone.description}`);
+        }
+    }
+
+    return `${block}\n\n${extras.join("\n")}`;
 }
