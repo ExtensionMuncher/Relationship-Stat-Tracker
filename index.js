@@ -34,7 +34,7 @@ import { detectCharacters } from "./llm/sidecar.js";
 import { generateStatUpdate } from "./llm/statUpdate.js";
 import { updateInjection, removeInjection } from "./inject/promptInjector.js";
 import { createPanel, renderHomeHeader, getPane, switchTab, showPanelLoading, hidePanelLoading } from "./ui/panel.js";
-import { renderHomeTab } from "./ui/home.js";
+import { renderHomeTab, refreshSidecarCadenceDisplay, setSidecarCadenceRunning } from "./ui/home.js";
 import { renderLibraryTab, selectCharacter, showNewCharacterDetected } from "./ui/library.js";
 import { renderScenesTab } from "./ui/scenes.js";
 import { renderSettingsTab } from "./ui/settings.js";
@@ -334,6 +334,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
     }
 
     const liveCount = syncRuntimeMessageState("message event", mesId);
+    refreshSidecarCadenceDisplay(liveCount);
 
     // ── Deduplication: skip if this mesId was already processed ──
     // If messages were deleted, syncRuntimeMessageState() clears this Set before
@@ -367,6 +368,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
     if (settings.sidecarPaused === true) {
         syncMessageCounterToLiveCount(liveCount);
         setMessageCounter(liveCount);
+        refreshSidecarCadenceDisplay(liveCount);
         dlog("[RST] Sidecar paused — skipping presence detection (liveCount=" + liveCount + ")");
         return;
     }
@@ -397,6 +399,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
         setMessageCounter(liveCount);
 
         _sidecarRunning = true;
+        setSidecarCadenceRunning(true);
         const profileName = settings.connections?.sidecarLLM || "(none)";
         dlog("[RST] Sidecar detection start (liveCount=" + liveCount + ", frequency=" + frequency + ", profile=" + profileName + ")");
 
@@ -520,6 +523,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
             console.error("[RST] Sidecar detection error:", err);
         } finally {
             _sidecarRunning = false;
+            setSidecarCadenceRunning(false);
             dlog("[RST] Sidecar detection complete");
         }
     }
@@ -531,6 +535,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
  */
 function onChatChanged() {
     resetRuntimeMessageState("CHAT_CHANGED");
+    setSidecarCadenceRunning(false);
 
     // Warn about pending updates in the previous chat
     // (pending updates are stored per-chat and persist across switches)
@@ -664,6 +669,7 @@ function addSceneButtons(mesId) {
         createScene(mesId);
         toastr?.success?.(`Scene started at message ${mesId}.`);
         $startBtn.addClass("rst-scene-active");
+        $(document).trigger("rst:scene-state-changed");
 
         // Refresh scenes tab
         renderScenesTab(getPane("scenes"));
@@ -695,6 +701,7 @@ function addSceneButtons(mesId) {
         // generateStatUpdate(). Without this, a slow GLM call makes the scene
         // look like it did not close until a refresh.
         $startBtn.removeClass("rst-scene-active");
+        $(document).trigger("rst:scene-state-changed");
         renderScenesTab(getPane("scenes"));
         $(document).trigger("rst:refresh-message-buttons");
 

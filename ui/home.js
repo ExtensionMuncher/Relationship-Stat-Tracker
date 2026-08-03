@@ -3,16 +3,83 @@
  * Renders the Home tab with pending update cards and present character list
  */
 
-import { getPendingUpdates, savePendingUpdates, getPresentCharacters, savePresentCharacters, getSettings, deleteCharacterData } from "../data/storage.js";
+import { getPendingUpdates, savePendingUpdates, getPresentCharacters, savePresentCharacters, getSettings, getMessageCounter, deleteCharacterData } from "../data/storage.js";
 import { getCharacterProfile, getInitials, getAllCharacters, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { getOpenScene, getSceneById, deleteScene, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
 import { generateStatUpdate } from "../llm/statUpdate.js";
 import { renderScenesTab } from "./scenes.js";
 import { renderLibraryTab } from "./library.js";
-import { switchTab, getPane, showPanelLoading, hidePanelLoading } from "./panel.js";
+import { switchTab, getPane, showPanelLoading, hidePanelLoading, refreshHomeHeaderStatus } from "./panel.js";
+import { chat } from "../../../../../script.js";
 import { Popup, POPUP_RESULT, POPUP_TYPE } from "../../../../../scripts/popup.js";
 import { dlog } from "../lib/debug.js";
 import { getRelationshipConditionDefinition, MAX_ACTIVE_RELATIONSHIP_CONDITIONS } from "../data/conditions.js";
+
+// ─── Sidecar Cadence Display ─────────────────────────────
+
+let _sidecarScanRunning = false;
+
+/**
+ * Refresh the quiet Home-tab sidecar cadence indicator.
+ *
+ * The scheduler itself fires only from MESSAGE_SENT (user messages), but its
+ * cadence is measured against the live chat length, so both user and character
+ * messages advance the countdown.
+ */
+export function refreshSidecarCadenceDisplay(liveCountOverride = null) {
+    const $row = $("#rst-sidecar-cadence");
+    const $text = $("#rst-sidecar-cadence-text");
+    if (!$row.length || !$text.length) return;
+
+    const settings = getSettings();
+    const enabled = settings.enabled !== false;
+    const paused = settings.sidecarPaused === true;
+    const frequency = Math.max(1, Number(settings.scanFrequency) || 5);
+    const parsedLiveCount = Number(liveCountOverride);
+    const liveCount = Number.isFinite(parsedLiveCount) && parsedLiveCount >= 0
+        ? Math.floor(parsedLiveCount)
+        : (Array.isArray(chat) ? chat.length : 0);
+    const lastBaseline = Math.max(0, Number(getMessageCounter()) || 0);
+    const sinceBaseline = Math.max(0, liveCount - Math.min(lastBaseline, liveCount));
+    const nextIn = Math.max(0, frequency - sinceBaseline);
+
+    let status = "ready";
+    let label = "";
+
+    if (!enabled) {
+        status = "disabled";
+        label = "Sidecar disabled.";
+    } else if (paused) {
+        status = "paused";
+        label = "Sidecar paused.";
+    } else if (_sidecarScanRunning) {
+        status = "scanning";
+        label = "Sidecar scan running…";
+    } else if (nextIn === 0) {
+        status = "due";
+        label = "Sidecar ready · scan due on next user message";
+    } else {
+        label = `Sidecar ready · next scan in ${nextIn} message${nextIn === 1 ? "" : "s"}`;
+    }
+
+    $row.attr("data-status", status);
+    $text.text(label);
+    $row.attr(
+        "title",
+        `Cadence counts live chat messages (user + character). The sidecar itself only runs when a user message is sent. ${sinceBaseline}/${frequency} messages since the current baseline.`
+    );
+}
+
+/**
+ * Mark the sidecar request as running/not running for the Home indicator.
+ * @param {boolean} running
+ */
+export function setSidecarCadenceRunning(running) {
+    _sidecarScanRunning = Boolean(running);
+    refreshSidecarCadenceDisplay();
+}
+
+$(document).on("rst:refresh-sidecar-cadence", () => refreshSidecarCadenceDisplay());
 
 // ─── Main Render ──────────────────────────────────────────
 
@@ -21,11 +88,23 @@ import { getRelationshipConditionDefinition, MAX_ACTIVE_RELATIONSHIP_CONDITIONS 
  * @param {jQuery} $pane
  */
 export function renderHomeTab($pane) {
+    // The header is persistent while Home content re-renders. Refresh its
+    // open-scene label so chat switches and scene lifecycle changes cannot
+    // leave stale status text behind.
+    refreshHomeHeaderStatus();
+
     // Header is rendered by panel.js via renderHomeHeader — preserve it.
     // Only clear content that we previously created.
     $pane.find("#rst-home-content").remove();
 
     const $content = $('<div id="rst-home-content"></div>');
+
+    $content.append(`
+        <div class="rst-sidecar-cadence" id="rst-sidecar-cadence" data-status="ready" title="Sidecar cadence status">
+            <span class="rst-sidecar-cadence-dot">●</span>
+            <span id="rst-sidecar-cadence-text">Sidecar cadence status unavailable.</span>
+        </div>
+    `);
 
     const pending = getPendingUpdates();
     if (pending) {
@@ -36,6 +115,7 @@ export function renderHomeTab($pane) {
 
     renderPresentCharacters($content);
     $pane.append($content);
+    refreshSidecarCadenceDisplay();
 }
 
 /**
@@ -43,6 +123,8 @@ export function renderHomeTab($pane) {
  * @param {jQuery} $pane
  */
 export function refreshPending($pane) {
+    refreshHomeHeaderStatus();
+
     // Always append inside #rst-home-content (same container renderHomeTab uses)
     // to prevent orphaned sections from accumulating outside the content div.
     const $container = $pane.find("#rst-home-content");
@@ -65,6 +147,11 @@ export function refreshPending($pane) {
         renderNoPending($target);
     }
 }
+
+// Scene begin/end/delete can happen from message buttons or the Scenes tab
+// without rebuilding Home. Keep both the persistent header and the Home notice
+// synchronized from one lightweight lifecycle event.
+$(document).on("rst:scene-state-changed", () => refreshPending($("#rst-p-home")));
 
 // ─── Pending Updates Section ──────────────────────────────
 

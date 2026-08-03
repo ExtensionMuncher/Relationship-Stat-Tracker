@@ -87,6 +87,7 @@ export function renderScenesTab($pane) {
             }
             selectedScenes.clear();
             toastr?.info?.(`${count} scene${count > 1 ? "s" : ""} deleted.`);
+            $(document).trigger("rst:scene-state-changed");
             renderScenesTab($pane);
             // Re-add scene buttons to all messages (ST may re-render, which destroys buttons)
             $(document).trigger("rst:refresh-message-buttons");
@@ -348,6 +349,7 @@ function renderSceneEntry(scene, isOpen) {
             if (!confirmed) return;
             deleteScene(scene.id);
             toastr?.info?.(`Scene ${sceneNum} deleted.`);
+            $(document).trigger("rst:scene-state-changed");
             const $pane = $("#rst-p-scenes");
             renderScenesTab($pane);
             // Re-add scene buttons to all messages (ST may re-render, which destroys buttons)

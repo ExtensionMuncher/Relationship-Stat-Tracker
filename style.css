@@ -1583,6 +1583,25 @@ dialog.popup .editor_maximize:hover {
 .rst-status-title { font-weight: 500; font-size: 14px; }
 .rst-status-sub { font-size: 12px; color: var(--rst-text-muted); margin-top: 1px; }
 
+/* Quiet persistent sidecar cadence indicator */
+.rst-sidecar-cadence {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 18px;
+    margin: -7px 0 12px;
+    padding: 2px 4px;
+    font-size: 10.5px;
+    line-height: 1.35;
+    color: var(--rst-text-muted);
+    cursor: help;
+}
+.rst-sidecar-cadence-dot { font-size: 8px; color: #7f9b83; }
+.rst-sidecar-cadence[data-status="scanning"] .rst-sidecar-cadence-dot { color: #6f91b8; }
+.rst-sidecar-cadence[data-status="paused"] .rst-sidecar-cadence-dot,
+.rst-sidecar-cadence[data-status="disabled"] .rst-sidecar-cadence-dot,
+.rst-sidecar-cadence[data-status="due"] .rst-sidecar-cadence-dot { color: #a99a6c; }
+
 /* ─── Section headers (Home + Scenes) ───────────────────── */
 .rst-sec-h { display: flex; align-items: center; gap: 8px; margin-bottom: 11px; }
 .rst-sec-title {

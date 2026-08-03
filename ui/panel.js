@@ -192,6 +192,7 @@ export function renderHomeHeader($pane) {
         $("#rst-header-wrap").toggleClass("rst-disabled-bar", !newState);
         $("#rst-sidecar-pause-btn").prop("disabled", !newState);
         $(document).trigger("rst:toggle", [newState]);
+        $(document).trigger("rst:refresh-sidecar-cadence");
     });
 
     $header.find("#rst-sidecar-pause-btn").on("click", function () {
@@ -205,9 +206,21 @@ export function renderHomeHeader($pane) {
         $button.find("i").attr("class", `fa-solid ${paused ? "fa-play" : "fa-pause"}`);
         $button.find("span").text(paused ? "Resume sidecar" : "Pause sidecar");
         $("#rst-ext-lbl").text(buildStatusSub(isEnabled()));
+        $(document).trigger("rst:refresh-sidecar-cadence");
     });
 
     $pane.prepend($header);
+}
+
+/**
+ * Refresh the Home header status line without rebuilding the header.
+ * Scene state can change while the header remains mounted, so this keeps the
+ * open-scene label synchronized with the same data used by the Home/Scenes UI.
+ */
+export function refreshHomeHeaderStatus() {
+    const $label = $("#rst-ext-lbl");
+    if (!$label.length) return;
+    $label.text(buildStatusSub(isEnabled()));
 }
 
 /**
