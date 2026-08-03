@@ -8,32 +8,49 @@ A SillyTavern extension that tracks relationship stats and ongoing relationship 
 
 ## Features
 
-- **Automatic character presence detection** through a configurable sidecar LLM that scans recent messages on a set cadence
-- **Multiple presence modes** for physical scenes, live calls, active messaging, surveillance, other remote involvement, and parallel active scenes
-- **Live sidecar cadence status** on the Home tab showing whether detection is ready, paused, disabled, scanning, or due on the next user message
-- **12-stat relationship matrix** per character — three fixed categories (Platonic, Romantic, Sexual), each with four stats (Trust, Openness, Support, Affection) — all expressed as percentages that can go negative
-- **Scene management** with Scene Start and Scene End buttons added directly to chat messages
-- **Synchronized scene status** across the Home header, scene notices, message controls, and Scenes tab
-- **Stat updates on scene close** — the main LLM reviews what happened and proposes before→after changes, per-stat commentary, and a narrative summary
+### Relationship Tracking
+
+- **12-stat relationship matrix** per character across Platonic, Romantic, and Sexual categories, with Trust, Openness, Support, and Affection tracked from `-100%` to `100%`
 - **Critical stat changes** for rare pivotal moments that justify movement beyond the normal configured range
 - **Hard and soft threshold locks** that keep progression consistent with character psychology, history, and unresolved narrative barriers
 - **Relationship milestones** for durable turning points that should remain part of the relationship's history
 - **Temporary relationship conditions** for current states such as guardedness, suspicion, resentment, protectiveness, or conflict
 - **Trajectory and inertia analysis** that uses approved relationship history to discourage unsupported acceleration or abrupt reversals
-- **User approval flow** — proposed numeric and structural changes are held in Pending Updates and never committed until approved
-- **Scene summaries as LLM notepads** — private notes written by the stat LLM for future analysis, never injected into the main prompt by default
-- **System prompt injection** — present characters' relationship data can be automatically injected and removed as involvement changes
-- **Optional relationship-stat lookup tool** for main LLMs that support function calling
-- **Character library** with manual creation, AI-assisted profile generation, and automatic blank-entry creation on new character detection
-- **Character search, filtering, and sorting** by name, presence, stat state, and update activity
-- **Folder organization** with right-click controls for moving, renaming, exporting, and deleting entries
-- **Profile pictures** stored per character and displayed in both list and full-profile views
-- **Name aliases and blacklist controls** for more reliable character matching and cleaner automatic detection
+- **User approval flow** that holds numeric and structural proposals in Pending Updates until they are reviewed
 - **Update logs** with rollback and delete controls
 - **Milestone and threshold-lock backfills** for retroactively reviewing existing chat history
-- **Batch scan** with built-in rate limiting, retry handling, scene detection, character discovery, initial stat generation, and scene summaries
+
+### Scene Workflow
+
+- **Scene management** with Scene Start and Scene End buttons added directly to chat messages
+- **Synchronized scene status** across the Home header, scene notices, message controls, and Scenes tab
+- **Stat updates on scene close** with proposed before→after changes, per-stat commentary, structural relationship updates, and a narrative summary
+- **Scene summaries as LLM notepads** for future relationship analysis without automatic injection into the main prompt
+- **Batch scanning** with rate limiting, retry handling, scene detection, character discovery, initial stat generation, and scene summaries
+
+### Presence Detection and Prompt Integration
+
+- **Automatic character presence detection** through a configurable sidecar LLM that scans recent messages on a set cadence
+- **Multiple presence modes** for physical scenes, live calls, active messaging, surveillance, other remote involvement, and parallel active scenes
+- **Live sidecar cadence status** on the Home tab showing whether detection is ready, paused, disabled, scanning, or due on the next user message
+- **Name aliases and blacklist controls** for more reliable character matching and cleaner automatic detection
+- **System prompt injection** that adds and removes present characters' relationship data as involvement changes
+- **Optional relationship-stat lookup tool** for main LLMs that support function calling
+
+### Character Library and Data Management
+
+- **Character library** with manual creation, AI-assisted profile generation, and automatic blank-entry creation when a new character is detected
+- **Character search, filtering, and sorting** by name, presence, stat state, and update activity
+- **Folder organization** with right-click controls for moving, renaming, exporting, and deleting entries
+- **Profile pictures** stored per character and displayed in list and full-profile views
 - **Import and export tools** for extension data, individual profiles, and editable prompt text
-- **Fully configurable** — separate connection profiles, per-profile no-think controls, scan windows, cadence, stat ranges, lock behavior, injection format, and passive library reference options
+
+### Configuration
+
+- **Separate connection profiles** for scene review, sidecar detection, and profile generation
+- **Per-profile no-think controls** for supported backends
+- **Configurable scan windows and cadence** for presence detection and batch processing
+- **Configurable stat ranges, critical-change behavior, locks, injection format, and passive library reference options**
 
 ---
 
