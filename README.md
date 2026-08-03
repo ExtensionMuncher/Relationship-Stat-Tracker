@@ -2,7 +2,7 @@
 
 ---
 
-# What's New
+# Features
 
 ## Deletion-Safe Sidecar Scheduling
 
@@ -18,7 +18,9 @@ Initial generation now resolves aliases and fuzzy names into the existing zero-s
 
 ## Scene Close Responsiveness
 
-Closing a scene now updates the UI immediately, before the stat-update LLM call begins, so a slow model no longer makes the scene look stuck open. Double-clicking the close button can no longer start overlapping stat-update calls. If generation runs long, a notice after 45 seconds confirms the scene is already closed and the LLM is simply still working, and the success toast reports how long generation took. If generation fails, the scene stays closed and the error message points to the console for the underlying LLM/API error.
+Closing a scene updates the UI immediately, before the stat-update LLM call begins, so a slow model does not make the scene look stuck open. Double-clicking the close button cannot start overlapping stat-update calls. If generation runs long, a notice after 45 seconds confirms the scene is already closed and the LLM is still working, and the success toast reports how long generation took. If generation fails, the scene stays closed and the error message points to the console for the underlying LLM/API error.
+
+The Home header and scene notices also refresh immediately when a scene is started, closed, or deleted from either message controls or the Scenes tab. Open-scene status therefore remains synchronized without requiring a manual panel refresh.
 
 ## Relationship Milestones
 
@@ -34,17 +36,9 @@ RST now derives relationship trajectory from approved stat history and uses that
 
 ## Expanded Sidecar Presence Tracking
 
-The sidecar can now distinguish more than simple physical presence, including participation through calls, messaging, surveillance, remote involvement, and parallel-scene activity where applicable. Alias matching, scene-transition handling, response validation, and malformed-output safeguards were also strengthened so invalid sidecar output fails closed instead of wiping the current presence list.
+The sidecar can distinguish more than simple physical presence, including participation through calls, messaging, surveillance, remote involvement, and parallel-scene activity where applicable. Alias matching, scene-transition handling, response validation, and malformed-output safeguards were also strengthened so invalid sidecar output fails closed instead of wiping the current presence list.
 
-The sidecar can also be paused and resumed directly from the extension UI.
-
-## Live Sidecar Cadence Status
-
-The Home tab now includes a compact sidecar status indicator showing whether presence detection is ready, paused, disabled, currently scanning, or due to run on the next user message. It also shows how many live chat messages remain before the next scheduled scan, making automatic presence detection easier to monitor without opening the settings panel.
-
-## Synchronized Scene Status
-
-The Home header and scene notices now refresh immediately when a scene is started, closed, or deleted from either message controls or the Scenes tab. The displayed open-scene status no longer remains stale until the panel is manually refreshed.
+The sidecar can be paused and resumed directly from the extension UI. A compact Home-tab status indicator shows whether presence detection is ready, paused, disabled, currently scanning, or due to run on the next user message. It also displays how many live chat messages remain before the next scheduled scan.
 
 ## Improved Approval Flow
 
@@ -66,7 +60,7 @@ Structural relationship changes such as milestones, conditions, and lock changes
 
 ---
 
-# Implemented Relationship Systems
+# Relationship Systems
 
 ## Critical Increase/Decreases
 
