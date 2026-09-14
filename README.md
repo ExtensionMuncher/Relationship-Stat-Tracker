@@ -1,121 +1,522 @@
 # Relationship Stat Tracker (RST)
 
+A per-chat relationship continuity extension for [SillyTavern](https://github.com/SillyTavern/SillyTavern). RST tracks how individual characters relate to the active persona over time, keeps those changes reviewable before they become canonical, and gives long-running roleplay a persistent relationship state without forcing the roleplay model to maintain a giant hand-written relationship ledger.
+
+RST is designed for multi-character and long-form roleplay where relationships should change gradually, unevenly, and according to what actually happened in the story. It tracks relationship statistics, commentary, scenes, presence, milestones, temporary relationship conditions, hard and soft locks, and approved update history on a per-chat basis.
+
 ---
 
-# What's New
+## Requirements
 
-## Relationship-Relevance & No-Op Safety
+- A recent SillyTavern installation.
+- SillyTavern's **Connection Manager** enabled and at least one usable Connection Profile.
+- A model/profile for relationship analysis. The same profile can be reused for all RST roles, or different profiles can be assigned for quality, latency, and cost.
 
-Relationship updates now require persona-anchored evidence for each character, not merely scene-wide involvement. Direct interaction, grounded remote observation, surveillance, messaging, and concrete secondhand learning can qualify; NPC-only subplots, mere co-presence, reference-only mentions, and unrelated activity fail closed. Zero-change results are removed before review and rejected again at approval, while unchanged stats preserve their previously approved commentary instead of being rewritten by a no-op response.
+RST stores relationship data inside the current chat's metadata. Character profiles and relationship state from one chat do not automatically carry into another chat.
 
-## Hidden Deterministic Relationship Inertia
+---
 
-The continuity guard is now a completely hidden, deterministic per-stat hysteresis layer. It never appears in prompts, approval cards, ordinary UI, or exports. Same-direction movement is left to the stat-update model; inertia only resists large isolated reversals against trustworthy approved history. Reversal resistance releases as a new direction persists, and genuinely oscillating stats can become locally flexible without affecting unrelated relationship axes. Trusted history requires real scene/message provenance, excludes manual edits and implausible legacy jumps, and critical candidates retain their appropriate ordinary/critical range behavior. Diagnostics are available only through F12 debug logging.
+## Installation
 
-## Persona Relationship Anchor
+1. Place the `Relationship-Stat-Tracker` folder in:
+   `SillyTavern/public/scripts/extensions/third-party/Relationship-Stat-Tracker`
+2. Reload SillyTavern. A hard refresh is recommended after replacing extension files.
+3. Open **Relationship Stat Tracker** from the Extensions panel.
 
-RST now treats the active persona as an immutable relationship subject. A prominent NPC, narrator viewpoint, or parallel subplot cannot replace the persona as the target of relationship-state generation. Blank/new profiles require actual evidence that the character interacted with, observed, learned about, or otherwise reacted to the persona before nonzero initial stats can be established.
+To update RST, replace the extension folder with the new version and reload SillyTavern. Existing per-chat relationship data is migrated forward when possible.
 
-## Milestone Assessment & Pagination
+---
 
-Every stat-update result must explicitly assess whether the scene produced a durable relationship milestone, returning either one qualifying milestone or an empty list. Ordinary warmth, first meetings, routine apologies, generic conflict, and isolated vulnerable lines do not qualify by themselves. Character Library milestone history is displayed newest-first in compact pages, with a default of five milestones per page and a configurable 1–50 page size. Stat-update context still receives only the three most recent milestones.
+## First-Time Setup
 
-## Internal Relationship-Context Boundary
+Open the **Settings** tab and configure the three Connection Profiles:
 
-Relationship Milestones and Temporary Relationship Conditions remain available to RST's stat-update analysis, lifecycle/backfill tools, review flow, and Character Library, but they are intentionally excluded from the main roleplay prompt. This keeps internal relationship bookkeeping from directly steering the RP model or consuming unnecessary prompt context.
+- **Stat update LLM** — analyzes completed scenes and proposes relationship changes. This is the most important role and should use the strongest model of the three when possible.
+- **Sidecar detection LLM** — tracks which known characters are currently relevant/present and detects unknown characters. A smaller, fast model is usually sufficient.
+- **Auto-gen profile LLM** — generates initial character profile information when you create a newly detected character.
 
-## Missed-Character Catch-Up Scan
+RST supports per-profile **No-think** controls for compatible models. These can be configured independently for the assigned Connection Profiles.
 
-Settings → Debug now includes a discovery-only catch-up scan for recently missed characters. The scan processes narrative history in configurable chunks, filters existing/blacklisted/player/reference-only/document-only names, preserves the normal live sidecar checkpoint and presence state, and uses the same Create / Ignore / dismiss semantics as live character discovery.
+The default stat-change range is conservative (`-5` to `+5` per scene), and RST is intentionally biased toward **no change unless the scene contains relationship evidence**.
 
-## Sidecar Reliability & Cadence Preservation
+---
 
-Presence scans can fire when either side of a message exchange crosses the configured cadence, failed/rejected scans remain due for retry, and destructive message edits invalidate stale in-flight results. Pausing the sidecar now freezes exact cadence progress: messages written while paused do not consume or restart the countdown, and the saved per-chat cadence resumes from the same point afterward.
+## How to Use RST
 
-## Explicit Settings Saves
+### 1. Track a scene
 
-Editable Settings sections now provide explicit Save buttons for Connection Profiles, Batch Scan, Scene Summary Prompt, Stat Settings, Detection Settings, and Injection Settings. These use SillyTavern's immediate settings persistence path so unblurred edits can be committed before a refresh. Existing lightweight autosave handlers remain as a convenience.
+Use the RST scene controls on SillyTavern message bars to mark the beginning and end of a scene.
 
-## Async & Chat-Scope Safety
+When a scene closes:
 
-Long-running scans, generation, review, and backfill operations are scoped to the chat that started them. Results produced after a chat switch or destructive message mutation are discarded instead of being written into stale or unrelated chat state.
+1. The scene closes immediately in the UI.
+2. RST generates an internal scene summary.
+3. Characters relevant to the persona relationship are evaluated.
+4. Proposed relationship changes are sent to **Home → Pending updates**.
+5. Nothing becomes canonical until you approve it.
 
-## Deletion-Safe Sidecar Scheduling
+If the LLM call is slow, the scene remains closed while generation continues. Closing the same scene repeatedly will not intentionally start overlapping update calls.
 
-The sidecar's message counter is now treated as the live chat message count at the last scan, rather than an ever-incrementing counter. If messages are deleted (for example, OOC messages cleaned out mid-chat) and SillyTavern renumbers the chat, RST detects the shrink, clears its session-only processed-message cache, and clamps the saved counter to the current chat length. The sidecar can no longer be stranded waiting for a message number that no longer exists. RST also now listens for message deletion, edit, and swipe events (when the running SillyTavern build provides them) and resets its runtime state defensively.
+### 2. Review pending changes
 
-## Smarter Character Matching & Duplicate-Card Prevention
+The **Home** tab is the review surface for newly generated relationship state.
 
-Stat-update parsing now resolves LLM-returned character names against canonical names, saved aliases, and fuzzy matches using one shared matcher, and tracks which LLM keys have already been consumed. A canonical name and one of its aliases can no longer produce two separate pending cards for the same character. As a final safety net, pending updates are deduplicated by character ID before saving and again when the Home tab renders, keeping the strongest entry (most stat changes, richest data) if duplicates ever slip through.
+Pending cards can include:
 
-## Improved Initial Stat Generation
+- Numeric stat changes
+- Relationship commentary
+- Dynamic relationship title changes
+- Relationship milestones
+- Temporary relationship conditions
+- Hard-lock changes and pressure
+- Soft-lock changes and progress
+- Critical cap changes
 
-Initial generation now resolves aliases and fuzzy names into the existing zero-stat profile instead of creating a second "discovered" copy of the same character. When an LLM-returned name matches an existing character that is still all-zero, the entry is treated as true first-time initialization (no clamping by the Stat Change Range); if the character already has established stats, the normal delta-range, lock, and critical handling applies.
+The scene summary has its own approval lifecycle, separate from character stat approval.
 
-## Scene Close Responsiveness
+You may approve or dismiss cards individually, or use **Approve all / Dismiss all**. Zero-change/no-op updates are filtered before review and rejected again at approval so invisible no-op entries cannot create update history.
 
-Closing a scene now updates the UI immediately, before the stat-update LLM call begins, so a slow model no longer makes the scene look stuck open. Double-clicking the close button can no longer start overlapping stat-update calls. If generation runs long, a notice after 45 seconds confirms the scene is already closed and the LLM is simply still working, and the success toast reports how long generation took. If generation fails, the scene stays closed and the error message points to the console for the underlying LLM/API error.
+### 3. Keep an eye on presence
+
+The Home tab also shows **Currently present** characters and the live Sidecar cadence status.
+
+Presence is broader than simple physical co-location. RST can recognize narratively relevant participation through:
+
+- Physical presence
+- Live remote interaction
+- Messaging
+- Surveillance/observation
+- Relevant parallel-scene involvement
+
+Simple mentions, historical references, hypothetical discussion, reference documents, or unrelated NPC-only activity should not count as active relationship presence.
+
+### 4. Maintain the Character Library
+
+The **Library** tab contains the canonical relationship profiles for the current chat. You can inspect and edit character information, aliases, relationship stats, commentary, locks, milestones, conditions, and update history.
+
+### 5. Use Scenes for history and corrections
+
+The **Scenes** tab lists open and closed scenes. Scene titles, participants, and summaries can be edited. Closed scenes can be retried for stat analysis when no other review is pending.
+
+---
+
+## Relationship Matrix
+
+Each tracked character has up to three relationship categories:
+
+- **Platonic**
+- **Romantic**
+- **Sexual**
+
+Each category contains four relationship stats:
+
+- **Trust**
+- **Openness**
+- **Support**
+- **Affection**
+
+Stats are stored on a `-100` to `100` scale.
+
+Individual relationship categories can be hidden on a per-character basis. A hidden category is not merely cosmetic: it is excluded from prompt injection and from RST's internal LLM analysis/modification for that profile.
+
+### No Change by Default
+
+RST does not assume that every scene changes every relationship.
+
+- Stagnation is not regression.
+- A character being present does not require a stat update.
+- A positive scene does not automatically raise all positive stats.
+- Stat decreases require negative relationship evidence.
+- NPC-only developments do not change a character's relationship with the persona unless that character actually gains relevant knowledge or is involved in a persona-related interaction.
+
+Unchanged stats keep their last approved commentary instead of receiving rewritten filler commentary.
+
+---
+
+## Persona-Anchored Relationship Evidence
+
+RST treats the active SillyTavern persona as the fixed subject of its relationship tracking.
+
+A character update must be grounded in evidence about **that character's relationship to the persona**. A prominent NPC, narrator viewpoint, or parallel subplot cannot silently replace the persona as the relationship subject.
+
+A character may still be relationship-relevant without physically sharing a room with the persona. Remote interaction, surveillance, messaging, or credible secondhand knowledge can qualify when the narrative supports it.
+
+For new/blank profiles, RST requires evidence that the character interacted with, observed, learned something meaningful about, or otherwise reacted to the persona before assigning nonzero initial relationship stats.
+
+---
+
+## Critical Changes
+
+Critical changes allow unusually important relationship moments to exceed the normal **Stat Change Range**.
+
+The stat-update model first has to identify a change as significant enough to qualify. RST then applies the configured critical chance. Critical changes are intentionally rare and remain visible in the approval flow before becoming canonical.
+
+The critical multiplier determines the larger range available to a successful critical change.
+
+---
+
+## Relationship Trajectory & Hidden Inertia
+
+RST derives visible relationship trajectory from approved relationship history.
+
+Separately, RST uses a **hidden deterministic inertia layer** to prevent implausible one-scene reversals in established stats. Inertia is not another model output and is not shown in normal UI, prompts, approval cards, or exports.
+
+The current inertia system behaves as per-stat reversal hysteresis:
+
+- Same-direction growth or decline is not damped by inertia.
+- A large isolated reversal against trustworthy approved history may be resisted.
+- Resistance releases when the new direction persists across grounded updates.
+- Repeated genuine oscillation can make that individual stat more flexible without affecting unrelated stats.
+- Manual edits and unreliable/legacy transitions are excluded from trusted inertia history.
+
+When Debug F12 logging is enabled, diagnostic information can be inspected in the browser console without exposing inertia to the stat-update model.
+
+---
+
+## Hard Locks
+
+Hard Locks are psychological ceilings/floors applied to individual relationship stats.
+
+They are intended for characters whose established personality or history makes certain relationship movement implausible without a major change. For example, a character who fundamentally distrusts others may have a Trust cap until enough contradictory evidence accumulates.
+
+Hard Locks require the character's **Personality** field to contain usable information. RST will not invent psychology-based locks for an empty personality profile.
+
+### Hard-Lock Pressure
+
+A hard lock can accumulate **pressure** when the narrative repeatedly provides evidence against the reason that lock exists.
+
+Pressure does not directly raise the stat. Instead, reaching the maximum flags the lock for user review and allows RST to recommend whether the cap itself should change.
+
+This keeps hard locks durable without making them permanently immune to genuine character development.
+
+---
+
+## Soft Locks
+
+Soft Locks are conditional relationship caps tied to a narrative requirement.
+
+A soft lock contains:
+
+- A stat cap
+- An unlock condition
+- Progress notes
+- Whether the condition has been met
+
+When the condition is fulfilled, the lock can release and normal stat movement resumes. Unlike a Hard Lock, a Soft Lock is not meant to be broken simply by a critical change.
+
+The maximum number of simultaneous active Soft Locks per character is configurable from **1–3**. This is a ceiling, not a target; RST may use fewer or none.
+
+Soft Locks also require a usable Personality field so the system has enough character context to justify them.
+
+---
 
 ## Relationship Milestones
 
-RST can identify rare, durable turning points in a relationship alongside ordinary stat updates. Proposed milestones remain reviewable before they are saved, and existing milestones can be edited or deleted from the Character Library. A full-chat backfill option can scan an existing conversation for important milestones that predate the feature. Milestones are internal analysis/history state and are not directly injected into the main RP prompt.
+Milestones are rare, durable turning points in the relationship rather than ordinary scene beats.
 
-## Temporary Relationship Conditions
+Every stat update explicitly assesses whether a qualifying milestone occurred and returns either a real proposal or no milestone. Routine friendliness, first meetings, minor apologies, generic arguments, or isolated emotional lines should not become permanent milestones by default.
 
-Characters can carry temporary relationship states such as Guarded, Suspicious, Resentful, Protective, or Conflicted. Conditions can be proposed, updated, resolved, and historically backfilled as circumstances change. Unlike milestones, conditions represent the character's current relationship state rather than a permanent historical turning point. Their effects remain internal to RST's stat-update analysis instead of being injected directly into the main RP prompt.
+Milestones:
 
-## Relationship Trajectory & Inertia
+- Are reviewable before commit
+- Can be edited or deleted from the Character Library
+- Can be backfilled from older chat history
+- Are shown newest-first in paginated Library history
+- Use a configurable page size from **1–50** (default: 5)
+- Supply only the **three most recent milestones** to stat-update analysis
 
-RST derives visible relationship trajectory from approved stat history. Separately, its hidden deterministic inertia layer provides stat-local reversal hysteresis against abrupt unsupported direction changes without damping legitimate same-direction growth. The mechanism uses only trustworthy approved narrative history and remains absent from normal prompts, UI, review data, and exports.
-
-## Expanded Sidecar Presence Tracking
-
-The sidecar can now distinguish more than simple physical presence, including participation through calls, messaging, surveillance, remote involvement, and parallel-scene activity where applicable. Alias matching, scene-transition handling, response validation, and malformed-output safeguards were also strengthened so invalid sidecar output fails closed instead of wiping the current presence list.
-
-The sidecar can also be paused and resumed directly from the extension UI.
-
-## Live Sidecar Cadence Status
-
-The Home tab now includes a compact sidecar status indicator showing whether presence detection is ready, paused, disabled, currently scanning, or due to run on the next user message. It also shows how many live chat messages remain before the next scheduled scan, making automatic presence detection easier to monitor without opening the settings panel.
-
-## Synchronized Scene Status
-
-The Home header and scene notices now refresh immediately when a scene is started, closed, or deleted from either message controls or the Scenes tab. The displayed open-scene status no longer remains stale until the panel is manually refreshed.
-
-## Improved Approval Flow
-
-Structural relationship changes such as milestones, conditions, and lock changes remain reviewable even when a scene produces no numeric stat changes. Approval cards and logs now expose more of the relevant relationship state before changes are committed.
-
-## Settings & Storage Improvements
-
-- Added clearer save feedback and improved persistence for the names blacklist.
-- Added an explicit **Save Stat Settings** action.
-- Added cleanup for obsolete stored evidence fields.
-
-## Bug Fixes
-
-- Fixed stale commentary in the prompt injection: the newest update-log entry is now read from the correct end of the log, so the injected commentary reflects the latest approved scene instead of the oldest.
-- Fixed the remove (✕) button on "Currently present" character cards doing nothing when the click landed on the icon inside the button.
-- Present-character cards now color their top stat values as positive/negative/neutral, matching the rest of the panel.
-- Improved protection against duplicate first-time stat proposals for pre-created zero-stat profiles.
-- Improved sidecar alias resolution and validation around scene changes.
+Milestones are **internal relationship-analysis/history state**. They are not directly injected into the main roleplay prompt.
 
 ---
 
-# Implemented Relationship Systems
+## Temporary Relationship Conditions
 
-## Critical Increase/Decreases
+Temporary Relationship Conditions describe a character's current relationship state when that state matters to how new evidence should be interpreted.
 
-Whenever a sufficiently significant moment occurs within the roleplay scene, the respective stat(s) can receive a critical increase or decrease beyond the normal amount set within the **Stat Change Range**. Critical changes are reserved for major relationship events and remain visible in the approval flow before being committed.
+Examples include states such as Guarded, Suspicious, Resentful, Protective, or Conflicted.
 
-## Threshold Locks
+Conditions can be proposed, approved, updated, resolved, and historically backfilled. Unlike Milestones, they are not permanent turning points; they describe a temporary relationship condition that may later disappear.
 
-### Hard Locks
+Temporary Conditions are internal to RST's stat-update analysis and are intentionally excluded from the main roleplay prompt.
 
-This allows the AI to set caps or floors on an NPC's stats based on their personality, psychology, history, and established relationship behavior. If an NPC has strong reasons not to trust easily, for example, a Hard Lock can limit Trust until the relationship genuinely changes enough to justify movement beyond that boundary.
+---
 
-### Soft Locks (Unlockable)
+## Character Presence & Discovery
 
-This is a conditional cap or floor that may require the {{user}} to perform certain actions or meet specific narrative requirements before the respective stat can continue moving. The unlock condition is stored with the lock so relationship growth can resume naturally once the underlying obstacle has actually changed.
+The Sidecar runs on a configurable cadence and reconciles which known characters are relevant to the current narrative window.
 
-Threshold-lock backfilling can scan raw chat history in chunks and consider current stats, trajectory, milestones, conditions, existing locks, and historical behavior before proposing new locks. Existing lock slots are preserved instead of being overwritten unnecessarily.
+### Cadence
+
+- **Scan frequency** controls how many narrative messages pass between presence scans.
+- **Messages to scan** controls how much recent story context the Sidecar reads.
+- The Home tab shows the live cadence state and how many messages remain before the next scan.
+- Pausing the Sidecar freezes its exact cadence position. Messages written while paused do not consume or reset progress.
+- Failed/rejected scans remain due for retry instead of silently consuming the checkpoint.
+
+### New characters
+
+When **New character popup** is enabled, an unknown grounded character can be offered for creation. The popup actions are explicit:
+
+- **Create** — creates the profile.
+- **Ignore** — adds the name to the blacklist.
+- Closing/dismissing the popup — does neither.
+
+The per-chat **Name blacklist** can also be edited manually. The active SillyTavern persona name is excluded from character detection automatically.
+
+### Missed-character catch-up
+
+**Settings → Debug → Scan for Missed Characters** performs a discovery-only historical pass over recent narrative messages. It proposes unknown grounded characters without changing normal Sidecar cadence or current presence state.
+
+---
+
+## Character Library
+
+The Library is the main place to inspect and maintain established character profiles.
+
+A profile can contain:
+
+- Name and aliases
+- Description, Personality, and Notes
+- Relationship matrix
+- Per-category visibility
+- Current relationship commentary and dynamic title
+- Hard Locks and pressure
+- Soft Locks and progress
+- Relationship Milestones
+- Temporary Relationship Conditions
+- Recent approved update history
+
+Name matching uses canonicalized identity and aliases to reduce duplicate profiles caused by punctuation, Unicode differences, alternate word order, or common shortened names.
+
+### Update history and rollback
+
+Approved relationship updates retain enough prior relationship state to support guarded rollback. Rollback refuses to overwrite newer manual edits when the stored post-update state no longer matches the current profile.
+
+---
+
+## Scenes
+
+RST scenes provide the evidence window used for relationship analysis.
+
+The Scenes tab supports:
+
+- Open and closed scene history
+- Scene titles
+- Character/participant editing
+- Scene summary editing and saving
+- Retrying stat review for a closed scene
+- Deleting scenes
+- Bulk selection/deletion of closed scenes
+
+Deleting an open scene does not generate a summary or relationship update. Deleting or editing messages/scenes also invalidates stale Sidecar work so old asynchronous results cannot commit against changed story evidence.
+
+---
+
+## Batch Scan
+
+**Settings → Batch Scan** can retrofit RST onto an existing chat.
+
+Batch Scan detects historical scene ranges, creates missing profiles when justified, generates summaries, and processes relationship state in chronological order.
+
+Important safeguards:
+
+- Scene-detected character names are advisory, not automatically trusted.
+- Proposed characters are grounded against the actual narrative messages in the detected scene.
+- Reference-only/document-only names are rejected.
+- Existing profiles and aliases are reused where possible.
+- Established characters use the same constrained update pipeline as normal live scenes; their existing stats are not treated as fresh initialization.
+- Historical initial stats still require persona-anchored relationship evidence.
+
+Batch Scan settings include token limits, request rate limiting, retry behavior, optional delays, and range combining for compatible context windows.
+
+---
+
+## Backfill & Repair Tools
+
+Settings → Debug includes historical maintenance tools for relationship systems that may have been introduced after a chat began.
+
+### Relationship Milestone Backfill
+
+Scans visible chat history for durable relationship turning points. Proposals are reviewed before becoming permanent history and do not modify relationship stats.
+
+### Temporary Condition Backfill
+
+Scans historical relationship context for conditions that should still matter or for historical state needed to make current relationship analysis coherent. Results are reviewed before application.
+
+### Threshold Lock Backfill
+
+Uses chat history together with current stats, trajectory, milestones, conditions, summaries, personality, and existing lock state to propose missing Hard/Soft Locks. Existing occupied lock slots are preserved.
+
+### Missed Character Scan
+
+Performs discovery-only scanning for grounded NPCs that may have appeared before the current Sidecar checkpoint.
+
+---
+
+## Settings Reference
+
+### Connection Profiles
+
+- **Stat update LLM** — scene relationship analysis and proposals.
+- **Sidecar detection LLM** — presence reconciliation and unknown-character detection.
+- **Auto-gen profile LLM** — initial generated character profile data.
+- **No-think per profile** — optional reasoning suppression for compatible backends.
+
+Use **Save Connection Profiles** to commit the section immediately.
+
+### Batch Scan
+
+Controls:
+
+- Scene detection max tokens
+- Initial stat max tokens
+- Requests per minute
+- Max retries
+- Base retry delay
+- Per-scene delay
+- Inter-phase delay
+- Combine ranges in a single call
+
+### Scene Summary Prompt
+
+Customizes the internal prompt used to summarize completed scenes for future relationship analysis.
+
+### Stat Settings
+
+Controls:
+
+- Normal Stat Change Range
+- Critical Changes on/off
+- Critical chance
+- Hard Locks on/off
+- Soft Locks on/off
+- Maximum active Soft Locks per character
+
+### Detection Settings
+
+Controls:
+
+- Sidecar Scan frequency
+- Messages to scan
+- New character popup
+- Name blacklist
+
+### Injection Settings
+
+Controls what relationship information reaches the main roleplay model.
+
+Options include:
+
+- Inject stat block
+- Inject character profile
+- Injection format
+- Injection placement
+- Passive Library Reference
+- Stat lookup tool/function calling
+- Library-reference depth and speaker role
+
+Milestones, Temporary Relationship Conditions, and hidden inertia data are intentionally not directly included in the normal RP prompt.
+
+### Data
+
+- **Milestones per page** — 1–50, default 5.
+- **Import all** — restores RST settings and chat data from an export.
+- **Export all** — downloads a full backup of RST settings and current-chat relationship data.
+
+### Debug
+
+Includes F12 logging and historical backfill/repair tools. Debug logging is off by default; warnings and errors remain visible regardless.
+
+---
+
+## Prompt Injection & Lookup
+
+RST can inject the relationship information for currently relevant characters into the main roleplay context.
+
+You can configure whether to inject:
+
+- Stat blocks
+- Character profile text
+- Both stats and narrative relationship context
+
+**Passive Library Reference** can make broader tracked relationship data available as reference context when enabled.
+
+When the backend supports tool calling, RST can also register a stat lookup tool so the main model can request a tracked character's relationship data on demand, even if that character is not currently present.
+
+Internal analysis systems such as Milestones, Temporary Relationship Conditions, and hidden deterministic inertia remain separated from the normal roleplay prompt.
+
+---
+
+## Import, Export & Backups
+
+RST data is stored per chat. Use **Settings → Data → Export all** to create a JSON backup containing settings, character profiles, and current-chat RST metadata.
+
+Imports support current exports as well as older backup layouts where possible. Migration fills in newer fields while preserving existing relationship profiles, scenes, presence state, aliases, and configured connections.
+
+Regular exports are recommended for long-running roleplays.
+
+---
+
+## Reliability & Safety Notes
+
+RST is deliberately conservative about relationship state:
+
+- No change is preferred over inventing movement.
+- Relationship decreases need negative evidence.
+- New relationships need persona-relevant evidence.
+- Hidden continuity safeguards do not become LLM instructions.
+- Generated state is reviewable before commit.
+- Long-running asynchronous work is scoped to the chat that started it.
+- Results produced after a chat switch or destructive message mutation are discarded rather than written into stale state.
+- Legacy internal-only evidence/diagnostic fields are scrubbed during migration and are not part of normal exports.
+
+These constraints are intended to make RST useful over hundreds or thousands of messages without letting incidental scene activity slowly distort the relationship model.
+
+---
+
+## Troubleshooting
+
+### No pending relationship update appears after closing a scene
+
+This can be correct. RST intentionally produces no relationship update when the scene contains no meaningful persona-anchored relationship change. Check F12 for generation errors if you expected an update.
+
+### A character is not detected as present
+
+Check:
+
+- The Sidecar Connection Profile is configured and available.
+- The Sidecar is not paused.
+- Detection cadence is due.
+- The character is not blacklisted.
+- The recent message window actually contains grounded participation rather than only a reference.
+
+For older missed appearances, use **Debug → Scan for Missed Characters**.
+
+### A character keeps appearing twice
+
+Add/repair aliases in the Character Library and make sure the duplicate names really refer to the same person. RST performs canonical name matching, but ambiguous unrelated short names are intentionally not collapsed blindly.
+
+### A stat refuses to rise
+
+Inspect the character's Hard/Soft Locks. A Hard Lock may cap normal growth; a Soft Lock may require its stated narrative condition to be fulfilled before progression resumes.
+
+### A stat reversal seems smaller than expected
+
+For established history, hidden deterministic inertia may be resisting a large isolated reversal. Enable Debug F12 logging if you need to inspect the calculation. Inertia does not affect same-direction movement and releases when the new direction becomes sustained evidence.
+
+### Batch Scan produces no new profile for a mentioned character
+
+Batch Scan intentionally rejects reference-only names. The character must be grounded as an active participant, remote participant, observer, messenger, or otherwise persona-relevant actor within the scanned narrative evidence.
+
+---
+
+## Notes
+
+- RST is a relationship-continuity aid, not a replacement for the character card or the roleplay model's judgment.
+- Generated changes are proposals until approved.
+- Stronger models generally improve nuanced stat/commentary decisions; the Sidecar role can usually use a smaller, faster model.
+- Per-chat storage means deleting a chat also deletes that chat's RST metadata unless you exported it first.
+
+---
+
+*Relationship Stat Tracker is a community SillyTavern extension. It orchestrates models you configure through SillyTavern's Connection Manager and ships no model of its own.*
