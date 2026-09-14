@@ -1,3 +1,4 @@
+import { captureChatScope, invalidateChatScopes } from "./lib/chatScope.js";
 /**
  * index.js — Extension entry point
  * Registers the RST extension with SillyTavern, initializes UI, and binds events
@@ -25,13 +26,17 @@ import {
     isNameBlacklisted,
     setMessageCounter,
     syncMessageCounterToLiveCount,
+    setSidecarRetryDue,
+    getSidecarPauseCadence,
+    saveSidecarPauseCadence,
+    clearSidecarPauseCadence,
     getPendingUpdates,
     savePendingUpdates,
 } from "./data/storage.js";
 import { createCharacter, findCharacterByName, findCharacterByFuzzyName } from "./data/characters.js";
 import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary, updateSceneTitle } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
-import { generateStatUpdate } from "./llm/statUpdate.js";
+import { generateStatUpdate, isStatUpdateRunning } from "./llm/statUpdate.js";
 import { updateInjection, removeInjection } from "./inject/promptInjector.js";
 import { createPanel, renderHomeHeader, getPane, switchTab, showPanelLoading, hidePanelLoading } from "./ui/panel.js";
 import { renderHomeTab, refreshSidecarCadenceDisplay, setSidecarCadenceRunning } from "./ui/home.js";
@@ -40,6 +45,7 @@ import { renderScenesTab } from "./ui/scenes.js";
 import { renderSettingsTab } from "./ui/settings.js";
 import { registerStatLookupTool } from "./llm/statTool.js";
 import { dlog } from "./lib/debug.js";
+import { isNarrativeMessage, narrativeMessages } from "./lib/chatMessages.js";
 
 // ─── Extension Constants ──────────────────────────────────
 
@@ -48,6 +54,11 @@ const EXTENSION_NAME = "rst";
 // ─── Re-entrancy guard ───────────────────────────────────
 // Prevents overlapping sidecar detection calls that could cause connection profile churn
 let _sidecarRunning = false;
+
+// Invalidates asynchronous sidecar work when its owning chat or pause state
+// changes. A result is allowed to mutate presence only in the exact lifecycle
+// generation in which it started.
+let _sidecarGeneration = 0;
 
 // ─── Message deduplication guard ─────────────────────────
 // ST may fire MESSAGE_RECEIVED/SENT multiple times for the same message
@@ -59,11 +70,6 @@ const _processedMesIds = new Set();
 // Tracks the live chat size so deletion/renumbering can be detected even if ST
 // does not emit a dedicated delete event before the next MESSAGE_SENT/RECEIVED.
 let _lastObservedChatLength = Array.isArray(chat) ? chat.length : 0;
-
-// ─── Rejected names (in-memory, session-only) ────────────
-// Names the user clicked "Ignore" on in the new-character popup.
-// Prevents repeated popups for the same name within a session.
-const _rejectedNames = new Set();
 
 // ─── jQuery Extension init ────────────────────────────────
 
@@ -219,10 +225,7 @@ function safeStep(label, fn) {
  * @returns {number}
  */
 function getLiveMessageCount(mesId = null) {
-    const chatLength = Array.isArray(chat) ? chat.length : 0;
-    const parsed = mesId !== null && mesId !== undefined ? parseInt(mesId, 10) : NaN;
-    const fromMesId = Number.isFinite(parsed) && parsed >= 0 ? parsed + 1 : 0;
-    return Math.max(chatLength, fromMesId);
+    return narrativeMessages(chat).length;
 }
 
 /**
@@ -241,6 +244,7 @@ function syncRuntimeMessageState(reason = "unknown", mesId = null) {
         const previousLength = _lastObservedChatLength;
         _processedMesIds.clear();
         const sync = syncMessageCounterToLiveCount(liveCount);
+        setSidecarRetryDue(false);
         dlog(`[RST] Live chat shrank (${previousLength} → ${liveCount}) during ${reason}; cleared processed message IDs.` +
             (sync.changed ? ` Sidecar counter clamped ${sync.previous} → ${sync.counter}.` : ""));
     } else {
@@ -262,10 +266,54 @@ function syncRuntimeMessageState(reason = "unknown", mesId = null) {
  */
 function resetRuntimeMessageState(reason = "chat changed") {
     _processedMesIds.clear();
+    const destructiveMutation = ["MESSAGE_DELETED", "MESSAGE_EDITED", "MESSAGE_SWIPED", "CHAT_DELETED"].includes(reason);
+    if (destructiveMutation) {
+        // The message evidence that an in-flight request owns has changed. Invalidate
+        // that request at the same lifecycle boundary that resets cadence bookkeeping;
+        // a stale pre-edit result must never commit into the edited chat.
+        _sidecarGeneration++;
+        setSidecarRetryDue(false);
+    }
     _lastObservedChatLength = getLiveMessageCount();
     const sync = syncMessageCounterToLiveCount(_lastObservedChatLength);
+    refreshSidecarCadenceDisplay(_lastObservedChatLength);
     dlog(`[RST] Runtime message state reset (${reason}); liveCount=${_lastObservedChatLength}` +
         (sync.changed ? `, sidecar counter clamped ${sync.previous} → ${sync.counter}` : ""));
+}
+
+
+/**
+ * Snapshot cadence progress without consuming or resetting it. Paused messages
+ * are intentionally excluded from cadence, so this anchor is held until resume.
+ * @param {number} liveCount
+ * @returns {{liveCount:number, baseline:number}}
+ */
+function captureSidecarPauseCadence(liveCount = getLiveMessageCount(), force = false) {
+    const sync = syncMessageCounterToLiveCount(liveCount);
+    const existing = getSidecarPauseCadence();
+    if (!force && existing) return existing;
+    return saveSidecarPauseCadence(liveCount, sync.counter);
+}
+
+/**
+ * Restore the same cadence progress against the current live chat length. Any
+ * narrative messages added while paused are skipped rather than counted toward
+ * the next scan. Example: pausing at 2/3 resumes at 2/3, not 0/3 or 3/3.
+ * @param {number} liveCount
+ * @returns {number} restored baseline
+ */
+function restoreSidecarPauseCadence(liveCount = getLiveMessageCount()) {
+    const snapshot = getSidecarPauseCadence();
+    if (!snapshot) {
+        return syncMessageCounterToLiveCount(liveCount).counter;
+    }
+
+    const progressAtPause = Math.max(0, snapshot.liveCount - snapshot.baseline);
+    const preservedProgress = Math.min(progressAtPause, Math.max(0, liveCount));
+    const restoredBaseline = Math.max(0, Math.floor(liveCount) - preservedProgress);
+    setMessageCounter(restoredBaseline);
+    clearSidecarPauseCadence();
+    return restoredBaseline;
 }
 
 // ─── Event Handlers ───────────────────────────────────────
@@ -274,15 +322,17 @@ function resetRuntimeMessageState(reason = "chat changed") {
  * Register all SillyTavern event handlers.
  */
 function registerEventHandlers() {
-    // Character message rendered — add scene buttons only (no sidecar)
-    // Sidecar does NOT run on AI responses — injection doesn't change
-    // mid-turn. Detection runs only on MESSAGE_SENT so the AI has
-    // updated present-character context before generating.
+    $(document).on("rst:profiles-changed", () => updateInjection());
+    // Check cadence on BOTH halves of the exchange. MESSAGE_RECEIVED fires
+    // after the assistant generation has completed, so reconciling presence here
+    // cannot alter the response that just finished. This also lets an unknown NPC
+    // introduced by the assistant reach the approval popup as soon as the cadence
+    // threshold is met instead of waiting for a later message boundary.
     eventSource.on(event_types.MESSAGE_RECEIVED, (mesId) => {
         onMessageReceived(mesId, true);
     });
 
-    // User message rendered — add scene buttons + sidecar check
+    // User message rendered — add scene buttons + the same cadence check.
     eventSource.on(event_types.MESSAGE_SENT, (mesId) => {
         onMessageReceived(mesId, false);
     });
@@ -290,6 +340,22 @@ function registerEventHandlers() {
     // Chat changed — re-render everything
     eventSource.on(event_types.CHAT_CHANGED, () => {
         onChatChanged();
+    });
+
+    // Pause is a hard transaction boundary. Invalidate in-flight work, but
+    // freeze cadence exactly where it is instead of restarting the countdown.
+    $(document).on("rst:sidecar-pause-changed", (_event, paused) => {
+        _sidecarGeneration++;
+        const liveCount = getLiveMessageCount();
+        if (paused) {
+            const snapshot = captureSidecarPauseCadence(liveCount, true);
+            const progress = Math.max(0, snapshot.liveCount - snapshot.baseline);
+            dlog(`[RST] Sidecar paused; cadence frozen at ${progress} message(s) of progress.`);
+        } else {
+            const restoredBaseline = restoreSidecarPauseCadence(liveCount);
+            dlog(`[RST] Sidecar resumed; cadence baseline restored to ${restoredBaseline} at liveCount=${liveCount}.`);
+        }
+        refreshSidecarCadenceDisplay(liveCount);
     });
 
     // Message deletion/edits can renumber mesIds without a full extension reload.
@@ -326,13 +392,19 @@ function registerEventHandlers() {
  * - Add Scene Start/End buttons to the message bar
  * - Run sidecar detection if scan frequency is met
  * @param {number} mesId
+ * @param {boolean} fromAssistant True when triggered by MESSAGE_RECEIVED.
  */
-async function onMessageReceived(mesId, skipSidecar = false) {
+async function onMessageReceived(mesId, fromAssistant = false) {
     if (!isEnabled()) {
         dlog("[RST] onMessageReceived: RST disabled, skipping (mesId=" + mesId + ")");
         return;
     }
 
+    const message = Array.isArray(chat) && Number.isInteger(Number(mesId)) ? chat[Number(mesId)] : null;
+    if (message && !isNarrativeMessage(message)) {
+        dlog("[RST] Ignoring non-narrative message event (mesId=" + mesId + ")");
+        return;
+    }
     const liveCount = syncRuntimeMessageState("message event", mesId);
     refreshSidecarCadenceDisplay(liveCount);
 
@@ -350,29 +422,24 @@ async function onMessageReceived(mesId, skipSidecar = false) {
     // Add scene buttons to message bar (always — even when sidecar is skipped)
     addSceneButtons(mesId);
 
-    // Sidecar detection — only runs on MESSAGE_SENT, not MESSAGE_RECEIVED
-    // This ensures the injection is updated before the AI generates, but doesn't
-    // change between user messages based on what the AI happened to say.
-    if (skipSidecar) {
+    // A paused sidecar consumes neither cadence nor presence transitions. Keep
+    // the original pause snapshot intact; do NOT move messageCounter to liveCount,
+    // because that would restart a partially completed cadence on resume.
+    const settings = getSettings();
+    if (settings.sidecarPaused === true) {
+        captureSidecarPauseCadence(liveCount);
+        refreshSidecarCadenceDisplay(liveCount);
+        dlog("[RST] Sidecar paused — cadence frozen and presence detection skipped (liveCount=" + liveCount + ")");
         return;
     }
 
-    // Sidecar detection check. The saved messageCounter is now treated as the
+    // Sidecar detection check. MESSAGE_RECEIVED is safe here because it fires
+    // after generation has completed. We still obey the exact same persisted
+    // cadence, so this changes detection latency rather than request frequency.
+    // The saved messageCounter is treated as the
     // live message count at the last sidecar scan/baseline, not as a permanent
     // high-water counter. That means deleted OOC messages cannot strand it in
     // the future.
-    const settings = getSettings();
-
-    // Manual sidecar pause: keep the baseline current so resuming does not
-    // immediately process a backlog of messages written while paused.
-    if (settings.sidecarPaused === true) {
-        syncMessageCounterToLiveCount(liveCount);
-        setMessageCounter(liveCount);
-        refreshSidecarCadenceDisplay(liveCount);
-        dlog("[RST] Sidecar paused — skipping presence detection (liveCount=" + liveCount + ")");
-        return;
-    }
-
     const frequency = settings.scanFrequency || 5;
     const sync = syncMessageCounterToLiveCount(liveCount);
     const lastScanCount = sync.counter;
@@ -384,6 +451,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
         " lastSidecarCount=" + lastScanCount +
         " sinceLastScan=" + messagesSinceScan +
         " frequency=" + frequency +
+        " source=" + (fromAssistant ? "assistant" : "user") +
         " shouldFire=" + shouldFire);
 
     if (shouldFire) {
@@ -393,18 +461,27 @@ async function onMessageReceived(mesId, skipSidecar = false) {
             return;
         }
 
-        // Advance the baseline as soon as the run begins. This matches the old
-        // behavior where failed sidecar calls still advanced the counter instead
-        // of retrying every single message.
-        setMessageCounter(liveCount);
-
         _sidecarRunning = true;
         setSidecarCadenceRunning(true);
+        const requestGeneration = _sidecarGeneration;
+        const requestChatMetadata = chat_metadata;
+        const requestIsCurrent = () => requestGeneration === _sidecarGeneration && requestChatMetadata === chat_metadata;
         const profileName = settings.connections?.sidecarLLM || "(none)";
         dlog("[RST] Sidecar detection start (liveCount=" + liveCount + ", frequency=" + frequency + ", profile=" + profileName + ")");
 
         try {
-            const result = await detectCharacters();
+            // Pass the exact unprocessed span so no boundary transition is lost,
+            // including when cadence becomes due on an assistant response.
+            const scanWindow = Math.max(Number(settings.messagesToScan) || 10, messagesSinceScan);
+            const result = await detectCharacters({
+                messageCount: scanWindow,
+                transitionMessageCount: messagesSinceScan,
+            });
+
+            if (!requestIsCurrent()) {
+                dlog("[RST] Sidecar ownership changed during generation — discarding stale result");
+                return;
+            }
 
             // The user may pause the sidecar while a request is already in flight.
             // In that case, discard the result instead of changing presence state.
@@ -418,6 +495,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
             // Malformed, truncated, or otherwise invalid sidecar output fails closed.
             // Preserve the current list rather than clearing it or accepting parser noise.
             if (result.valid === false) {
+                setSidecarRetryDue(true);
                 dlog("[RST] Presence reconciliation skipped; preserving current list. Reason:", result.reason || "invalid response");
                 return;
             }
@@ -427,7 +505,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
             // Filter out excluded and previously-rejected names using normalized keys,
             // so case/dash/spacing variants don't leak through.
             const personaName = name1 || "";
-            const isExcludedDetectedName = (name) => isNameBlacklisted(name, ["{{user}}", "user", personaName, ..._rejectedNames]);
+            const isExcludedDetectedName = (name) => isNameBlacklisted(name, ["{{user}}", "user", personaName]);
             const filteredDetected = result.detected.filter((name) => !isExcludedDetectedName(name));
             const filteredUnknown = result.unknown.filter((name) => !isExcludedDetectedName(name));
 
@@ -451,6 +529,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
                 }
             }
             for (const unknownName of filteredUnknown) {
+                if (!requestIsCurrent()) return;
                 const existing = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
                 if (existing && !detectedIds.has(existing.id)) {
                     detectedIds.add(existing.id);
@@ -465,9 +544,15 @@ async function onMessageReceived(mesId, skipSidecar = false) {
                 const alreadyMatched = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
                 if (alreadyMatched) continue;
 
-                if (settings.newCharPopup) {
-                    const created = await showNewCharacterDetected(unknownName);
-                    if (created) {
+                // Missing legacy values mean enabled, matching the Settings UI and
+                // the default setting. Only an explicit false disables prompts.
+                if (settings.newCharPopup !== false) {
+                    const created = await showNewCharacterDetected(unknownName, requestIsCurrent);
+                    if (!requestIsCurrent()) {
+                        dlog("[RST] Sidecar ownership changed during character confirmation — aborting commit");
+                        return;
+                    }
+                    if (created === true) {
                         // Character was created — re-find and include as present
                         const newChar = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
                         if (newChar && !detectedIds.has(newChar.id)) {
@@ -475,13 +560,20 @@ async function onMessageReceived(mesId, skipSidecar = false) {
                             detectedIds.add(newChar.id);
                             detectedModes[newChar.id] = normalizePresenceMode(resultModes[unknownName]);
                         }
-                    } else {
-                        // User clicked "Ignore" — persist it to the per-chat blacklist so
-                        // the same rejected name doesn't return after a refresh/chat reload.
-                        _rejectedNames.add(unknownName.toLowerCase().trim());
-                        addNamesToBlacklist(unknownName, true);
+                    } else if (created === false) {
+                        // Only an EXPLICIT click on "Ignore" blacklists the name. Closing
+                        // the modal, Escape, or lifecycle cancellation leaves it eligible
+                        // to be proposed again on a later scan.
+                        const persisted = await Promise.resolve(addNamesToBlacklist(unknownName, true));
+                        if (persisted === false) {
+                            toastr?.warning?.(`Ignored ${unknownName}, but its blacklist entry could not be confirmed on disk.`);
+                        }
                         dlog("[RST] Name rejected by user, added to blacklist:", unknownName);
+                    } else {
+                        dlog("[RST] New-character confirmation dismissed without a decision; not blacklisting:", unknownName);
                     }
+                } else {
+                    dlog("[RST] Unknown character detected but popup setting is explicitly disabled:", unknownName);
                 }
             }
 
@@ -499,6 +591,8 @@ async function onMessageReceived(mesId, skipSidecar = false) {
             const modesChanged = Object.keys(nextModes).length !== Object.keys(currentModes).length ||
                 Object.entries(nextModes).some(([id, mode]) => currentModes[id] !== mode);
 
+            if (!requestIsCurrent()) return;
+
             if (changed) {
                 dlog("[RST] Present characters changed — old:", currentPresent.length, "new:", uniqueDetected.length, ". Updating.");
                 // Always save — if empty, clears the present list; if non-empty, updates it
@@ -510,6 +604,11 @@ async function onMessageReceived(mesId, skipSidecar = false) {
                 dlog("[RST] Present characters unchanged — skipping injection update.");
             }
 
+            // Commit cadence only after a valid result has been reconciled in
+            // its owning chat. Failed or stale requests remain due for retry.
+            setMessageCounter(liveCount);
+            setSidecarRetryDue(false);
+
             // Refresh both Home and Library tabs if visible so present-indicator UI stays in sync
             const $homePane = getPane("home");
             if ($homePane.hasClass("on")) {
@@ -520,6 +619,7 @@ async function onMessageReceived(mesId, skipSidecar = false) {
                 renderLibraryTab($libPane);
             }
         } catch (err) {
+            setSidecarRetryDue(true);
             console.error("[RST] Sidecar detection error:", err);
         } finally {
             _sidecarRunning = false;
@@ -534,29 +634,20 @@ async function onMessageReceived(mesId, skipSidecar = false) {
  * Warns if there are pending updates from the previous chat.
  */
 function onChatChanged() {
+    invalidateChatScopes();
+    _sidecarGeneration++;
     resetRuntimeMessageState("CHAT_CHANGED");
     setSidecarCadenceRunning(false);
 
-    // Warn about pending updates in the previous chat
-    // (pending updates are stored per-chat and persist across switches)
+    // Pause is global but the cadence checkpoint is per chat. Capture a snapshot
+    // for a chat entered while paused; clear stale snapshots when entered unpaused.
+    const liveCount = getLiveMessageCount();
+    if (getSetting("sidecarPaused", false)) captureSidecarPauseCadence(liveCount);
+    else clearSidecarPauseCadence();
+
     const pending = getPendingUpdates();
-    if (pending) {
-        const pendingScenes = Object.keys(pending);
-        if (pendingScenes.length > 0) {
-            let totalUpdates = 0;
-            for (const sceneId of pendingScenes) {
-                const scene = pending[sceneId];
-                if (scene.summary) totalUpdates++;
-                if (scene.characters) totalUpdates += Object.keys(scene.characters).length;
-            }
-            dlog(`[RST] Chat switched with ${totalUpdates} pending update(s) across ${pendingScenes.length} scene(s).`);
-            toastr?.warning?.(
-                `This chat has ${totalUpdates} unapproved stat update(s) in ${pendingScenes.length} scene(s). Switch to the Home tab to review them.`,
-                "Pending Updates",
-                { timeOut: 8000 }
-            );
-        }
-    }
+    const count = pending?.characterUpdates?.length || 0;
+    if (count) toastr?.info?.(`This chat has ${count} unapproved stat update(s). Review them on Home.`, "Pending Updates");
 
     initSceneCounter();
 
@@ -570,6 +661,9 @@ function onChatChanged() {
     renderHomeTab($homePane);
     renderLibraryTab(getPane("lib"));
     renderScenesTab(getPane("scenes"));
+    // The blacklist is per-chat. Refresh Settings too, otherwise an open
+    // textarea can continue displaying (and later save) the previous chat's list.
+    renderSettingsTab(getPane("settings"));
 
     // Update injection
     if (isEnabled()) {
@@ -688,6 +782,15 @@ function addSceneButtons(mesId) {
             return;
         }
 
+        if (getPendingUpdates() || isStatUpdateRunning()) {
+            toastr?.warning?.("Finish the current stat review before closing another scene.");
+            return;
+        }
+        if (mesId < openScene.messageStart) {
+            toastr?.warning?.("A scene cannot end before its starting message.");
+            return;
+        }
+
         // Close the scene immediately, before the expensive LLM call.
         // This makes the close operation visible even when GLM / the API is slow.
         const closedScene = closeScene(openScene.id, mesId);
@@ -721,7 +824,8 @@ function addSceneButtons(mesId) {
 
         // Trigger stat update flow
         try {
-            const result = await generateStatUpdate(closedScene.id);
+            const scope = captureChatScope();
+            const result = await scope.wait(() => generateStatUpdate(closedScene.id));
 
             // Store the scene title (if generated) — scene summary is saved only on user approval from Home tab
             if (result.sceneTitle) {
@@ -925,4 +1029,3 @@ function closeRstPopout() {
     $(document).off('keydown.rst_popout');
     dlog('[RST] Popout closed.');
 }
-

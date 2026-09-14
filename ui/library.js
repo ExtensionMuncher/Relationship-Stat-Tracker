@@ -1,10 +1,11 @@
+import { captureChatScope } from "../lib/chatScope.js";
 /**
  * library.js — Character Library tab: list, display, wand, logs
  * Renders the character library with full stat display, update logs, and profile generation
  * v2: search, filter chips, sort, folder organization, profile picture upload + crop
  */
 
-import { getPresentCharacters } from "../data/storage.js";
+import { getPresentCharacters, getSettings } from "../data/storage.js";
 import { getContext } from "../../../../extensions.js";
 import {
     getAllCharacters,
@@ -43,6 +44,15 @@ import { getRelationshipConditionDefinition } from "../data/conditions.js";
 import { Popup, POPUP_RESULT, POPUP_TYPE } from "../../../../../scripts/popup.js";
 import { showPanelLoading, hidePanelLoading } from "./panel.js";
 
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
 // ─── State ────────────────────────────────────────────────
 
 let selectedCharId = null;
@@ -75,6 +85,10 @@ let activeFolderPicker = null;
  * @param {jQuery} $pane
  */
 export function renderLibraryTab($pane) {
+    // The rendered checkboxes start unchecked, so their backing selection must
+    // start empty as well. Keeping this Set across a rerender/chat switch made
+    // invisible stale IDs participate in the next bulk deletion.
+    selectedCharIds.clear();
     $pane.empty();
 
     // Action buttons
@@ -96,6 +110,9 @@ export function renderLibraryTab($pane) {
 
     // Bulk action toolbar
     const chars = getAllCharacters();
+    if (selectedCharId && !chars.some((character) => character.id === selectedCharId)) {
+        selectedCharId = null;
+    }
     if (chars.length > 0) {
         const $bulkToolbar = $(`
             <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:6px 4px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg-secondary, rgba(0,0,0,0.05))">
@@ -113,18 +130,21 @@ export function renderLibraryTab($pane) {
         });
 
         $bulkToolbar.find("#rst-delete-selected-chars").on("click", async function () {
+    const rstScope1 = captureChatScope();
+
             const count = selectedCharIds.size;
             if (count === 0) return;
-            const confirmed = await Popup.show.confirm(
+            const confirmed = await rstScope1.wait(() => (Popup.show.confirm(
                 "Delete Characters",
                 `Delete ${count} selected character${count > 1 ? "s" : ""}? This cannot be undone.`
-            );
+            )));
             if (!confirmed) return;
-            for (const charId of selectedCharIds) {
+            const deletedIds = new Set(selectedCharIds);
+            for (const charId of deletedIds) {
                 deleteCharacter(charId);
             }
             selectedCharIds.clear();
-            if (selectedCharId && !chars.some(c => c.id === selectedCharId)) {
+            if (selectedCharId && deletedIds.has(selectedCharId)) {
                 selectedCharId = null;
             }
             toastr?.info?.(`${count} character${count > 1 ? "s" : ""} deleted.`);
@@ -319,12 +339,12 @@ function renderCharacterList($container) {
 
         if (count === 0 && (searchQuery.trim() || activeFilter !== "all")) continue;
 
-        const $folder = $(`<div class="rst-folder${isOpen ? " open" : ""}" data-folder-id="${folder.id}"></div>`);
+        const $folder = $(`<div class="rst-folder${isOpen ? " open" : ""}" data-folder-id="${escapeHtml(folder.id)}"></div>`);
 
         const $header = $(`
             <div class="rst-folder-hdr">
                 <i class="fa-solid fa-folder" style="font-size:15px;color:var(--rst-accent)" aria-hidden="true"></i>
-                <span style="font-weight:500">${folder.name}</span>
+                <span style="font-weight:500">${escapeHtml(folder.name)}</span>
                 <span class="rst-folder-count">${count} character${count !== 1 ? "s" : ""}</span>
                 <i class="fa-solid fa-ellipsis-vertical rst-folder-menu-btn" title="Folder options"></i>
                 <i class="fa-solid fa-chevron-down rst-folder-chevron"></i>
@@ -382,20 +402,21 @@ function buildCharChip(char, presentIds, isUnfiled = false) {
     const initials = getInitials(char.name);
     const isPresent = presentIds.includes(char.id);
     const isSelected = char.id === selectedCharId;
+    const safeId = escapeHtml(char.id);
 
     const $wrap = $(`<div class="rst-chip-wrap"></div>`);
 
-    let avContent = initials;
+    let avContent = escapeHtml(initials);
     if (char.avatar) {
-        avContent = `<img src="${char.avatar}" alt="">`;
+        avContent = `<img src="${escapeHtml(char.avatar)}" alt="">`;
     }
 
     const $chip = $(`
         <div class="rst-chip${isSelected ? " on" : ""}${isUnfiled ? " rst-chip-unfiled" : ""}">
-            <input type="checkbox" class="rst-char-select" data-char-id="${char.id}" style="margin:0;cursor:pointer;flex-shrink:0" title="Select this character">
+            <input type="checkbox" class="rst-char-select" data-char-id="${safeId}" style="margin:0;cursor:pointer;flex-shrink:0" title="Select this character">
             <div class="rst-av">${avContent}</div>
             <div style="min-width:0;flex:1">
-                <div style="font-weight:500">${char.name}</div>
+                <div style="font-weight:500">${escapeHtml(char.name)}</div>
                 <div style="font-size:11px;color:var(--rst-text-muted)">${isPresent ? '<span class="rst-badge-present">present</span>' : '<span class="rst-badge-absent">not present</span>'}</div>
             </div>
             ${isPresent ? '<div class="rst-dot" style="margin-left:auto"></div>' : ""}
@@ -520,9 +541,9 @@ function renderCharacterCard($pane, profile) {
         ? `Some fields hidden from prompts/LLM updates: ${[descHidden ? "Personality" : "", notesHidden ? "Notes" : "", ...hiddenStatCats.map(c => c.charAt(0).toUpperCase() + c.slice(1) + " stats")].filter(Boolean).join(", ")}`
         : "All RST fields visible to prompts/LLM updates";
 
-    let avContent = `<span>${initials}</span>`;
+    let avContent = `<span>${escapeHtml(initials)}</span>`;
     if (hasAvatar) {
-        avContent = `<img src="${profile.avatar}" alt=""><span>${initials}</span>`;
+        avContent = `<img src="${escapeHtml(profile.avatar)}" alt=""><span>${escapeHtml(initials)}</span>`;
     }
 
     const $header = $(`
@@ -543,11 +564,11 @@ function renderCharacterCard($pane, profile) {
                 </div>
             </div>
             <div style="flex:1;min-width:0">
-                <input type="text" class="rst-char-name" value="${profile.name}"
+                <input type="text" class="rst-char-name" value="${escapeHtml(profile.name)}"
                     style="font-size:15px;font-weight:500;width:100%;padding:2px 4px">
                 <div style="font-size:11px;color:var(--rst-text-muted);margin-top:2px">
                     ${folderName
-                        ? `<span class="rst-folder-label" id="rst-folder-label-${profile.id}" title="Click to change folder"><i class="fa-solid fa-folder"></i> ${folderName}</span>`
+                        ? `<span class="rst-folder-label" id="rst-folder-label-${profile.id}" title="Click to change folder"><i class="fa-solid fa-folder"></i> ${escapeHtml(folderName)}</span>`
                         : `<span class="rst-folder-label" id="rst-folder-label-${profile.id}" style="color:var(--rst-text-muted)" title="Click to add to folder"><i class="fa-solid fa-folder"></i> Unfiled</span>`
                     }
                 </div>
@@ -574,8 +595,10 @@ function renderCharacterCard($pane, profile) {
     });
 
     $header.find(".rst-remove-pic-link").on("click", async function (e) {
+    const rstScope2 = captureChatScope();
+
         e.stopPropagation();
-        await removeProfilePicture(profile);
+        await rstScope2.wait(() => (removeProfilePicture(profile)));
     });
 
     const $folderLabel = $header.find(`#rst-folder-label-${profile.id}`);
@@ -618,7 +641,7 @@ function renderCharacterCard($pane, profile) {
                 Alternative names this character is known by (comma-separated). Used by sidecar detection
                 to match LLM output (e.g. "Doe") against your library entry (e.g. "John Doe").
             </div>
-            <input type="text" class="rst-char-aliases" value="${aliasesStr}"
+            <input type="text" class="rst-char-aliases" value="${escapeHtml(aliasesStr)}"
                 style="width:100%;padding:4px 6px;font-size:12px;background:transparent;color:inherit"
                 placeholder="e.g. Mr. Doe, John">
         </div>
@@ -640,7 +663,7 @@ function renderCharacterCard($pane, profile) {
             <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-lib-personality-${profile.id}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i>
         </div>
     `);
-    const $desc = $(`<textarea id="rst-lib-personality-${profile.id}" rows="2" style="margin-bottom:8px">${profile.description || ""}</textarea>`);
+    const $desc = $(`<textarea id="rst-lib-personality-${profile.id}" rows="2" style="margin-bottom:8px">${escapeHtml(profile.description || "")}</textarea>`);
     $card.append($desc);
     $card.append(`
         <div style="display:flex;align-items:baseline;gap:6px;margin-top:8px">
@@ -648,7 +671,7 @@ function renderCharacterCard($pane, profile) {
             <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-lib-notes-${profile.id}" title="Expand the editor" style="margin-left:auto;display:inline-block;font-size:14px;vertical-align:middle;opacity:0.85;filter:grayscale(1);cursor:pointer;transition:all var(--animation-duration-2x,0.3s) ease-in-out"></i>
         </div>
     `);
-    const $notes = $(`<textarea id="rst-lib-notes-${profile.id}" rows="2">${profile.notes || ""}</textarea>`);
+    const $notes = $(`<textarea id="rst-lib-notes-${profile.id}" rows="2">${escapeHtml(profile.notes || "")}</textarea>`);
 
     $desc.on("change", function () {
         updateCharacterProfile(profile.id, { description: $(this).val() });
@@ -678,10 +701,10 @@ function renderCharacterCard($pane, profile) {
     if (profile.dynamicTitle || profile.narrativeSummary) {
         $card.append('<div class="rst-d-section-lbl">Current dynamic</div>');
         if (profile.dynamicTitle) {
-            $card.append(`<div class="rst-d-title">${profile.dynamicTitle}</div>`);
+            $card.append(`<div class="rst-d-title">${escapeHtml(profile.dynamicTitle)}</div>`);
         }
         if (profile.narrativeSummary) {
-            $card.append(`<div class="rst-d-narr">${profile.narrativeSummary}</div>`);
+            $card.append(`<div class="rst-d-narr">${escapeHtml(profile.narrativeSummary)}</div>`);
         }
     }
 
@@ -718,30 +741,73 @@ function renderCharacterCard($pane, profile) {
         $details.append($('<summary></summary>').text(`Relationship milestones (${milestones.length})`));
         const $list = $('<div class="rst-milestone-list"></div>');
         const indexedMilestones = milestones.map((milestone, originalIndex) => ({ milestone, originalIndex })).reverse();
-        for (const { milestone, originalIndex } of indexedMilestones) {
-            const $item = $('<div class="rst-milestone-item"></div>');
-            const $head = $('<div class="rst-milestone-head"></div>');
-            $head.append($('<div class="rst-milestone-title"></div>').text(milestone.title || 'Milestone'));
-            const $actions = $('<div class="rst-milestone-actions"></div>');
-            const $edit = $('<button type="button" class="rst-milestone-action" title="Edit milestone"><i class="fa-solid fa-pen"></i></button>');
-            const $delete = $('<button type="button" class="rst-milestone-action danger" title="Delete milestone"><i class="fa-solid fa-trash"></i></button>');
-            $edit.on('click', async (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                await editRelationshipMilestone(profile.id, milestone, originalIndex);
-            });
-            $delete.on('click', async (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                await deleteRelationshipMilestone(profile.id, milestone, originalIndex);
-            });
-            $actions.append($edit, $delete);
-            $head.append($actions);
-            $item.append($head);
-            $item.append($('<div class="rst-milestone-description"></div>').text(milestone.description || ''));
-            $list.append($item);
-        }
+        const configuredPageSize = Number.parseInt(getSettings()?.milestonesPerPage, 10);
+        const pageSize = Number.isFinite(configuredPageSize) ? Math.min(50, Math.max(1, configuredPageSize)) : 5;
+        let milestonePage = 0;
+        const pageCount = Math.ceil(indexedMilestones.length / pageSize);
+
+        const $pager = $('<div class="rst-milestone-pager"></div>');
+        const $prev = $('<button type="button" class="rst-milestone-page-btn" title="Previous milestones"><i class="fa-solid fa-chevron-left"></i></button>');
+        const $status = $('<span class="rst-milestone-page-status"></span>');
+        const $next = $('<button type="button" class="rst-milestone-page-btn" title="Next milestones"><i class="fa-solid fa-chevron-right"></i></button>');
+        $pager.append($prev, $status, $next);
+
+        const renderMilestonePage = () => {
+            $list.empty();
+            const start = milestonePage * pageSize;
+            const visibleMilestones = indexedMilestones.slice(start, start + pageSize);
+            for (const { milestone, originalIndex } of visibleMilestones) {
+                const $item = $('<div class="rst-milestone-item"></div>');
+                const $head = $('<div class="rst-milestone-head"></div>');
+                $head.append($('<div class="rst-milestone-title"></div>').text(milestone.title || 'Milestone'));
+                const $actions = $('<div class="rst-milestone-actions"></div>');
+                const $edit = $('<button type="button" class="rst-milestone-action" title="Edit milestone"><i class="fa-solid fa-pen"></i></button>');
+                const $delete = $('<button type="button" class="rst-milestone-action danger" title="Delete milestone"><i class="fa-solid fa-trash"></i></button>');
+                $edit.on('click', async (event) => {
+                    const rstScope3 = captureChatScope();
+                    event.preventDefault();
+                    event.stopPropagation();
+                    await rstScope3.wait(() => (editRelationshipMilestone(profile.id, milestone, originalIndex)));
+                });
+                $delete.on('click', async (event) => {
+                    const rstScope4 = captureChatScope();
+                    event.preventDefault();
+                    event.stopPropagation();
+                    await rstScope4.wait(() => (deleteRelationshipMilestone(profile.id, milestone, originalIndex)));
+                });
+                $actions.append($edit, $delete);
+                $head.append($actions);
+                $item.append($head);
+                $item.append($('<div class="rst-milestone-description"></div>').text(milestone.description || ''));
+                $list.append($item);
+            }
+
+            const end = Math.min(start + pageSize, indexedMilestones.length);
+            $status.text(`${start + 1}\u2013${end} of ${indexedMilestones.length}`);
+            $prev.prop('disabled', milestonePage === 0);
+            $next.prop('disabled', milestonePage >= pageCount - 1);
+        };
+
+        $prev.on('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (milestonePage > 0) {
+                milestonePage -= 1;
+                renderMilestonePage();
+            }
+        });
+        $next.on('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (milestonePage < pageCount - 1) {
+                milestonePage += 1;
+                renderMilestonePage();
+            }
+        });
+
+        renderMilestonePage();
         $details.append($list);
+        if (pageCount > 1) $details.append($pager);
         $card.append($details);
     }
 
@@ -758,6 +824,8 @@ function renderCharacterCard($pane, profile) {
 
 
 async function editRelationshipMilestone(characterId, milestone, fallbackIndex) {
+    const rstScope5 = captureChatScope();
+
     const safe = (value) => $("<div>").text(String(value ?? "")).html();
     const domains = new Set(Array.isArray(milestone?.domains) ? milestone.domains : []);
     const domainChecks = STAT_CATEGORIES.map((cat) => `
@@ -781,7 +849,7 @@ async function editRelationshipMilestone(characterId, milestone, fallbackIndex) 
     const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Save milestone", cancelButton: "Cancel" });
     const showPromise = popup.show();
     const $dlg = $("dialog.popup").last();
-    const result = await showPromise;
+    const result = await rstScope5.wait(() => (showPromise));
     if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
     const title = String($dlg.find("#rst-ms-title").val() || "").trim().slice(0, 160);
@@ -793,6 +861,8 @@ async function editRelationshipMilestone(characterId, milestone, fallbackIndex) 
 
     const selectedDomains = [];
     $dlg.find("[data-rst-ms-domain]").each(function () {
+    if (!rstScope5.isCurrent()) return;
+
         if (this.checked && STAT_CATEGORIES.includes(this.dataset.rstMsDomain)) selectedDomains.push(this.dataset.rstMsDomain);
     });
 
@@ -822,10 +892,12 @@ async function editRelationshipMilestone(characterId, milestone, fallbackIndex) 
 }
 
 async function deleteRelationshipMilestone(characterId, milestone, fallbackIndex) {
-    const confirmed = await Popup.show.confirm(
+    const rstScope6 = captureChatScope();
+
+    const confirmed = await rstScope6.wait(() => (Popup.show.confirm(
         "Delete Relationship Milestone",
         `Delete “${milestone?.title || "this milestone"}”? This removes only the milestone record; relationship stats and update logs are unchanged.`
-    );
+    )));
     if (!confirmed) return;
 
     const latest = getCharacterProfile(characterId);
@@ -845,13 +917,15 @@ async function deleteRelationshipMilestone(characterId, milestone, fallbackIndex
 function findMilestoneIndex(milestones, milestone, fallbackIndex) {
     if (milestone?.id) {
         const byId = milestones.findIndex((item) => item?.id === milestone.id);
-        if (byId >= 0) return byId;
+        return byId;
     }
     if (Number.isInteger(fallbackIndex) && fallbackIndex >= 0 && fallbackIndex < milestones.length) return fallbackIndex;
     return milestones.findIndex((item) => item === milestone);
 }
 
 async function showRelationshipConditionDetail(profile, condition) {
+    const rstScope7 = captureChatScope();
+
     const def = getRelationshipConditionDefinition(condition?.type);
     if (!def) return;
     const safe = (value) => $("<div>").text(String(value || "")).html();
@@ -861,7 +935,7 @@ async function showRelationshipConditionDetail(profile, condition) {
                 <i class="fa-solid ${def.icon}"></i> ${safe(def.label)}
             </div>
             <div style="margin-bottom:10px">${safe(def.meaning)}</div>
-            <div style="font-weight:600;margin-top:8px">Current effect</div>
+            <div style="font-weight:600;margin-top:8px">Internal stat-update effect</div>
             <div>${safe(def.effect)}</div>
             <div style="font-weight:600;margin-top:8px">Why it is active</div>
             <div>${safe(condition.reason || "No specific reason recorded.")}</div>
@@ -869,7 +943,7 @@ async function showRelationshipConditionDetail(profile, condition) {
             <div>${safe(condition.resolution || "No resolution condition recorded.")}</div>
         </div>`;
     const popup = new Popup(html, POPUP_TYPE.TEXT, `${def.label} — ${profile.name}`, { okButton: "Close" });
-    await popup.show();
+    await rstScope7.wait(() => popup.show());
 }
 
 // ─── Profile Picture: Upload, Crop, Remove ────────────────
@@ -898,12 +972,16 @@ function triggerAvatarUpload(profile) {
  * Supports drag-to-reposition AND corner-drag-to-resize the crop square.
  */
 async function showCropDialog(file, charId) {
-    const dataUrl = await new Promise((resolve, reject) => {
+    const rstScope11 = captureChatScope();
+
+    const dataUrl = await rstScope11.wait(() => (new Promise((resolve, reject) => {
+    if (!rstScope11.isCurrent()) return;
+
         const reader = new FileReader();
         reader.onload = () => resolve(reader.result);
         reader.onerror = () => reject(reader.error);
         reader.readAsDataURL(file);
-    });
+    })));
 
     const cropId = "rst-crop-" + Date.now();
 
@@ -962,6 +1040,9 @@ async function showCropDialog(file, charId) {
                 text: "Skip crop",
                 result: 1,
                 action: async () => {
+    if (!rstScope11.isCurrent()) return;
+    const rstScope12 = captureChatScope();
+
                     updateCharacterProfile(charId, { avatar: dataUrl });
                     toastr?.success?.("Profile picture updated.");
                     renderLibraryTab($("#rst-p-lib"));
@@ -972,6 +1053,9 @@ async function showCropDialog(file, charId) {
                 text: "Crop & Save",
                 result: 2,
                 action: async () => {
+    if (!rstScope11.isCurrent()) return;
+    const rstScope13 = captureChatScope();
+
                     const cropped = doCrop();
                     updateCharacterProfile(charId, { avatar: cropped });
                     toastr?.success?.("Profile picture saved.");
@@ -985,6 +1069,8 @@ async function showCropDialog(file, charId) {
 
     // Wire up the crop UI after the dialog DOM is rendered
     setTimeout(() => {
+    if (!rstScope11.isCurrent()) return;
+
         const $dialog = $("dialog.popup").last();
         if (!$dialog.length) return;
 
@@ -1002,6 +1088,8 @@ async function showCropDialog(file, charId) {
         imgEl = $img[0];
 
         const setupCrop = () => {
+    if (!rstScope11.isCurrent()) return;
+
             cropState.displayW = imgEl.clientWidth;
             cropState.displayH = imgEl.clientHeight;
             cropState.size = Math.min(cropState.displayW, cropState.displayH, 260);
@@ -1028,6 +1116,8 @@ async function showCropDialog(file, charId) {
 
             // Move: mousedown on the wrap itself (not handles)
             $wrap.on("mousedown", function (e) {
+    if (!rstScope11.isCurrent()) return;
+
                 if ($(e.target).closest(".rst-crop-handle").length) return; // let handles handle it
                 action = "move";
                 dragStartX = e.clientX;
@@ -1039,7 +1129,11 @@ async function showCropDialog(file, charId) {
 
             // Resize: mousedown on handles
             Object.entries($handles).forEach(([corner, $h]) => {
+    if (!rstScope11.isCurrent()) return;
+
                 $h.on("mousedown", function (e) {
+    if (!rstScope11.isCurrent()) return;
+
                     action = "resize-" + corner;
                     dragStartX = e.clientX;
                     dragStartY = e.clientY;
@@ -1052,6 +1146,8 @@ async function showCropDialog(file, charId) {
             });
 
             $(document).on("mousemove.rst-crop", function (e) {
+    if (!rstScope11.isCurrent()) return;
+
                 if (!action) return;
                 const dx = e.clientX - dragStartX;
                 const dy = e.clientY - dragStartY;
@@ -1101,6 +1197,8 @@ async function showCropDialog(file, charId) {
             });
 
             $(document).on("mouseup.rst-crop", function () {
+    if (!rstScope11.isCurrent()) return;
+
                 action = null;
             });
         };
@@ -1112,7 +1210,7 @@ async function showCropDialog(file, charId) {
         }
     }, 100);
 
-    await popup.show();
+    await rstScope11.wait(() => (popup.show()));
 
     $(document).off("mousemove.rst-crop");
     $(document).off("mouseup.rst-crop");
@@ -1122,10 +1220,12 @@ async function showCropDialog(file, charId) {
  * Remove the profile picture for a character.
  */
 async function removeProfilePicture(profile) {
-    const confirmed = await Popup.show.confirm(
+    const rstScope14 = captureChatScope();
+
+    const confirmed = await rstScope14.wait(() => (Popup.show.confirm(
         "Remove Profile Picture",
         `Remove ${profile.name}'s profile picture?`
-    );
+    )));
     if (!confirmed) return;
 
     updateCharacterProfile(profile.id, { avatar: null });
@@ -1228,8 +1328,8 @@ function showFolderPickerAt(x, y, char) {
 function buildPickerItems($container, folders, profile) {
     for (const folder of folders) {
         const isCurrent = profile.folderId === folder.id;
-        const $item = $(`<div class="rst-folder-pick-item${isCurrent ? " on" : ""}" data-folder-id="${folder.id}">
-            <i class="fa-solid fa-folder" style="font-size:12px;color:var(--rst-accent);margin-right:6px"></i>${folder.name}
+        const $item = $(`<div class="rst-folder-pick-item${isCurrent ? " on" : ""}" data-folder-id="${escapeHtml(folder.id)}">
+            <i class="fa-solid fa-folder" style="font-size:12px;color:var(--rst-accent);margin-right:6px"></i>${escapeHtml(folder.name)}
             ${isCurrent ? '<span style="margin-left:auto;font-size:11px;color:var(--rst-avatar-text)">✓</span>' : ""}
         </div>`);
 
@@ -1304,8 +1404,10 @@ function showCharContextMenu(e, char) {
         <i class="fa-solid fa-trash" style="font-size:14px"></i>Delete character
     </div>`);
     $deleteItem.on("click", async function () {
+    const rstScope15 = captureChatScope();
+
         closeContextMenu();
-        await confirmDeleteCharacter(char);
+        await rstScope15.wait(() => (confirmDeleteCharacter(char)));
     });
     $menu.append($deleteItem);
 
@@ -1344,8 +1446,10 @@ function showFolderContextMenu(e, folder) {
         <i class="fa-solid fa-pen" style="font-size:14px;color:var(--rst-text-muted)"></i>Rename folder
     </div>`);
     $renameItem.on("click", async function () {
+    const rstScope16 = captureChatScope();
+
         closeContextMenu();
-        const newName = await Popup.show.input("Rename folder", "Enter new folder name:", folder.name);
+        const newName = await rstScope16.wait(() => (Popup.show.input("Rename folder", "Enter new folder name:", folder.name)));
         if (newName && newName.trim() && newName.trim() !== folder.name) {
             renameFolder(folder.id, newName.trim());
             const $pane = $("#rst-p-lib");
@@ -1378,8 +1482,10 @@ function showFolderContextMenu(e, folder) {
         <i class="fa-solid fa-trash" style="font-size:14px"></i>Delete folder
     </div>`);
     $deleteItem.on("click", async function () {
+    const rstScope17 = captureChatScope();
+
         closeContextMenu();
-        await confirmDeleteFolder(folder);
+        await rstScope17.wait(() => (confirmDeleteFolder(folder)));
     });
     $menu.append($deleteItem);
 
@@ -1418,6 +1524,8 @@ function closeContextMenu() {
 // ─── Folder Deletion Confirmation ─────────────────────────
 
 async function confirmDeleteFolder(folder) {
+    const rstScope18 = captureChatScope();
+
     const charsInFolder = getCharactersInFolder(folder.id);
     const count = charsInFolder.length;
 
@@ -1429,10 +1537,10 @@ async function confirmDeleteFolder(folder) {
         return;
     }
 
-    const confirmed = await Popup.show.confirm(
+    const confirmed = await rstScope18.wait(() => (Popup.show.confirm(
         "Delete Folder",
         `Delete folder "${folder.name}"?\n\n${count} character${count > 1 ? "s" : ""} will be ejected to unfiled status. No character data will be lost.`
-    );
+    )));
 
     if (!confirmed) return;
 
@@ -1445,7 +1553,9 @@ async function confirmDeleteFolder(folder) {
 // ─── New Folder Dialog ────────────────────────────────────
 
 async function showNewFolderDialog($pane) {
-    const name = await Popup.show.input("New folder", "Enter folder name:");
+    const rstScope19 = captureChatScope();
+
+    const name = await rstScope19.wait(() => (Popup.show.input("New folder", "Enter folder name:")));
     if (!name || !name.trim()) return;
 
     createFolder(name.trim());
@@ -1478,8 +1588,10 @@ function renderStatCategoryForLibrary(cat, profile) {
     const hiddenBadge = catVisible ? "" : `<span style="font-size:10px;color:var(--rst-text-muted);font-weight:400" title="Hidden from main prompt injection, Stat Update LLM, and Scan Locks"><i class="fa-solid fa-eye-slash"></i> hidden from LLM</span>`;
     $cat.append(`<div class="rst-d-cat-h" style="display:flex;align-items:center;gap:6px"><span><i class="fa-solid ${catIcon}"></i> ${catTitle}</span>${hiddenBadge}<button class="rst-icon-btn rst-cat-vis-toggle" style="margin-left:auto;padding:1px 5px;font-size:10px" title="${visTitle}"><i class="fa-solid ${visIcon}"></i></button></div>`);
     $cat.find(".rst-cat-vis-toggle").on("click", async function (e) {
+    const rstScope20 = captureChatScope();
+
         e.stopPropagation();
-        await toggleStatCategoryVisibility(profile, cat);
+        await rstScope20.wait(() => (toggleStatCategoryVisibility(profile, cat)));
     });
 
     for (const stat of STAT_NAMES) {
@@ -1540,21 +1652,27 @@ function renderStatCategoryForLibrary(cat, profile) {
                     ${pressureMarkup}
                     <span class="rst-d-stat-val ${cls}">${sign}${val}%</span>
                 </div>
-                ${commentary ? `<div class="rst-d-stat-com">${commentary}</div>` : ""}
+                ${commentary ? `<div class="rst-d-stat-com">${escapeHtml(commentary)}</div>` : ""}
             </div>
         `);
         // Lock click -> prompt to set/clear cap
         $stat.find(".rst-lock").on("click", async function (e) {
+    const rstScope21 = captureChatScope();
+
             e.stopPropagation();
-            await editHardLock(profile, cat, stat);
+            await rstScope21.wait(() => (editHardLock(profile, cat, stat)));
         });
         $stat.find(".rst-pressure-badge").on("click", async function (e) {
+    const rstScope22 = captureChatScope();
+
             e.stopPropagation();
-            await editHardLock(profile, cat, stat);
+            await rstScope22.wait(() => (editHardLock(profile, cat, stat)));
         });
         $stat.find(".rst-softlock").on("click", async function (e) {
+    const rstScope23 = captureChatScope();
+
             e.stopPropagation();
-            await editSoftLock(profile, cat, stat);
+            await rstScope23.wait(() => (editSoftLock(profile, cat, stat)));
         });
         $cat.append($stat);
     }
@@ -1566,6 +1684,8 @@ function renderStatCategoryForLibrary(cat, profile) {
  * Prompt the user to set or clear a hard-lock cap on a stat.
  */
 async function editHardLock(profile, cat, stat) {
+    const rstScope24 = captureChatScope();
+
     const lock = profile.hardLocks?.[cat]?.[stat] || { cap: null, reason: "" };
     const curCap = (typeof lock.cap === 'number') ? String(lock.cap) : "";
     const curReason = (lock.reason || "").toString();
@@ -1614,15 +1734,17 @@ async function editHardLock(profile, cat, stat) {
     const $dlg = $("dialog.popup").last();
     // Wire the reset button (live, inside the open dialog).
     $dlg.find("#rst-hl-pressure-reset").on("click", function () {
+    if (!rstScope24.isCurrent()) return;
+
         $dlg.find("#rst-hl-pressure").val(0);
     });
-    const result = await showPromise;
+    const result = await rstScope24.wait(() => (showPromise));
     if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
     const capRaw = ($dlg.find("#rst-hl-cap").val() || "").toString().trim();
     const reasonRaw = ($dlg.find("#rst-hl-reason").val() || "").toString().trim();
 
-    const { getCharacterProfile, updateCharacterProfile, ensurePressure, HARD_LOCK_PRESSURE_MAX } = await import("../data/characters.js");
+    const { getCharacterProfile, updateCharacterProfile, ensurePressure, HARD_LOCK_PRESSURE_MAX } = await rstScope24.wait(() => (import("../data/characters.js")));
     const prof = getCharacterProfile(profile.id);
     if (!prof.hardLocks) return;
 
@@ -1704,6 +1826,8 @@ async function editHardLock(profile, cat, stat) {
  * is also offered.
  */
 async function toggleStatCategoryVisibility(profile, cat) {
+    const rstScope25 = captureChatScope();
+
     const prof = getCharacterProfile(profile.id);
     if (!prof) return;
     const nextVisibility = { ...createBlankStatCategoryVisibility(), ...(prof.statCategoryVisibility || {}) };
@@ -1712,7 +1836,7 @@ async function toggleStatCategoryVisibility(profile, cat) {
     updateCharacterProfile(profile.id, { statCategoryVisibility: nextVisibility });
     const catTitle = cat.charAt(0).toUpperCase() + cat.slice(1);
     toastr?.info?.(`${catTitle} stats for ${profile.name} are now ${nextVisibility[cat] ? "visible to prompts/LLMs" : "hidden from prompts/LLMs"}.`);
-    try { const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); } catch (e) {}
+    try { const { updateInjection } = await rstScope25.wait(() => (import("../inject/promptInjector.js"))); updateInjection(); } catch (e) {}
     reRenderCharacterList($("#rst-p-lib"));
 }
 
@@ -1722,7 +1846,9 @@ async function toggleStatCategoryVisibility(profile, cat) {
  * prompt injection and RST internal LLM update/lock passes.
  */
 async function showInjectionVisibilityModal(profile) {
-    const { getCharacterProfile, updateCharacterProfile, createBlankStatCategoryVisibility, ensureStatCategoryVisibility } = await import("../data/characters.js");
+    const rstScope26 = captureChatScope();
+
+    const { getCharacterProfile, updateCharacterProfile, createBlankStatCategoryVisibility, ensureStatCategoryVisibility } = await rstScope26.wait(() => (import("../data/characters.js")));
     const p = getCharacterProfile(profile.id);
     ensureStatCategoryVisibility(p);
 
@@ -1734,6 +1860,8 @@ async function showInjectionVisibilityModal(profile) {
 
     const safeName = $("<div>").text(profile.name).html();
     const catRows = STAT_CATEGORIES.map((cat) => {
+    if (!rstScope26.isCurrent()) return;
+
         const label = cat.charAt(0).toUpperCase() + cat.slice(1);
         const checked = vis[cat] === false ? "checked" : "";
         return `
@@ -1763,10 +1891,12 @@ async function showInjectionVisibilityModal(profile) {
     const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Save", cancelButton: "Cancel" });
     const showPromise = popup.show();
     const $dlg = $("dialog.popup").last();
-    const result = await showPromise;
+    const result = await rstScope26.wait(() => (showPromise));
     if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
     const readChk = (id) => {
+    if (!rstScope26.isCurrent()) return;
+
         const el = $dlg.find("#" + id)[0] || document.getElementById(id);
         return !!(el && el.checked);
     };
@@ -1802,12 +1932,14 @@ async function showInjectionVisibilityModal(profile) {
         : `Hidden for ${profile.name}: ${hiddenNames.join(", ")}.`;
     toastr?.info?.(msg);
 
-    try { const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); } catch (e) {}
+    try { const { updateInjection } = await rstScope26.wait(() => (import("../inject/promptInjector.js"))); updateInjection(); } catch (e) {}
     const $pane = $("#rst-p-lib");
     reRenderCharacterList($pane);
 }
 
 async function editSoftLock(profile, cat, stat) {
+    const rstScope27 = captureChatScope();
+
     const sl = profile.softLocks?.[cat]?.[stat] || { cap: null, condition: "", progress: "", met: false };
     if (sl.cap === null) { toastr?.info?.("No soft lock on this stat."); return; }
 
@@ -1826,7 +1958,7 @@ async function editSoftLock(profile, cat, stat) {
             <label class="rst-lockedit-label">Cap %</label>
             <input type="number" id="rst-sl-cap" class="rst-lockedit-cap" value="${curCap}" min="-100" max="100" placeholder="e.g. 45">
             <label class="rst-lockedit-label">Condition to unlock</label>
-            <textarea id="rst-sl-cond" class="rst-lockedit-reason" rows="3" placeholder="What must happen for this stat to unlock — e.g. 'Mira must reveal a genuine vulnerability of her own before he lowers this guard.'">${$("<div>").text(curCond).html()}</textarea>
+            <textarea id="rst-sl-cond" class="rst-lockedit-reason" rows="3" placeholder="What must happen for this stat to unlock — e.g. 'The character must receive credible evidence that challenges the belief maintaining this guard.'">${$("<div>").text(curCond).html()}</textarea>
             <label class="rst-lockedit-label">Progress notes</label>
             <textarea id="rst-sl-prog" class="rst-lockedit-reason" rows="3" placeholder="Running notes toward the condition (optional).">${$("<div>").text(curProg).html()}</textarea>
             ${sl.met ? `<label class="rst-scan-discard"><input type="checkbox" id="rst-sl-relock"> Re-lock this (treat condition as not yet met)</label>` : ""}
@@ -1836,10 +1968,10 @@ async function editSoftLock(profile, cat, stat) {
     const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Save", cancelButton: "Cancel" });
     const showPromise = popup.show();
     const $dlg = $("dialog.popup").last();
-    const result = await showPromise;
+    const result = await rstScope27.wait(() => (showPromise));
     if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
-    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    const { getCharacterProfile, updateCharacterProfile } = await rstScope27.wait(() => (import("../data/characters.js")));
     const prof = getCharacterProfile(profile.id);
     if (!prof.softLocks) return;
 
@@ -1931,8 +2063,8 @@ function renderLogEntry(entry, profile) {
 
     $entry.append(`
         <div class="rst-log-head">
-            <div class="rst-log-scene">Scene ${sceneNum}</div>
-            <div class="rst-log-meta">${metaBits}</div>
+            <div class="rst-log-scene">Scene ${escapeHtml(sceneNum)}</div>
+            <div class="rst-log-meta">${escapeHtml(metaBits)}</div>
             <div class="rst-log-changecount">${changedCount} change${changedCount === 1 ? "" : "s"}</div>
         </div>
     `);
@@ -1941,9 +2073,9 @@ function renderLogEntry(entry, profile) {
     if (entry.dynamicTitleBefore && entry.dynamicTitleAfter && entry.dynamicTitleBefore !== entry.dynamicTitleAfter) {
         $entry.append(`
             <div class="rst-log-dyn">
-                <span class="rst-log-dyn-from">${entry.dynamicTitleBefore}</span>
+                <span class="rst-log-dyn-from">${escapeHtml(entry.dynamicTitleBefore)}</span>
                 <i class="fa-solid fa-arrow-right-long" style="font-size:10px;opacity:0.6;margin:0 6px"></i>
-                <span class="rst-log-dyn-to">${entry.dynamicTitleAfter}</span>
+                <span class="rst-log-dyn-to">${escapeHtml(entry.dynamicTitleAfter)}</span>
             </div>
         `);
     }
@@ -1978,10 +2110,7 @@ function renderLogEntry(entry, profile) {
             const statKey = cat + "." + stat;
             const commentary = entry.commentary?.[cat]?.[stat] || "";
             const isCritical = Array.isArray(entry.criticalStats) && entry.criticalStats.includes(statKey);
-            const inertiaAdjustment = Array.isArray(entry.inertiaAdjustments)
-                ? entry.inertiaAdjustments.find((item) => item?.stat === statKey)
-                : null;
-            rows.push({ statTitle, delta, cls, commentary, isCritical, inertiaAdjustment });
+            rows.push({ statTitle, delta, cls, commentary, isCritical });
         }
 
         if (rows.length === 0) continue;
@@ -1995,7 +2124,6 @@ function renderLogEntry(entry, profile) {
                         <span class="rst-log-stat-delta ${r.cls}">${r.delta}</span>
                     </div>
                     ${r.commentary ? `<div class="rst-log-stat-com">${r.commentary}</div>` : ""}
-                    ${r.inertiaAdjustment ? `<div class="rst-inertia-note"><i class="fa-solid fa-anchor"></i> Inertia guard: ${r.inertiaAdjustment.proposedDelta > 0 ? "+" : ""}${r.inertiaAdjustment.proposedDelta} → ${r.inertiaAdjustment.adjustedDelta > 0 ? "+" : ""}${r.inertiaAdjustment.adjustedDelta}</div>` : ""}
                 </div>
             `);
         }
@@ -2032,6 +2160,9 @@ function renderLogEntry(entry, profile) {
 // ─── Rollback Confirmation ────────────────────────────────
 
 async function showRollbackConfirmation(profile, entry) {
+    const rstScope28 = captureChatScope();
+
+    if (getCharacterProfile(profile.id)?.updateLog?.[0]?.timestamp !== entry.timestamp) return toastr?.warning?.("Roll back newer updates first so relationship history stays consistent.");
     const hasStatsBefore = !!entry.statsBefore;
 
     const detailLines = [
@@ -2058,10 +2189,10 @@ async function showRollbackConfirmation(profile, entry) {
         );
     }
 
-    const result = await Popup.show.confirm(
+    const result = await rstScope28.wait(() => (Popup.show.confirm(
         hasStatsBefore ? "⚠ Rollback warning" : "⚠ Rollback — no previous stats recorded",
         detailLines.join("\n"),
-    );
+    )));
 
     // Popup.show.confirm resolves with a BOOLEAN (unlike popup.show(), which
     // resolves with a POPUP_RESULT enum) — comparing it to the enum made this
@@ -2069,6 +2200,12 @@ async function showRollbackConfirmation(profile, entry) {
     if (result !== true && result !== POPUP_RESULT.AFFIRMATIVE) return;
 
     try {
+        const latest = getCharacterProfile(profile.id);
+        if (latest?.updateLog?.[0]?.timestamp !== entry.timestamp) throw new Error("History changed while this confirmation was open.");
+        if (entry.stateAfter) {
+            const { snapshotRelationshipState } = await rstScope28.wait(() => (import("../data/approval.js")));
+            if (JSON.stringify(snapshotRelationshipState(latest)) !== JSON.stringify(entry.stateAfter)) throw new Error("Relationship data was edited after this update; rollback would overwrite those edits.");
+        }
         if (hasStatsBefore) {
             updateCharacterStats(profile.id, entry.statsBefore);
         }
@@ -2104,6 +2241,11 @@ async function showRollbackConfirmation(profile, entry) {
             }
             profileUpdates.relationshipConditions = conditions;
         }
+        if (entry.stateBefore) {
+            const { stats, ...rest } = entry.stateBefore;
+            updateCharacterStats(profile.id, stats);
+            Object.assign(profileUpdates, rest);
+        }
         updateCharacterProfile(profile.id, profileUpdates);
 
         const sceneRef = entry.sceneId && entry.sceneId !== "" ? entry.sceneId : "manual edit";
@@ -2120,17 +2262,19 @@ async function showRollbackConfirmation(profile, entry) {
         const $pane = $("#rst-p-lib");
             reRenderCharacterList($pane);
 
-        const { updateInjection } = await import("../inject/promptInjector.js");
+        const { updateInjection } = await rstScope28.wait(() => (import("../inject/promptInjector.js")));
         updateInjection();
     } catch (err) {
         console.error("[RST] Rollback failed:", err);
-        toastr?.error?.("Rollback failed. Please try again.");
+        toastr?.error?.(err.message || "Rollback failed.");
     }
 }
 
 // ─── Edit Stats Modal ───────────────────────────────────────
 
 async function showEditStatsModal(profile) {
+    const rstScope29 = captureChatScope();
+
     const catTitle = (cat) => cat.charAt(0).toUpperCase() + cat.slice(1);
     const statLabel = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
@@ -2151,7 +2295,7 @@ async function showEditStatsModal(profile) {
                     </div>
                     <textarea rows="2" data-cat="${cat}" data-stat="${stat}"
                         class="rst-edit-com" style="width:100%;margin-top:2px"
-                        placeholder="Reason / commentary...">${commentary}</textarea>
+                        placeholder="Reason / commentary...">${escapeHtml(commentary)}</textarea>
                 </div>
             `;
         }
@@ -2161,7 +2305,7 @@ async function showEditStatsModal(profile) {
     const currentNarrative = profile.narrativeSummary || "";
 
     const html = `
-        <h3>Edit Stats — ${profile.name}</h3>
+        <h3>Edit Stats — ${escapeHtml(profile.name)}</h3>
         <p style="margin-bottom:6px;font-size:12px;color:var(--SmartThemeBodyColor,#999)">
             Edit stat values (−100 to +100) and their associated commentary.
             Old values will be saved in the update log.
@@ -2171,12 +2315,12 @@ async function showEditStatsModal(profile) {
 
             <div style="border-top:1px solid var(--SmartThemeBorderColor,#333);margin:12px 0 10px;padding-top:10px">
                 <div style="font-weight:600;margin-bottom:4px;font-size:13px;color:var(--SmartThemeBodyColor,#ccc)">── Dynamic Title ──</div>
-                <input type="text" id="rst-lib-edit-title" value="${currentTitle}"
+                <input type="text" id="rst-lib-edit-title" value="${escapeHtml(currentTitle)}"
                     style="width:100%;padding:5px 8px;font-size:12px;background:transparent;color:inherit">
 
                 <div style="font-weight:600;margin:10px 0 4px;font-size:13px;color:var(--SmartThemeBodyColor,#ccc)">── Narrative Summary ──</div>
                 <textarea id="rst-lib-edit-narrative" rows="3"
-                    style="width:100%;padding:5px 8px;font-size:12px;resize:vertical">${currentNarrative}</textarea>
+                    style="width:100%;padding:5px 8px;font-size:12px;resize:vertical">${escapeHtml(currentNarrative)}</textarea>
             </div>
         </div>
     `;
@@ -2187,6 +2331,9 @@ async function showEditStatsModal(profile) {
                 text: "Save Changes",
                 result: 1,
                 action: async () => {
+    if (!rstScope29.isCurrent()) return;
+    const rstScope30 = captureChatScope();
+
                     const newStats = {};
                     const newCommentary = {};
                     for (const cat of STAT_CATEGORIES) {
@@ -2233,12 +2380,14 @@ async function showEditStatsModal(profile) {
         okButton: "Cancel",
     });
 
-    await popup.show();
+    await rstScope29.wait(() => (popup.show()));
 }
 
 // ─── Wand Modal (Profile Generation) ─────────────────────
 
 async function showWandModal(profile) {
+    const rstScope31 = captureChatScope();
+
     const html = `
         <h3>Generate profile</h3>
         <p style="margin-bottom:10px;font-size:12px;color:var(--SmartThemeBodyColor,#999)">
@@ -2253,9 +2402,12 @@ async function showWandModal(profile) {
                 text: "Generate from prompt",
                 result: 2,
                 action: async () => {
+    if (!rstScope31.isCurrent()) return;
+    const rstScope32 = captureChatScope();
+
                     const textarea = document.getElementById("rst-wand-input");
                     const prompt = textarea?.value?.trim() || "";
-                    await runProfileGen(profile.name, prompt, false);
+                    await rstScope32.wait(() => (runProfileGen(profile.name, prompt, false)));
                     popup.complete(2);
                 },
             },
@@ -2263,7 +2415,10 @@ async function showWandModal(profile) {
                 text: "Generate from scene",
                 result: 3,
                 action: async () => {
-                    await runProfileGen(profile.name, "", true);
+    if (!rstScope31.isCurrent()) return;
+    const rstScope33 = captureChatScope();
+
+                    await rstScope33.wait(() => (runProfileGen(profile.name, "", true)));
                     popup.complete(3);
                 },
             },
@@ -2271,13 +2426,15 @@ async function showWandModal(profile) {
         okButton: "Cancel",
     });
 
-    await popup.show();
+    await rstScope31.wait(() => (popup.show()));
 }
 
 async function runProfileGen(name, prompt, fromScene) {
+    const rstScope34 = captureChatScope();
+
     showPanelLoading(`Generating profile for ${name}...`);
     try {
-        const result = await generateProfile(name, prompt, fromScene);
+        const result = await rstScope34.wait(() => (generateProfile(name, prompt, fromScene)));
 
         const chars = getAllCharacters();
         const char = chars.find((c) => c.name === name);
@@ -2304,7 +2461,9 @@ async function runProfileGen(name, prompt, fromScene) {
 // ─── New Character Dialog ─────────────────────────────────
 
 async function showNewCharacterDialog($pane) {
-    const name = await Popup.show.input("New character", "Enter character name:");
+    const rstScope35 = captureChatScope();
+
+    const name = await rstScope35.wait(() => (Popup.show.input("New character", "Enter character name:")));
     if (!name || !name.trim()) return;
 
     createCharacter(name.trim());
@@ -2313,31 +2472,65 @@ async function showNewCharacterDialog($pane) {
     renderLibraryTab($pane);
 }
 
-export async function showNewCharacterDetected(name) {
-    const result = await Popup.show.confirm(
-        "New character detected",
-        `${name} was found in the current context. Create a blank profile entry?`,
-        { okButton: "Create entry", cancelButton: "Ignore" },
-    );
+/**
+ * Ask the user what to do with a newly detected name.
+ * @returns {Promise<true|false|null>} true=create, false=explicit Ignore,
+ *   null=dismissed/cancelled/stale (do not blacklist).
+ */
+export async function showNewCharacterDetected(name, stillValid = null, options = null) {
+    const rstScope36 = captureChatScope();
+    const historical = options?.historical === true;
+    const detail = historical
+        ? `${name} was found actively involved in recent chat history and has no RST profile. Create a blank profile entry?`
+        : `${name} was found actively involved in the current scene. Create a blank profile entry?`;
 
-    if (result !== true && result !== POPUP_RESULT.AFFIRMATIVE) {
+    let result;
+    try {
+        result = await rstScope36.wait(() => (Popup.show.confirm(
+            historical ? "Missed character detected" : "New character detected",
+            detail,
+            {
+                okButton: "Create entry",
+                cancelButton: "Ignore",
+                allowEscapeClose: true,
+            },
+        )));
+    } catch (error) {
+        // A chat switch invalidates the popup's ownership. That is cancellation,
+        // not an explicit rejection of the detected character.
+        if (error?.code === "RST_STALE_CHAT") return null;
+        throw error;
+    }
+
+    if (result === POPUP_RESULT.NEGATIVE) {
         return false;
+    }
+    if (result !== true && result !== POPUP_RESULT.AFFIRMATIVE) {
+        return null;
+    }
+
+    // The confirmation may remain open across a chat switch or pause/resume.
+    // Never create the detected profile in a different lifecycle context.
+    if (typeof stillValid === "function" && !stillValid()) {
+        return null;
     }
 
     createCharacter(name);
     toastr?.success?.(`New character profile created for ${name}.`);
     const $pane = $("#rst-p-lib");
-            reRenderCharacterList($pane);
+    reRenderCharacterList($pane);
     return true;
 }
 
 // ─── Delete Character ─────────────────────────────────────
 
 async function confirmDeleteCharacter(profile) {
-    const result = await Popup.show.confirm(
+    const rstScope37 = captureChatScope();
+
+    const result = await rstScope37.wait(() => (Popup.show.confirm(
         "Delete character",
         `Are you sure you want to delete ${profile.name}? This cannot be undone.`,
-    );
+    )));
 
     if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
@@ -2368,9 +2561,11 @@ function triggerImport() {
     input.type = "file";
     input.accept = ".json";
     input.onchange = async (e) => {
+    const rstScope38 = captureChatScope();
+
         const file = e.target.files[0];
         if (!file) return;
-        const text = await file.text();
+        const text = await rstScope38.wait(() => (file.text()));
         const { count, errors } = importCharacters(text);
         if (count >= 0) {
             toastr?.success?.(`${count} characters imported.`);

@@ -4,6 +4,7 @@
  */
 
 import { getScenes, saveScenes, getPresentCharacters } from "./storage.js";
+import { mergeSceneCharacterIds } from "../lib/presenceUtils.js";
 
 // ─── Scene Counter ────────────────────────────────────────
 
@@ -46,7 +47,7 @@ export function createScene(messageStart, title = "") {
         title: title || "",
         messageStart,
         messageEnd: null,
-        charactersPresent: [...getPresentCharacters()],
+        charactersPresent: mergeSceneCharacterIds(getPresentCharacters()),
         llmSummary: "",
         timestamp: Date.now(),
     };
@@ -72,7 +73,7 @@ export function closeScene(sceneId, messageEnd) {
 
     scene.status = "closed";
     scene.messageEnd = messageEnd;
-    scene.charactersPresent = [...getPresentCharacters()];
+    scene.charactersPresent = mergeSceneCharacterIds(scene.charactersPresent, getPresentCharacters());
     saveScenes(scenes);
     return scene;
 }

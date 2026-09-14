@@ -3,9 +3,12 @@
  * Handles extension_settings.rst and chat_metadata.rst
  */
 
-import { chat_metadata, saveSettingsDebounced, saveChatDebounced } from "../../../../../script.js";
+import { chat_metadata, saveSettings, saveSettingsDebounced, saveChatDebounced } from "../../../../../script.js";
 import { extension_settings } from "../../../../../scripts/extensions.js";
 import { getContext } from "../../../../extensions.js";
+import { normalizeNameForMatch, getNameMatchKeys } from "../lib/nameIdentity.js";
+
+export { normalizeNameForMatch, getNameMatchKeys } from "../lib/nameIdentity.js";
 
 const NAMESPACE = "rst";
 
@@ -34,13 +37,13 @@ function scrubLegacyRelationshipEvidence(data) {
             changed = stripEvidenceFields(condition, ["evidenceRefs"]) || changed;
         }
         for (const entry of (Array.isArray(profile.updateLog) ? profile.updateLog : [])) {
-            changed = stripEvidenceFields(entry, ["evidenceRefs"]) || changed;
+            changed = stripEvidenceFields(entry, ["evidenceRefs", "inertiaAdjustments"]) || changed;
         }
     }
 
     const pending = data.pendingUpdates;
     for (const update of (Array.isArray(pending?.characterUpdates) ? pending.characterUpdates : [])) {
-        changed = stripEvidenceFields(update, ["evidenceRefs"]) || changed;
+        changed = stripEvidenceFields(update, ["evidenceRefs", "inertiaAdjustments"]) || changed;
         for (const item of (Array.isArray(update.proposedMilestones) ? update.proposedMilestones : [])) {
             changed = stripEvidenceFields(item, ["evidence"]) || changed;
         }
@@ -83,31 +86,6 @@ function scrubPendingLockEvidence(results) {
  * @param {string} name
  * @returns {string}
  */
-export function normalizeNameForMatch(name) {
-    return String(name || "")
-        .normalize("NFKC")
-        .replace(/[\u2010\u2011\u2012\u2013\u2014\u2212]/g, "-")
-        .replace(/[“”]/g, '"')
-        .replace(/[‘’]/g, "'")
-        .replace(/\s+/g, " ")
-        .trim()
-        .replace(/^[\s"'`*_.,;:!?()[\]{}<>]+|[\s"'`*_.,;:!?()[\]{}<>]+$/g, "")
-        .toLowerCase();
-}
-
-/**
- * Matching keys used for blacklist comparison. The compact key lets
- * "Vane-san" match "Vane san" without enabling broad substring checks.
- * @param {string} name
- * @returns {string[]}
- */
-export function getNameMatchKeys(name) {
-    const normalized = normalizeNameForMatch(name);
-    if (!normalized) return [];
-    const compact = normalized.replace(/[\s._'`-]+/g, "");
-    return [...new Set([normalized, compact].filter(Boolean))];
-}
-
 /**
  * Parse comma/newline separated blacklist text.
  * @param {string|string[]} value
@@ -168,6 +146,10 @@ export async function persistChatNow() {
     }
 }
 
+function notifyProfileChange() {
+    if (typeof $ === "function" && typeof document !== "undefined") $(document).trigger("rst:profiles-changed");
+}
+
 // ─── Extension Settings (Global) ──────────────────────────
 
 /**
@@ -225,10 +207,26 @@ export function saveAllSettings(newSettings) {
 }
 
 /**
- * Persist extension settings to disk.
+ * Persist extension settings to disk immediately.
+ *
+ * Ordinary controls still queue SillyTavern's normal debounced save so existing
+ * behavior remains lightweight while editing. Explicit RST Save buttons call
+ * this function instead: saveSettings() performs the host's awaited settings
+ * POST immediately, so the user never has to wait for the debounce window
+ * before refreshing SillyTavern.
+ *
+ * @returns {Promise<boolean>} true once the immediate save call completes
  */
-export function persistSettings() {
-    saveSettingsDebounced();
+export async function persistSettings() {
+    try {
+        await saveSettings();
+        return true;
+    } catch (err) {
+        // SillyTavern normally handles/report its own save errors, but keep a
+        // defensive boundary in case a host version lets one propagate.
+        console.warn("[RST] Immediate extension settings save failed.", err);
+        return false;
+    }
 }
 
 // ─── Character Profiles (Per-Chat) ────────────────────────
@@ -267,6 +265,7 @@ export function saveCharacter(charId, profile) {
     }
     chat_metadata[NAMESPACE].characters[charId] = profile;
     saveChatDebounced();
+    notifyProfileChange();
 }
 
 /**
@@ -277,7 +276,16 @@ export function deleteCharacterData(charId) {
     ensureChatNamespace();
     if (chat_metadata[NAMESPACE].characters) {
         delete chat_metadata[NAMESPACE].characters[charId];
+        const data = chat_metadata[NAMESPACE];
+        data.presentCharacters = data.presentCharacters.filter(id => id !== charId);
+        delete data.presenceModes[charId];
+        for (const scene of data.scenes) if (scene && Array.isArray(scene.charactersPresent)) scene.charactersPresent = scene.charactersPresent.filter(id => id !== charId);
+        if (Array.isArray(data.pendingUpdates?.characterUpdates)) {
+            data.pendingUpdates.characterUpdates = data.pendingUpdates.characterUpdates.filter(update => update.characterId !== charId);
+            if (!data.pendingUpdates.characterUpdates.length) data.pendingUpdates = null;
+        }
         saveChatDebounced();
+        notifyProfileChange();
     }
 }
 
@@ -331,9 +339,13 @@ function ensureChatNamespace() {
     if (!Array.isArray(data.scenes)) data.scenes = [];
     if (data.pendingUpdates === undefined) data.pendingUpdates = null;
     if (data.pendingMilestoneScan === undefined) data.pendingMilestoneScan = null;
+    if (data.pendingConditionScan === undefined) data.pendingConditionScan = null;
     if (!Array.isArray(data.presentCharacters)) data.presentCharacters = [];
     if (!data.presenceModes || typeof data.presenceModes !== "object" || Array.isArray(data.presenceModes)) data.presenceModes = {};
     if (typeof data.messageCounter !== "number") data.messageCounter = 0;
+    if (typeof data.sidecarRetryDue !== "boolean") data.sidecarRetryDue = false;
+    if (!Object.prototype.hasOwnProperty.call(data, "sidecarPauseCadence")) data.sidecarPauseCadence = null;
+    if (data.sidecarPauseCadence !== null && (typeof data.sidecarPauseCadence !== "object" || Array.isArray(data.sidecarPauseCadence))) data.sidecarPauseCadence = null;
     if (!data.characters || typeof data.characters !== "object" || Array.isArray(data.characters)) data.characters = {};
     if (!Array.isArray(data.folders)) data.folders = [];
     if (!Array.isArray(data.nameBlacklist)) data.nameBlacklist = [];
@@ -413,29 +425,33 @@ export function savePendingMilestoneScan(results) {
     saveChatDebounced();
 }
 
+export function getPendingConditionScan() {
+    ensureChatNamespace();
+    return chat_metadata[NAMESPACE].pendingConditionScan || null;
+}
+
+export function savePendingConditionScan(results) {
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].pendingConditionScan = results || null;
+    saveChatDebounced();
+}
+
 /**
- * Pending lock-scan results (library-wide, so stored globally in
- * extension_settings rather than per-chat). Persisted so that dismissing the
+ * Pending lock-scan results for the current chat. Persisted so that dismissing the
  * review dialog does not throw away an expensive scan — it can be reopened.
  * @returns {Array|null}
  */
 export function getPendingLockScan() {
-    if (!extension_settings[NAMESPACE]) return null;
-    const pending = extension_settings[NAMESPACE].pendingLockScan || null;
-    if (scrubPendingLockEvidence(pending)) saveSettingsDebounced();
+    ensureChatNamespace();
+    const pending = chat_metadata[NAMESPACE].pendingLockScan || null;
+    if (scrubPendingLockEvidence(pending)) saveChatDebounced();
     return pending;
 }
 
-/**
- * Save (or clear, with null) the pending lock-scan results.
- * @param {Array|null} results
- */
 export function savePendingLockScan(results) {
-    if (!extension_settings[NAMESPACE]) {
-        extension_settings[NAMESPACE] = {};
-    }
-    extension_settings[NAMESPACE].pendingLockScan = results || null;
-    saveSettingsDebounced();
+    ensureChatNamespace();
+    chat_metadata[NAMESPACE].pendingLockScan = results || null;
+    saveChatDebounced();
 }
 
 /**
@@ -459,6 +475,8 @@ export function savePresentCharacters(charIds) {
     ensureChatNamespace();
     const safeIds = Array.isArray(charIds) ? [...new Set(charIds.filter((id) => typeof id === "string" && id))] : [];
     chat_metadata[NAMESPACE].presentCharacters = safeIds;
+    const openScene = chat_metadata[NAMESPACE].scenes.find(scene => scene?.status === "open");
+    if (openScene) openScene.charactersPresent = [...new Set([...(openScene.charactersPresent || []), ...safeIds])];
 
     // Keep presence-mode metadata aligned with the active list. Manual additions
     // default to unknown until the sidecar observes physical/remote evidence.
@@ -528,7 +546,7 @@ export function saveNameBlacklist(names, immediate = false) {
     ensureChatNamespace();
 
     // Preserve display text, but dedupe by normalized match keys so variants like
-    // "Vane-san" and "Vane san" don't need to be re-added forever.
+    // Honorific/punctuation variants do not need to be re-added forever.
     const cleaned = parseNameBlacklist(names);
     const seen = new Set();
     const deduped = [];
@@ -570,9 +588,9 @@ export function addNamesToBlacklist(names, immediate = false) {
     }
 
     if (changed) {
-        saveNameBlacklist(current, immediate);
+        return saveNameBlacklist(current, immediate);
     }
-    return changed;
+    return true;
 }
 
 /**
@@ -644,12 +662,93 @@ export function syncMessageCounterToLiveCount(liveMessageCount) {
     return { counter: previous, previous, changed: false };
 }
 
+
+
+/**
+ * Whether the current cadence checkpoint is awaiting a retry because the last
+ * sidecar attempt failed or was rejected before committing presence state.
+ * This belongs to the per-chat scheduler state (not UI-local state) so the
+ * Home counter and scheduler cannot disagree after chat switches/rerenders.
+ * @returns {boolean}
+ */
+export function getSidecarRetryDue() {
+    ensureChatNamespace();
+    return chat_metadata[NAMESPACE].sidecarRetryDue === true;
+}
+
+/**
+ * Persist whether the current sidecar cadence checkpoint is retry-due.
+ * @param {boolean} value
+ * @returns {boolean}
+ */
+export function setSidecarRetryDue(value) {
+    ensureChatNamespace();
+    const next = Boolean(value);
+    if (chat_metadata[NAMESPACE].sidecarRetryDue !== next) {
+        chat_metadata[NAMESPACE].sidecarRetryDue = next;
+        saveChatDebounced();
+    }
+    return chat_metadata[NAMESPACE].sidecarRetryDue;
+}
+
+/**
+ * Get the persisted sidecar pause snapshot for this chat.
+ * The snapshot stores the live narrative-message count and cadence baseline at
+ * the instant the sidecar was paused so resume can preserve exact progress.
+ * @returns {{liveCount:number, baseline:number}|null}
+ */
+export function getSidecarPauseCadence() {
+    ensureChatNamespace();
+    const state = chat_metadata[NAMESPACE].sidecarPauseCadence;
+    if (!state || typeof state !== "object" || Array.isArray(state)) return null;
+
+    const liveCount = Number(state.liveCount);
+    const baseline = Number(state.baseline);
+    if (!Number.isFinite(liveCount) || !Number.isFinite(baseline)) return null;
+
+    const safeLiveCount = Math.max(0, Math.floor(liveCount));
+    const safeBaseline = Math.max(0, Math.min(Math.floor(baseline), safeLiveCount));
+    return { liveCount: safeLiveCount, baseline: safeBaseline };
+}
+
+/**
+ * Persist the sidecar cadence position at the moment of pause.
+ * @param {number} liveMessageCount
+ * @param {number} baseline
+ * @returns {{liveCount:number, baseline:number}}
+ */
+export function saveSidecarPauseCadence(liveMessageCount, baseline) {
+    ensureChatNamespace();
+    const parsedLive = Number(liveMessageCount);
+    const parsedBaseline = Number(baseline);
+    const safeLiveCount = Number.isFinite(parsedLive) ? Math.max(0, Math.floor(parsedLive)) : 0;
+    const safeBaseline = Number.isFinite(parsedBaseline)
+        ? Math.max(0, Math.min(Math.floor(parsedBaseline), safeLiveCount))
+        : 0;
+    const state = { liveCount: safeLiveCount, baseline: safeBaseline };
+    chat_metadata[NAMESPACE].sidecarPauseCadence = state;
+    saveChatDebounced();
+    return state;
+}
+
+/**
+ * Clear the persisted pause snapshot after cadence has been restored.
+ */
+export function clearSidecarPauseCadence() {
+    ensureChatNamespace();
+    if (chat_metadata[NAMESPACE].sidecarPauseCadence !== null) {
+        chat_metadata[NAMESPACE].sidecarPauseCadence = null;
+        saveChatDebounced();
+    }
+}
+
 /**
  * Reset the message counter.
  */
 export function resetMessageCounter() {
     ensureChatNamespace();
     chat_metadata[NAMESPACE].messageCounter = 0;
+    chat_metadata[NAMESPACE].sidecarRetryDue = false;
     saveChatDebounced();
 }
 
@@ -693,8 +792,13 @@ export function getDefaultSettings() {
 
         messagesToScan: 10,
         scanFrequency: 5,
+        milestonesPerPage: 5,
         sidecarPaused: false,
         newCharPopup: true,
+        debugMissedCharacterScan: {
+            messageCount: 30,
+            chunkSize: 5,
+        },
         statChangeRange: { min: -5, max: 5 },
         criticalChanges: {
             enabled: true,

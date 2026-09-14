@@ -198,6 +198,7 @@ export function renderHomeHeader($pane) {
     $header.find("#rst-sidecar-pause-btn").on("click", function () {
         const paused = !getSetting("sidecarPaused", false);
         setSetting("sidecarPaused", paused);
+        $(document).trigger("rst:sidecar-pause-changed", [paused]);
         const $button = $(this);
         $button.toggleClass("is-paused", paused);
         $button.attr("title", paused

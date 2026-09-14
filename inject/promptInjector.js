@@ -14,15 +14,7 @@ import { getCharacterProfile, getAllCharacters, STAT_CATEGORIES, STAT_NAMES, get
 const PROMPT_ID = "rst-stat-block";
 const LIBRARY_REF_KEY = "rst-library-reference";
 
-/**
- * Preview keys — ALWAYS injected at IN_PROMPT (position 0).
- * ST's Prompt section inspect view only shows extension prompts that are
- * in the system prompt collection (IN_PROMPT or BEFORE_PROMPT).  IN_CHAT
- * prompts are excluded.  To make RST's content visible in the Prompt
- * section preview (the same way Author's Note appears), we register
- * second entries at IN_PROMPT.  This follows ST's own dual-registration
- * pattern used by Author's Note.
- */
+// Legacy duplicate keys are cleared during refresh; inspectors use the live entries.
 const PROMPT_PREVIEW_KEY = "rst-stat-block-preview";
 const LIBRARY_PREVIEW_KEY = "rst-library-reference-preview";
 
@@ -32,7 +24,7 @@ const POSITION_IN_CHAT = 1;
 const POSITION_IN_PROMPT = 0;
 
 // Internal generation flag — prevents self-injection during RST's own API calls
-let _isRSTInternalGen = false;
+let _internalRequests = 0;
 
 /**
  * Set the internal generation flag to prevent passive library reference from injecting
@@ -40,7 +32,7 @@ let _isRSTInternalGen = false;
  * @param {boolean} val
  */
 export function setRSTInternalGen(val) {
-    _isRSTInternalGen = val;
+    _internalRequests = Math.max(0, _internalRequests + (val ? 1 : -1));
 }
 
 /**
@@ -49,15 +41,15 @@ export function setRSTInternalGen(val) {
  * @returns {boolean}
  */
 function libraryRefFilter() {
-    return !_isRSTInternalGen;
+    return _internalRequests === 0;
 }
 
 // Placement mapping to ST's injection position/depth
-// Only ST-standard positions: top(0), above character card(1), below character card(2)
+// Legacy placement keys map to actual ST prompt positions, not chat depths.
 const PLACEMENT_MAP = {
-    above_card: 1,
-    below_card: 2,
-    top: 0,
+    above_card: 2, // BEFORE_PROMPT
+    below_card: 0, // IN_PROMPT
+    top: 2,
 };
 
 // ─── Main Injection Function ──────────────────────────────
@@ -68,33 +60,18 @@ const PLACEMENT_MAP = {
  */
 export function updateInjection() {
     const settings = getSettings();
-    if (!settings.enabled || !settings.injection.injectStats) {
+    // Old preview entries were live prompts, not inspector-only metadata.
+    setExtensionPrompt(PROMPT_PREVIEW_KEY, "", 0, 0, false, ROLE_SYSTEM);
+    setExtensionPrompt(LIBRARY_PREVIEW_KEY, "", 0, 0, false, ROLE_SYSTEM);
+    if (!settings.enabled) {
         removeInjection();
         return;
     }
-
-    const presentCharIds = getPresentCharacters();
-    if (presentCharIds.length === 0) {
-        removeInjection();
-        return;
-    }
-
-    // Active stat block for present characters
-    const content = buildStatBlock(presentCharIds, settings);
-    if (!content) {
-        removeInjection();
-        return;
-    }
-
-    const position = PLACEMENT_MAP[settings.injection.placement] || 1;
-    setExtensionPrompt(PROMPT_ID, content, position, 0, false, ROLE_SYSTEM);
-
-    // Preview key — always at IN_PROMPT so stat block content is visible
-    // in the Prompt section inspect view (under Main Prompt), the same way
-    // Author's Note appears there.
-    setExtensionPrompt(PROMPT_PREVIEW_KEY, content, POSITION_IN_PROMPT, 0, false, ROLE_SYSTEM);
-
-    // Passive library reference for ALL characters
+    const content = settings.injection?.injectStats
+        ? buildStatBlock(getPresentCharacters(), settings) : "";
+    const position = PLACEMENT_MAP[settings.injection?.placement] ?? 2;
+    setExtensionPrompt(PROMPT_ID, content, position, 0, false, ROLE_SYSTEM, libraryRefFilter);
+    // The optional directory remains useful even when no character is present.
     updatePassiveLibraryRef();
 }
 
@@ -150,9 +127,8 @@ export function updatePassiveLibraryRef() {
     // Filter prevents the library block from being injected during RST's own API calls
     setExtensionPrompt(LIBRARY_REF_KEY, block, POSITION_IN_CHAT, depth, false, role, libraryRefFilter);
 
-    // Preview key — always at IN_PROMPT so library reference content is visible
-    // in the Prompt section inspect view.
-    setExtensionPrompt(LIBRARY_PREVIEW_KEY, block, POSITION_IN_PROMPT, 0, false, ROLE_SYSTEM);
+    // Clear the obsolete duplicate entry.
+    setExtensionPrompt(LIBRARY_PREVIEW_KEY, "", POSITION_IN_PROMPT, 0, false, ROLE_SYSTEM);
 }
 
 /**
@@ -173,7 +149,7 @@ function buildLibraryBlock(allChars) {
     for (const profile of allChars) {
         if (!profile.name) continue;
         const name = profile.name;
-        const desc = (typeof profile.description === "string" && profile.description)
+        const desc = (!profile.suppressDescriptionInjection && typeof profile.description === "string" && profile.description)
             ? ` — ${profile.description.substring(0, 120)}`
             : "";
         parts.push(`- ${name}${desc}`);
@@ -293,6 +269,13 @@ export function buildCharacterBlock(profile, settings) {
         }
     }
 
+    // IMPORTANT PROMPT BOUNDARY:
+    // Relationship milestones and temporary relationship statuses are RST-internal
+    // analysis state. They intentionally remain available to stat updates/backfills/
+    // lifecycle scans, but MUST NOT be injected into SillyTavern's roleplay prompt.
+    // Their behavioral meaning is already reflected through approved stats,
+    // narrative summary, commentary, and ordinary story context; injecting these
+    // internal trackers would add redundant tokens and can over-steer the main model.
+
     return parts.join("\n").trim();
 }
-

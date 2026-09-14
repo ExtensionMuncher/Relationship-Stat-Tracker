@@ -1,3 +1,7 @@
+import { getPendingUpdates, savePendingUpdates } from "../data/storage.js";
+import { generateStatUpdate } from "../llm/statUpdate.js";
+import { renderHomeTab } from "./home.js";
+import { captureChatScope } from "../lib/chatScope.js";
 /**
  * scenes.js — Scenes tab: scene list + summaries
  * Renders the Scenes tab with all scene entries and their summaries
@@ -6,6 +10,15 @@
 import { Popup } from "../../../../../scripts/popup.js";
 import { getCharacterProfile, getInitials, getAllCharacters } from "../data/characters.js";
 import { getAllScenes, getOpenScene, deleteScene, updateSceneSummary, updateSceneTitle, updateSceneCharacters, formatTimeAgo } from "../data/scenes.js";
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
 
 // ─── Bulk Selection State ─────────────────────────────────
 
@@ -75,12 +88,14 @@ export function renderScenesTab($pane) {
 
         // Delete selected handler
         $toolbar.find("#rst-delete-selected-scenes").on("click", async function () {
+    const rstScope1 = captureChatScope();
+
             const count = selectedScenes.size;
             if (count === 0) return;
-            const confirmed = await Popup.show.confirm(
+            const confirmed = await rstScope1.wait(() => (Popup.show.confirm(
                 "Delete Scenes",
                 `Delete ${count} selected scene${count > 1 ? "s" : ""}? This cannot be undone.`
-            );
+            )));
             if (!confirmed) return;
             for (const sceneId of selectedScenes) {
                 deleteScene(sceneId);
@@ -139,13 +154,13 @@ function renderSceneEntry(scene, isOpen) {
     // Header
     const $header = $(`
         <div class="rst-scene-hdr">
-            ${isOpen ? "" : `<input type="checkbox" class="rst-scene-select" data-scene-id="${scene.id}" style="margin:0;cursor:pointer" title="Select this scene">`}
+            ${isOpen ? "" : `<input type="checkbox" class="rst-scene-select" data-scene-id="${escapeHtml(scene.id)}" style="margin:0;cursor:pointer" title="Select this scene">`}
             <div>
-                <div style="font-weight:500">Scene ${sceneNum}${sceneTitle ? ` — ${sceneTitle}` : ""}</div>
-                <div style="font-size:11px;color:var(--rst-text-muted)">${msgRange}</div>
+                <div style="font-weight:500">Scene ${escapeHtml(sceneNum)}${sceneTitle ? ` — ${escapeHtml(sceneTitle)}` : ""}</div>
+                <div style="font-size:11px;color:var(--rst-text-muted)">${escapeHtml(msgRange)}</div>
             </div>
             <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
-                <span style="font-size:11px;color:var(--rst-text-muted)">${charNames.join(", ")}</span>
+                <span style="font-size:11px;color:var(--rst-text-muted)">${escapeHtml(charNames.join(", "))}</span>
                 ${isOpen
                     ? '<span class="rst-badge-pending">open</span>'
                     : '<span class="rst-badge-closed">closed</span>'
@@ -194,12 +209,31 @@ function renderSceneEntry(scene, isOpen) {
     // Body
     const $body = $('<div class="rst-scene-body"></div>');
 
+    if (!isOpen && !scene.llmSummary) {
+        const $retry = $('<button class="rst-btn rst-scene-retry">Generate / retry stat review</button>');
+        $retry.on("click", async () => {
+            const scope = captureChatScope();
+            if (getPendingUpdates()) return toastr?.warning?.("Finish the pending stat review first.");
+            if (getAllCharacters().some(profile => profile.updateLog?.some(entry => entry.sceneId === scene.id))) return toastr?.warning?.("This scene already has approved changes. Repeating it could double-count them.");
+            $retry.prop("disabled", true);
+            try {
+                const result = await scope.wait(() => generateStatUpdate(scene.id));
+                if (getPendingUpdates()) throw new Error("Another review became pending; finish it before retrying.");
+                savePendingUpdates(result);
+                renderHomeTab($("#rst-p-home"));
+                toastr?.success?.("Stat review ready on Home.");
+            } catch (error) { toastr?.error?.(error.message || "Stat review failed."); }
+            finally { $retry.prop("disabled", false); }
+        });
+        $body.append($retry);
+    }
+
     // Characters in this scene — editable (add/remove)
     {
         const $charSection = $(`
             <div style="margin-bottom:10px">
                 <div class="rst-lbl" style="margin-bottom:6px">Characters in this scene</div>
-                <div class="rst-btn-row" style="flex-wrap:wrap;gap:6px" id="rst-scene-chars-${scene.id}"></div>
+                <div class="rst-btn-row" style="flex-wrap:wrap;gap:6px" id="rst-scene-chars-${escapeHtml(scene.id)}"></div>
                 <div style="display:flex;align-items:center;gap:6px;margin-top:6px">
                     <select class="rst-scene-add-char" style="flex:1;font-size:12px;padding:4px 6px;border:0.5px solid var(--rst-border);border-radius:6px;background:transparent;color:inherit">
                         <option value="">— Add character —</option>
@@ -220,7 +254,7 @@ function renderSceneEntry(scene, isOpen) {
             const available = allChars.filter((c) => !currentIds.includes(c.id));
             $addSelect.find("option:not([value=''])").remove();
             for (const c of available) {
-                $addSelect.append(`<option value="${c.id}">${c.name}</option>`);
+                $addSelect.append($("<option></option>").val(c.id).text(c.name));
             }
             $addSelect.val("");
             $addBtn.prop("disabled", true);
@@ -260,8 +294,8 @@ function renderSceneEntry(scene, isOpen) {
                 const initials = getInitials(name);
                 const $chip = $(`
                     <div style="display:flex;align-items:center;gap:5px;padding:4px 8px;border:0.5px solid var(--rst-border);border-radius:6px;font-size:12px">
-                        <div class="rst-av" style="width:22px;height:22px;font-size:9px">${initials}</div>
-                        <span>${name}</span>
+                        <div class="rst-av" style="width:22px;height:22px;font-size:9px">${escapeHtml(initials)}</div>
+                        <span>${escapeHtml(name)}</span>
                         <span class="rst-scene-remove-char" data-char-id="${charId}" style="cursor:pointer;color:var(--rst-danger);margin-left:2px;font-size:13px;line-height:1" title="Remove from scene">✕</span>
                     </div>
                 `);
@@ -292,7 +326,7 @@ function renderSceneEntry(scene, isOpen) {
         </div>
     `);
 
-    const $titleInput = $(`<input type="text" class="rst-scene-title-input" value="${sceneTitle}" placeholder="e.g. The Confrontation at the Gate">`);
+    const $titleInput = $('<input type="text" class="rst-scene-title-input" placeholder="e.g. The Confrontation at the Gate">').val(sceneTitle);
     $titleInput.on("change", function () {
         updateSceneTitle(scene.id, $(this).val());
     });
@@ -314,7 +348,7 @@ function renderSceneEntry(scene, isOpen) {
             </div>
         `);
 
-        const $textarea = $(`<textarea id="rst-scene-summary-${scene.id}" rows="4">${scene.llmSummary || ""}</textarea>`);
+        const $textarea = $('<textarea rows="4"></textarea>').attr("id", `rst-scene-summary-${scene.id}`).val(scene.llmSummary || "");
         $textarea.on("change", function () {
             updateSceneSummary(scene.id, $(this).val());
         });
@@ -345,7 +379,9 @@ function renderSceneEntry(scene, isOpen) {
         `);
 
         $btnRow.find("button").on("click", async () => {
-            const confirmed = await Popup.show.confirm("Delete Scene", confirmMsg);
+    const rstScope2 = captureChatScope();
+
+            const confirmed = await rstScope2.wait(() => (Popup.show.confirm("Delete Scene", confirmMsg)));
             if (!confirmed) return;
             deleteScene(scene.id);
             toastr?.info?.(`Scene ${sceneNum} deleted.`);

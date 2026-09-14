@@ -13,6 +13,7 @@ import {
     getFolders,
     saveFolders,
 } from "./storage.js";
+import { getNameMatchKeys, getNameWordSignature, getNameTokens } from "../lib/nameIdentity.js";
 
 // Re-export storage functions needed by the UI layer
 export { getFolders, saveFolders };
@@ -392,50 +393,7 @@ export function getAllCharacters() {
  */
 export function findCharacterByName(name) {
     const all = getAllCharacters();
-    const lowerName = name.toLowerCase().trim();
-    if (!lowerName) return null;
-
-    // 1. Exact match on main name
-    const exact = all.find((c) => c.name.toLowerCase().trim() === lowerName);
-    if (exact) return exact;
-
-    // 2. Exact match on any alias
-    for (const c of all) {
-        if (c.nameAliases && Array.isArray(c.nameAliases)) {
-            const aliasMatch = c.nameAliases.some((a) => a.toLowerCase().trim() === lowerName);
-            if (aliasMatch) return c;
-        }
-    }
-
-    // 3. Word-set match (e.g., "Jane Doe" ↔ "Doe Jane")
-    const nameWords = lowerName.split(/\s+/).filter(Boolean).sort().join(" ");
-    for (const c of all) {
-        const cWords = c.name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
-        if (cWords === nameWords) return c;
-        // Also check aliases with word-set matching
-        if (c.nameAliases && Array.isArray(c.nameAliases)) {
-            for (const alias of c.nameAliases) {
-                const aliasWords = alias.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
-                if (aliasWords === nameWords) return c;
-            }
-        }
-    }
-
-    // 4. Substring match (e.g., "Jane" matches inside "Jane Doe")
-    for (const c of all) {
-        // Check if the name is a substring of the character's main name, or vice versa
-        const cNameLower = c.name.toLowerCase().trim();
-        if (cNameLower.includes(lowerName) || lowerName.includes(cNameLower)) return c;
-        // Also check aliases
-        if (c.nameAliases && Array.isArray(c.nameAliases)) {
-            for (const alias of c.nameAliases) {
-                const aliasLower = alias.toLowerCase().trim();
-                if (aliasLower.includes(lowerName) || lowerName.includes(aliasLower)) return c;
-            }
-        }
-    }
-
-    return null;
+    return resolveUniqueCharacterIdentity(all, name, true);
 }
 
 /**
@@ -447,32 +405,37 @@ export function findCharacterByName(name) {
  */
 export function findCharacterByFuzzyName(name) {
     const all = getAllCharacters();
-    const lowerName = name.toLowerCase().trim();
-    if (!lowerName) return null;
+    return resolveUniqueCharacterIdentity(all, name, false);
+}
 
-    // 1. Word-set match
-    const nameWords = lowerName.split(/\s+/).filter(Boolean).sort().join(" ");
-    for (const c of all) {
-        const cWords = c.name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
-        if (cWords === nameWords) return c;
-        if (c.nameAliases && Array.isArray(c.nameAliases)) {
-            for (const alias of c.nameAliases) {
-                const aliasWords = alias.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
-                if (aliasWords === nameWords) return c;
-            }
-        }
+function resolveUniqueCharacterIdentity(all, query, allowExact) {
+    const queryKeys = new Set(getNameMatchKeys(query));
+    if (queryKeys.size === 0) return null;
+    const querySignature = getNameWordSignature(query);
+    const queryTokens = getNameTokens(query);
+    const variantsFor = (character) => [character.name, ...(Array.isArray(character.nameAliases) ? character.nameAliases : [])];
+    const unique = (matches) => matches.length === 1 ? matches[0] : null;
+
+    if (allowExact) {
+        const exact = all.filter((character) => variantsFor(character).some((variant) =>
+            getNameMatchKeys(variant).some((key) => queryKeys.has(key)),
+        ));
+        if (exact.length > 0) return unique(exact);
     }
 
-    // 2. Substring match
-    for (const c of all) {
-        const cNameLower = c.name.toLowerCase().trim();
-        if (cNameLower.includes(lowerName) || lowerName.includes(cNameLower)) return c;
-        if (c.nameAliases && Array.isArray(c.nameAliases)) {
-            for (const alias of c.nameAliases) {
-                const aliasLower = alias.toLowerCase().trim();
-                if (aliasLower.includes(lowerName) || lowerName.includes(aliasLower)) return c;
-            }
-        }
+    const reordered = all.filter((character) => variantsFor(character).some((variant) =>
+        querySignature && getNameWordSignature(variant) === querySignature,
+    ));
+    if (reordered.length > 0) return unique(reordered);
+
+    // Shortened names match complete tokens only. This allows a unique surname or
+    // given-name alias while preventing substring collisions. Ambiguous shared tokens fail closed.
+    if (queryTokens.length === 1) {
+        const token = queryTokens[0];
+        const tokenMatches = all.filter((character) => variantsFor(character).some((variant) =>
+            getNameTokens(variant).includes(token),
+        ));
+        if (tokenMatches.length > 0) return unique(tokenMatches);
     }
 
     return null;
@@ -497,7 +460,7 @@ export function getCharacterNameVariants(profile) {
 
 /**
  * Find a character by word-set similarity (same words, different order).
- * Detects collisions like "Jane Doe" ↔ "Doe Jane".
+ * Detects reordered full-name collisions that resolve to the same token set.
  * @param {string} name
  * @returns {object|null}
  */
@@ -778,7 +741,7 @@ export function exportCharacters() {
  * @param {object} profile
  * @returns {string[]}
  */
-function validateProfile(profile) {
+export function validateProfile(profile) {
     const errors = [];
 
     // Required: id must be a non-empty string
@@ -801,7 +764,7 @@ function validateProfile(profile) {
             } else {
                 for (const stat of STAT_NAMES) {
                     const val = profile.stats[cat][stat];
-                    if (typeof val !== "number" || isNaN(val)) {
+                    if (!Number.isFinite(val)) {
                         errors.push(`Invalid stat value for "${cat}/${stat}" (must be a number, got ${typeof val})`);
                     }
                 }
@@ -880,7 +843,8 @@ export function importCharacters(jsonString) {
                 continue;
             }
 
-            existing[id] = profile;
+            if (["__proto__", "constructor", "prototype"].includes(id)) { errors.push(`Invalid character id: ${id}`); continue; }
+            existing[id] = { ...profile, id, stats: clampAllStats(profile.stats) };
             count++;
         }
 
@@ -913,7 +877,7 @@ function clampAllStats(stats) {
         clamped[cat] = {};
         for (const stat of STAT_NAMES) {
             const val = stats[cat]?.[stat] ?? 0;
-            clamped[cat][stat] = Math.max(-100, Math.min(100, val));
+            clamped[cat][stat] = Number.isFinite(Number(val)) ? Math.max(-100, Math.min(100, Number(val))) : 0;
         }
     }
     return clamped;

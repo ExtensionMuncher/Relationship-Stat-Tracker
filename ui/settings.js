@@ -1,16 +1,23 @@
+import { captureChatScope } from "../lib/chatScope.js";
 /**
  * settings.js — Settings tab: all config UI
  * Renders the Settings tab with accordion-collapsed sections (NWST-style)
  * Connection Profiles are NOT accordion-wrapped to ensure ConnectionManager initializes properly
  */
 
-import { getSettings, saveSetting, getNameBlacklist, saveNameBlacklist, parseNameBlacklist, getPendingLockScan, savePendingLockScan, getPendingMilestoneScan, savePendingMilestoneScan } from "../data/storage.js";
+import { getSettings, saveSetting, persistSettings, getNameBlacklist, saveNameBlacklist, parseNameBlacklist, addNamesToBlacklist, getPendingLockScan, savePendingLockScan, getPendingMilestoneScan, savePendingMilestoneScan, getPendingConditionScan, savePendingConditionScan } from "../data/storage.js";
 import { setSetting, isEnabled, exportAllData, importAllData } from "../settings.js";
 import { ConnectionManagerRequestService } from "../../../../extensions/shared.js";
 import { getContext } from "../../../../extensions.js";
 import { Popup, POPUP_TYPE, POPUP_RESULT } from "../../../../../scripts/popup.js";
 import { scanForLocks } from "../llm/lockScan.js";
 import { scanHistoricalMilestones } from "../llm/milestoneScan.js";
+import { getAllCharacters, findCharacterByName, findCharacterByFuzzyName } from "../data/characters.js";
+import { getRelationshipConditionDefinition } from "../data/conditions.js";
+import { scanHistoricalConditions } from "../llm/conditionBackfill.js";
+import { scanMissedCharacters } from "../llm/sidecar.js";
+import { showNewCharacterDetected } from "./library.js";
+import { getPane } from "./panel.js";
 
 
 function escapeHtml(value) {
@@ -19,6 +26,110 @@ function escapeHtml(value) {
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;");
+}
+
+// SillyTavern's connection-dropdown helper registers three permanent
+// host event listeners every time it is called.  RST rebuilds its Settings tab
+// on tab entry and chat changes, so using that helper here accumulated detached
+// dropdowns and duplicate callbacks for the rest of the page session.  Keep one
+// host refresh listener set, and render each current dropdown from a snapshot.
+const connectionEventSources = new WeakSet();
+
+function supportedConnectionProfiles() {
+    const context = getContext?.();
+    if (context?.extensionSettings?.disabledExtensions?.includes("connection-manager")) return [];
+    const profiles = Array.isArray(context?.extensionSettings?.connectionManager?.profiles)
+        ? context.extensionSettings.connectionManager.profiles
+        : [];
+    return profiles
+        .filter((profile) => {
+            try {
+                return typeof ConnectionManagerRequestService.isProfileSupported !== "function"
+                    || ConnectionManagerRequestService.isProfileSupported(profile);
+            } catch {
+                return false;
+            }
+        })
+        .slice()
+        .sort((a, b) => String(a?.name || "").localeCompare(String(b?.name || "")));
+}
+
+function bindConnectionDropdown($dropdown, selectedId, onChange) {
+    $dropdown.empty();
+    $dropdown.append('<option value="">Select a Connection Profile</option>');
+    const profiles = supportedConnectionProfiles();
+    for (const profile of profiles) {
+        const id = String(profile?.id || "");
+        if (!id) continue;
+        $dropdown.append(`<option value="${escapeHtml(id)}">${escapeHtml(profile?.name || "Unnamed")}</option>`);
+    }
+    const selectedProfile = profiles.find((profile) =>
+        String(profile?.id || "") === String(selectedId || "")
+        || String(profile?.name || "") === String(selectedId || ""));
+    const selected = String(selectedProfile?.id || "");
+    $dropdown.val(selected);
+    $dropdown.off("change.rst-connection").on("change.rst-connection", function () {
+        const id = String($(this).val() || "");
+        const profile = profiles.find((candidate) => String(candidate?.id || "") === id) || null;
+        onChange(profile);
+    });
+}
+
+function ensureConnectionProfileRefresh() {
+    const context = getContext?.();
+    const source = context?.eventSource;
+    if (!source || typeof source.on !== "function" || connectionEventSources.has(source)) return;
+    connectionEventSources.add(source);
+    const rerender = () => {
+        const $pane = getPane("settings");
+        if ($pane?.length) renderSettingsTab($pane);
+    };
+    for (const key of ["CONNECTION_PROFILE_CREATED", "CONNECTION_PROFILE_UPDATED", "CONNECTION_PROFILE_DELETED"]) {
+        const eventName = context?.eventTypes?.[key];
+        if (eventName) source.on(eventName, rerender);
+    }
+}
+
+// ─── Explicit Section Saving ──────────────────────────────
+
+function appendSectionSaveButton($container, id, label) {
+    const $row = $(`
+        <div class="rst-setting-row rst-explicit-save-row" style="border-bottom:none;justify-content:flex-end">
+            <button id="${id}" class="rst-btn rst-explicit-save-btn" type="button">
+                <i class="fa-solid fa-floppy-disk"></i> ${label}
+            </button>
+        </div>
+    `);
+    $container.append($row);
+    return $row.find(`#${id}`);
+}
+
+async function commitSectionNow($button, label, commitFn) {
+    if (!$button?.length) return false;
+    const originalHtml = $button.html();
+    $button.prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Saving...');
+
+    try {
+        await Promise.resolve(commitFn?.());
+        const saved = await persistSettings();
+        if (saved === false) throw new Error("Immediate settings persistence failed.");
+        $button.html('<i class="fa-solid fa-check"></i> Saved');
+        toastr?.success?.(`${label} saved.`, "Relationship Stat Tracker");
+        setTimeout(() => {
+            if ($button?.length) $button.html(originalHtml);
+        }, 1200);
+        return true;
+    } catch (err) {
+        console.error(`[RST] Failed to save ${label}.`, err);
+        $button.html('<i class="fa-solid fa-triangle-exclamation"></i> Save failed');
+        toastr?.error?.(`${label} could not be saved. Check the console/server connection.`, "Relationship Stat Tracker");
+        setTimeout(() => {
+            if ($button?.length) $button.html(originalHtml);
+        }, 1800);
+        return false;
+    } finally {
+        $button.prop("disabled", false);
+    }
 }
 
 // ─── Accordion Helper ─────────────────────────────────────
@@ -116,6 +227,36 @@ function renderDebugSettings($pane, settings) {
                 <button id="rst-scan-milestones-btn" class="rst-btn"><i class="fa-solid fa-flag"></i> Backfill</button>
             </div>
         </div>
+        <div class="rst-setting-row">
+            <div>
+                <div class="rst-setting-label">Backfill Temporary Statuses</div>
+                <div class="rst-setting-sub">Chronologically reconstruct status activation, development, and resolution across the full visible chat. Only end-of-chat statuses are proposed; review is required before current data changes.</div>
+            </div>
+            <div style="display:flex;gap:6px;flex-shrink:0">
+                <button id="rst-preview-conditions-btn" class="rst-btn"><i class="fa-solid fa-eye"></i> Current</button>
+                <button id="rst-review-conditions-btn" class="rst-btn" style="display:${getPendingConditionScan() ? 'inline-flex' : 'none'}"><i class="fa-solid fa-list-check"></i> Review</button>
+                <button id="rst-scan-conditions-btn" class="rst-btn"><i class="fa-solid fa-tags"></i> Backfill</button>
+            </div>
+        </div>
+        <div class="rst-setting-row">
+            <div>
+                <div class="rst-setting-label">Scan for Missed Characters</div>
+                <div class="rst-setting-sub">Debug catch-up pass for NPCs that may have appeared before the live sidecar checkpoint. Scans recent narrative messages in small chronological chunks and only proposes unknown active names. It does not change current presence or sidecar cadence.</div>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end;flex-shrink:0">
+                <label style="font-size:11px;color:var(--rst-text-muted)">Recent
+                    <select id="rst-missed-char-window" style="width:58px;margin-left:3px">
+                        ${[20, 30, 50, 100].map((n) => `<option value="${n}"${n === (settings.debugMissedCharacterScan?.messageCount || 30) ? " selected" : ""}>${n}</option>`).join("")}
+                    </select>
+                </label>
+                <label style="font-size:11px;color:var(--rst-text-muted)">Chunk
+                    <select id="rst-missed-char-chunk" style="width:52px;margin-left:3px">
+                        ${[3, 5, 7, 10].map((n) => `<option value="${n}"${n === (settings.debugMissedCharacterScan?.chunkSize || 5) ? " selected" : ""}>${n}</option>`).join("")}
+                    </select>
+                </label>
+                <button id="rst-scan-missed-chars-btn" class="rst-btn"><i class="fa-solid fa-user-plus"></i> Scan</button>
+            </div>
+        </div>
         <div class="rst-setting-row" style="border-bottom:none">
             <div>
                 <div class="rst-setting-label">Scan for Threshold Locks</div>
@@ -135,28 +276,173 @@ function renderDebugSettings($pane, settings) {
         toastr?.info?.(`Debug logging ${on ? "enabled" : "disabled"}.`, "Relationship Stat Tracker");
     });
 
+    $card.find("#rst-missed-char-window").on("change", function () {
+        saveSetting("debugMissedCharacterScan.messageCount", parseInt($(this).val(), 10) || 30);
+    });
+    $card.find("#rst-missed-char-chunk").on("change", function () {
+        saveSetting("debugMissedCharacterScan.chunkSize", parseInt($(this).val(), 10) || 5);
+    });
+
+    $card.find("#rst-scan-missed-chars-btn").on("click", async function () {
+        const rstScopeMissed = captureChatScope();
+        const $btn = $(this);
+        const messageCount = parseInt($card.find("#rst-missed-char-window").val(), 10) || 30;
+        const chunkSize = parseInt($card.find("#rst-missed-char-chunk").val(), 10) || 5;
+        saveSetting("debugMissedCharacterScan.messageCount", messageCount);
+        saveSetting("debugMissedCharacterScan.chunkSize", chunkSize);
+
+        $btn.prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Scanning...');
+        try {
+            const result = await rstScopeMissed.wait(() => scanMissedCharacters({
+                messageCount,
+                chunkSize,
+                shouldContinue: () => rstScopeMissed.isCurrent(),
+                onProgress: (current, total) => {
+                    if (!rstScopeMissed.isCurrent()) return;
+                    $btn.html(`<i class="fa-solid fa-spinner fa-spin"></i> ${current}/${total}`);
+                },
+            }));
+
+            if (!rstScopeMissed.isCurrent() || result.cancelled) return;
+
+            const candidates = Array.isArray(result.candidates) ? result.candidates : [];
+            if (!candidates.length) {
+                const suffix = result.failedChunks
+                    ? ` ${result.failedChunks} chunk${result.failedChunks === 1 ? "" : "s"} could not be validated; rerun if needed.`
+                    : "";
+                toastr?.info?.(`Missed-character scan found no unknown active NPCs in the last ${result.scannedMessages} narrative messages.${suffix}`, "Relationship Stat Tracker");
+                return;
+            }
+
+            let createdCount = 0;
+            let ignoredCount = 0;
+            let dismissedCount = 0;
+            for (const candidate of candidates) {
+                if (!rstScopeMissed.isCurrent()) return;
+                const name = String(candidate?.name || "").trim();
+                if (!name) continue;
+
+                // A previous popup in this pass may already have created an alias-equivalent profile.
+                if (findCharacterByName(name) || findCharacterByFuzzyName(name)) continue;
+
+                const decision = await showNewCharacterDetected(
+                    name,
+                    () => rstScopeMissed.isCurrent(),
+                    { historical: true },
+                );
+                if (!rstScopeMissed.isCurrent()) return;
+
+                if (decision === true) {
+                    createdCount++;
+                } else if (decision === false) {
+                    ignoredCount++;
+                    const persisted = await Promise.resolve(addNamesToBlacklist(name, true));
+                    if (persisted === false) {
+                        toastr?.warning?.(`Ignored ${name}, but its blacklist entry could not be confirmed on disk.`);
+                    }
+                } else {
+                    dismissedCount++;
+                }
+            }
+
+            const failedNote = result.failedChunks
+                ? ` ${result.failedChunks}/${result.totalChunks} chunks failed validation.`
+                : "";
+            toastr?.success?.(
+                `Catch-up scan complete: ${createdCount} created, ${ignoredCount} ignored, ${dismissedCount} dismissed.${failedNote}`,
+                "Relationship Stat Tracker",
+            );
+        } catch (err) {
+            if (err?.code === "RST_STALE_CHAT") return;
+            console.error("[RST] Missed-character catch-up scan failed:", err);
+            toastr?.error?.(err?.message || "Missed-character catch-up scan failed. Check the console and sidecar connection.", "Relationship Stat Tracker");
+        } finally {
+            $btn.prop("disabled", false).html('<i class="fa-solid fa-user-plus"></i> Scan');
+        }
+    });
+
+    $card.find("#rst-preview-conditions-btn").on("click", async function () {
+    const rstScope1 = captureChatScope();
+
+        const rows = [];
+        for (const character of getAllCharacters()) {
+            const conditions = Array.isArray(character.relationshipConditions) ? character.relationshipConditions : [];
+            if (!conditions.length) continue;
+            rows.push(`<h3>${escapeHtml(character.name || "Unnamed character")}</h3>`);
+            for (const condition of conditions) {
+                const def = getRelationshipConditionDefinition(condition?.type);
+                rows.push(`<div class="rst-pending-system-item">
+                    <div class="rst-pending-system-name">${escapeHtml(def?.label || condition?.type || "Unknown status")}</div>
+                    <div><b>Active because:</b> ${escapeHtml(condition?.reason || def?.meaning || "(no reason stored)")}</div>
+                    <div><b>Resolves when:</b> ${escapeHtml(condition?.resolution || "(no resolution rule stored)")}</div>
+                    <div><b>Internal stat-update effect:</b> ${escapeHtml(def?.effect || "(unknown status type)")}</div>
+                </div>`);
+            }
+        }
+        const html = rows.length
+            ? `<div class="rst-condition-debug-preview">${rows.join("")}</div>`
+            : '<div class="rst-empty">No active temporary relationship statuses exist in this chat.</div>';
+        const popup = new Popup(html, POPUP_TYPE.TEXT, "", { wide: true, allowVerticalScrolling: true });
+        await rstScope1.wait(() => (popup.show()));
+    });
+
+    $card.find("#rst-review-conditions-btn").on("click", async function () {
+    const rstScope2 = captureChatScope();
+
+        const pending = getPendingConditionScan();
+        if (!pending) return toastr?.info?.("No pending temporary-status backfill to review.");
+        await rstScope2.wait(() => (reviewConditionScanResults(pending)));
+    });
+
+    $card.find("#rst-scan-conditions-btn").on("click", async function () {
+    const rstScope3 = captureChatScope();
+
+        const $btn = $(this);
+        $btn.prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Scanning...');
+        try {
+            const results = await rstScope3.wait(() => (scanHistoricalConditions((current, total) => {
+    if (!rstScope3.isCurrent()) return;
+
+                $btn.html(`<i class="fa-solid fa-spinner fa-spin"></i> ${current}/${total}`);
+            })));
+            if (!results.length) return toastr?.info?.("No character history was available to scan.");
+            savePendingConditionScan(results);
+            $card.find("#rst-review-conditions-btn").show();
+            await rstScope3.wait(() => (reviewConditionScanResults(results)));
+        } catch (err) {
+            console.error("[RST] Temporary-status backfill failed:", err);
+            toastr?.error?.("Temporary-status backfill stopped without applying partial results. Check the console and connection.");
+        } finally {
+            $btn.prop("disabled", false).html('<i class="fa-solid fa-tags"></i> Backfill');
+        }
+    });
+
     $card.find("#rst-review-milestones-btn").on("click", async function () {
+    const rstScope4 = captureChatScope();
+
         const pending = getPendingMilestoneScan();
         if (!pending || pending.length === 0) {
             toastr?.info?.("No pending milestone backfill to review.");
             $card.find("#rst-review-milestones-btn").hide();
             return;
         }
-        await reviewMilestoneScanResults(pending);
+        await rstScope4.wait(() => (reviewMilestoneScanResults(pending)));
     });
 
     $card.find("#rst-scan-milestones-btn").on("click", async function () {
+    const rstScope5 = captureChatScope();
+
         const $btn = $(this);
         $btn.prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Scanning...');
         try {
-            const results = await scanHistoricalMilestones();
+            const results = await rstScope5.wait(() => (scanHistoricalMilestones()));
             if (!results || results.length === 0) {
                 toastr?.info?.("Milestone backfill complete — no durable milestones were proposed.", "Relationship Stat Tracker");
                 return;
             }
             savePendingMilestoneScan(results);
             $card.find("#rst-review-milestones-btn").show();
-            await reviewMilestoneScanResults(results);
+            await rstScope5.wait(() => (reviewMilestoneScanResults(results)));
         } catch (err) {
             console.error("[RST] Milestone backfill error:", err);
             toastr?.error?.("Milestone backfill failed. Check the console and connection settings.");
@@ -166,27 +452,31 @@ function renderDebugSettings($pane, settings) {
     });
 
     $card.find("#rst-review-scan-btn").on("click", async function () {
+    const rstScope6 = captureChatScope();
+
         const pending = getPendingLockScan();
         if (!pending || pending.length === 0) {
             toastr?.info?.("No pending lock scan to review.");
             $card.find("#rst-review-scan-btn").hide();
             return;
         }
-        await reviewLockScanResults(pending);
+        await rstScope6.wait(() => (reviewLockScanResults(pending)));
     });
 
     $card.find("#rst-scan-locks-btn").on("click", async function () {
+    const rstScope7 = captureChatScope();
+
         const $btn = $(this);
         $btn.prop("disabled", true).html('<i class="fa-solid fa-spinner fa-spin"></i> Scanning...');
         try {
-            const results = await scanForLocks();
+            const results = await rstScope7.wait(() => (scanForLocks()));
             if (!results || results.length === 0) {
                 toastr?.info?.("Scan complete — no new locks proposed.", "Relationship Stat Tracker");
                 return;
             }
             savePendingLockScan(results);
             $card.find("#rst-review-scan-btn").show();
-            await reviewLockScanResults(results);
+            await rstScope7.wait(() => (reviewLockScanResults(results)));
         } catch (err) {
             console.error("[RST] Lock scan error:", err);
             toastr?.error?.("Lock scan failed. Check the console and your connection settings.");
@@ -196,16 +486,101 @@ function renderDebugSettings($pane, settings) {
     });
 }
 
+// ─── Temporary-status backfill review (reopenable) ───────
+
+async function reviewConditionScanResults(results) {
+    const rstScope8 = captureChatScope();
+
+    const blocks = [];
+    for (const r of results) {
+        const currentCount = Array.isArray(r.previousConditions) ? r.previousConditions.length : 0;
+        const final = Array.isArray(r.finalConditions) ? r.finalConditions : [];
+        const trail = Array.isArray(r.transitions) ? r.transitions : [];
+        if (!currentCount && !final.length && !trail.length) continue;
+        const finalRows = final.length ? final.map((condition) => {
+    if (!rstScope8.isCurrent()) return;
+
+            const def = getRelationshipConditionDefinition(condition.type);
+            return `<div class="rst-milestone-scan-content"><div><span class="rst-scan-tag soft">ACTIVE</span> <b>${escapeHtml(def?.label || condition.type)}</b></div>
+                <div class="rst-scan-why">${escapeHtml(condition.reason)}</div>
+                <div class="rst-scan-why"><b>Resolves when:</b> ${escapeHtml(condition.resolution)}</div></div>`;
+        }).join("") : '<div class="rst-scan-why"><b>Final state:</b> No active temporary statuses.</div>';
+        const trailRows = trail.length ? trail.map((t) => {
+    if (!rstScope8.isCurrent()) return;
+
+            const def = getRelationshipConditionDefinition(t.type);
+            return `<li><b>${escapeHtml(String(t.op || "").toUpperCase())} ${escapeHtml(def?.label || t.type)}</b> · messages ${escapeHtml(t.messageRange?.start)}–${escapeHtml(t.messageRange?.end)}${t.reason ? ` — ${escapeHtml(t.reason)}` : ""}</li>`;
+        }).join("") : "<li>No transitions detected.</li>";
+        blocks.push(`<label class="rst-milestone-scan-row">
+            <input type="checkbox" class="rst-condition-scan-pick" data-charid="${escapeHtml(r.characterId)}" checked>
+            <div class="rst-milestone-scan-content" style="width:100%"><div class="rst-scan-stat">${escapeHtml(r.characterName)}</div>
+                <div class="rst-scan-why">Stored now: ${currentCount} · Reconstructed final: ${final.length}</div>${finalRows}
+                <details><summary>Chronological transition trail (${trail.length})</summary><ol>${trailRows}</ol></details>
+            </div></label>`);
+    }
+    const html = `<div class="rst-scan-review"><div class="rst-scan-summary">Apply replaces each selected character's current temporary statuses with the reconstructed end-of-chat state. Untick any character you do not want changed. Closing keeps this review.</div>
+        ${blocks.join("") || '<div class="rst-empty">No status changes were reconstructed.</div>'}
+        <label class="rst-scan-discard"><input type="checkbox" id="rst-condition-discard-chk"> Discard this status scan instead of keeping it</label></div>`;
+    const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Apply selected", cancelButton: "Close" });
+    const showPromise = popup.show();
+    const $dlg = $(popup.dlg);
+    const result = await rstScope8.wait(() => (showPromise));
+    const discard = !!$dlg.find("#rst-condition-discard-chk")[0]?.checked;
+    if (result !== POPUP_RESULT.AFFIRMATIVE) {
+        if (discard) {
+            savePendingConditionScan(null);
+            $("#rst-review-conditions-btn").hide();
+            toastr?.info?.("Temporary-status scan discarded.");
+        } else toastr?.info?.("Temporary-status scan kept for later review.");
+        return;
+    }
+    const selected = new Set();
+    $dlg.find(".rst-condition-scan-pick:checked").each(function () {
+    if (!rstScope8.isCurrent()) return;
+ if (this.dataset.charid) selected.add(this.dataset.charid); });
+    const { getCharacterProfile, updateCharacterProfile } = await rstScope8.wait(() => (import("../data/characters.js")));
+    for (const r of results) {
+        if (!selected.has(r.characterId)) continue;
+        const current = getCharacterProfile(r.characterId);
+        if (!current || JSON.stringify(current.relationshipConditions || []) !== JSON.stringify(r.previousConditions || [])) {
+            toastr?.warning?.("Statuses changed since this backfill began. Run a fresh backfill before replacing them.");
+            return;
+        }
+    }
+    const now = Date.now();
+    let applied = 0;
+    for (const r of results) {
+        if (!selected.has(r.characterId) || !getCharacterProfile(r.characterId)) continue;
+        const conditions = (r.finalConditions || []).map((condition, index) => ({
+            ...condition,
+            id: `condition_backfill_${condition.type}_${now}_${index}`,
+            startedAt: now,
+            source: "condition_backfill",
+        }));
+        updateCharacterProfile(r.characterId, { relationshipConditions: conditions });
+        applied++;
+    }
+    savePendingConditionScan(null);
+    $("#rst-review-conditions-btn").hide();
+    const { updateInjection } = await rstScope8.wait(() => (import("../inject/promptInjector.js")));
+    updateInjection();
+    toastr?.success?.(`Applied reconstructed temporary-status state to ${applied} character${applied === 1 ? "" : "s"}.`);
+}
+
 // ─── Milestone-backfill review (reopenable) ───────────────
 
 async function reviewMilestoneScanResults(results) {
+    const rstScope9 = captureChatScope();
+
     const blocks = [];
     let total = 0;
     for (const r of results) {
         const rows = (r.milestones || []).map((m, index) => {
+    if (!rstScope9.isCurrent()) return;
+
             total++;
             const domains = Array.isArray(m.domains) && m.domains.length
-                ? `<span class="rst-scan-cap">${m.domains.join(" / ")}</span>`
+                ? `<span class="rst-scan-cap">${escapeHtml(m.domains.join(" / "))}</span>`
                 : "";
             return `<label class="rst-milestone-scan-row">
                 <input type="checkbox" class="rst-milestone-scan-pick" data-charid="${escapeHtml(r.characterId)}" data-index="${index}" checked>
@@ -229,8 +604,8 @@ async function reviewMilestoneScanResults(results) {
     </div>`;
     const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Apply selected", cancelButton: "Close" });
     const showPromise = popup.show();
-    const $dlg = $("dialog.popup").last();
-    const result = await showPromise;
+    const $dlg = $(popup.dlg);
+    const result = await rstScope9.wait(() => (showPromise));
     const proceed = result === POPUP_RESULT.AFFIRMATIVE;
     const discardChecked = !!($dlg.find("#rst-milestone-discard-chk")[0]?.checked);
 
@@ -247,6 +622,8 @@ async function reviewMilestoneScanResults(results) {
 
     const selected = new Map();
     $dlg.find(".rst-milestone-scan-pick").each(function () {
+    if (!rstScope9.isCurrent()) return;
+
         if (!this.checked) return;
         const charId = this.dataset.charid;
         const index = Number(this.dataset.index);
@@ -255,7 +632,7 @@ async function reviewMilestoneScanResults(results) {
         selected.get(charId).add(index);
     });
 
-    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    const { getCharacterProfile, updateCharacterProfile } = await rstScope9.wait(() => (import("../data/characters.js")));
     let applied = 0;
     const now = Date.now();
     for (const r of results) {
@@ -289,8 +666,8 @@ async function reviewMilestoneScanResults(results) {
     $("#rst-review-milestones-btn").hide();
     toastr?.success?.(`Applied ${applied} retroactive milestone${applied === 1 ? "" : "s"}.`, "Relationship Stat Tracker");
 
-    const { renderLibraryTab } = await import("./library.js");
-    const { getPane } = await import("./panel.js");
+    const { renderLibraryTab } = await rstScope9.wait(() => (import("./library.js")));
+    const { getPane } = await rstScope9.wait(() => (import("./panel.js")));
     renderLibraryTab(getPane("lib"));
 }
 
@@ -305,10 +682,14 @@ async function reviewMilestoneScanResults(results) {
  * @param {Array} results
  */
 async function reviewLockScanResults(results) {
+    const rstScope10 = captureChatScope();
+
     let totalHard = 0, totalSoft = 0;
     const charBlocks = [];
     for (const r of results) {
         const hardRows = (r.hardLocks || []).map((l) => {
+    if (!rstScope10.isCurrent()) return;
+
             totalHard++;
             const reason = escapeHtml(l.reason || "");
             return `<div class="rst-scan-lock">
@@ -319,6 +700,8 @@ async function reviewLockScanResults(results) {
             </div>`;
         }).join("");
         const softRows = (r.softLocks || []).map((l) => {
+    if (!rstScope10.isCurrent()) return;
+
             totalSoft++;
             const cond = escapeHtml(l.condition || "");
             return `<div class="rst-scan-lock">
@@ -343,8 +726,8 @@ async function reviewLockScanResults(results) {
         </div>`;
     const popup = new Popup(html, POPUP_TYPE.CONFIRM, "", { okButton: "Apply selected", cancelButton: "Close" });
     const showPromise = popup.show();
-    const $dlg = $("dialog.popup").last();
-    const proceedResult = await showPromise;
+    const $dlg = $(popup.dlg);
+    const proceedResult = await rstScope10.wait(() => (showPromise));
     const proceed = proceedResult === POPUP_RESULT.AFFIRMATIVE;
 
     const discardChecked = !!($dlg.find("#rst-scan-discard-chk")[0]?.checked);
@@ -363,10 +746,12 @@ async function reviewLockScanResults(results) {
 
     const selectedIds = new Set();
     $dlg.find(".rst-scan-pick").each(function () {
+    if (!rstScope10.isCurrent()) return;
+
         if (this.checked && this.dataset.charid) selectedIds.add(this.dataset.charid);
     });
 
-    const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
+    const { getCharacterProfile, updateCharacterProfile } = await rstScope10.wait(() => (import("../data/characters.js")));
     let appliedHard = 0, appliedSoft = 0, skippedChars = 0;
     for (const r of results) {
         if (!selectedIds.has(r.characterId)) { skippedChars++; continue; }
@@ -388,8 +773,8 @@ async function reviewLockScanResults(results) {
             updateCharacterProfile(r.characterId, { hardLocks: prof.hardLocks });
         }
         if (prof.softLocks) {
-            const { getSoftLockAvailability } = await import("../data/characters.js");
-            const { getClosedSceneCountForChar } = await import("../data/scenes.js");
+            const { getSoftLockAvailability } = await rstScope10.wait(() => (import("../data/characters.js")));
+            const { getClosedSceneCountForChar } = await rstScope10.wait(() => (import("../data/scenes.js")));
             const sceneCount = getClosedSceneCountForChar(r.characterId);
             const avail = getSoftLockAvailability(prof, sceneCount);
             if (avail.allowed) {
@@ -420,6 +805,7 @@ async function reviewLockScanResults(results) {
 // ─── Connection Profiles ──────────────────────────────────
 
 function renderConnectionProfiles($card, settings) {
+    ensureConnectionProfileRefresh();
     const $twoCol = $(`
         <div class="rst-two-col" style="margin-bottom:10px">
             <div>
@@ -493,35 +879,33 @@ function renderConnectionProfiles($card, settings) {
     }
     rstRenderNoThinkRows();
 
-    try {
-        ConnectionManagerRequestService.handleDropdown(
-            "#rst-conn-stat",
-            settings.connections?.statUpdateLLM || "",
-            (profile) => { saveSetting("connections.statUpdateLLM", profile?.id || ""); if (settings.connections) settings.connections.statUpdateLLM = profile?.id || ""; rstRenderNoThinkRows(); },
-        );
-    } catch (err) {
-        console.warn("[RST] Connection Manager not available for stat update LLM:", err);
-    }
+    bindConnectionDropdown(
+        $card.find("#rst-conn-stat"),
+        settings.connections?.statUpdateLLM || "",
+        (profile) => { saveSetting("connections.statUpdateLLM", profile?.id || ""); if (settings.connections) settings.connections.statUpdateLLM = profile?.id || ""; rstRenderNoThinkRows(); },
+    );
+    bindConnectionDropdown(
+        $card.find("#rst-conn-sidecar"),
+        settings.connections?.sidecarLLM || "",
+        (profile) => { saveSetting("connections.sidecarLLM", profile?.id || ""); if (settings.connections) settings.connections.sidecarLLM = profile?.id || ""; rstRenderNoThinkRows(); },
+    );
+    bindConnectionDropdown(
+        $card.find("#rst-conn-autogen"),
+        settings.connections?.autoGenLLM || "",
+        (profile) => { saveSetting("connections.autoGenLLM", profile?.id || ""); if (settings.connections) settings.connections.autoGenLLM = profile?.id || ""; rstRenderNoThinkRows(); },
+    );
 
-    try {
-        ConnectionManagerRequestService.handleDropdown(
-            "#rst-conn-sidecar",
-            settings.connections?.sidecarLLM || "",
-            (profile) => { saveSetting("connections.sidecarLLM", profile?.id || ""); if (settings.connections) settings.connections.sidecarLLM = profile?.id || ""; rstRenderNoThinkRows(); },
-        );
-    } catch (err) {
-        console.warn("[RST] Connection Manager not available for sidecar LLM:", err);
-    }
-
-    try {
-        ConnectionManagerRequestService.handleDropdown(
-            "#rst-conn-autogen",
-            settings.connections?.autoGenLLM || "",
-            (profile) => { saveSetting("connections.autoGenLLM", profile?.id || ""); if (settings.connections) settings.connections.autoGenLLM = profile?.id || ""; rstRenderNoThinkRows(); },
-        );
-    } catch (err) {
-        console.warn("[RST] Connection Manager not available for auto-gen LLM:", err);
-    }
+    const $saveConnections = appendSectionSaveButton($card, "rst-save-connection-profiles", "Save Connection Profiles");
+    $saveConnections.on("click", () => commitSectionNow($saveConnections, "Connection Profiles", () => {
+        const statId = String($card.find("#rst-conn-stat").val() || settings.connections?.statUpdateLLM || "");
+        const sidecarId = String($card.find("#rst-conn-sidecar").val() || settings.connections?.sidecarLLM || "");
+        const autoGenId = String($card.find("#rst-conn-autogen").val() || settings.connections?.autoGenLLM || "");
+        saveSetting("connections.statUpdateLLM", statId);
+        saveSetting("connections.sidecarLLM", sidecarId);
+        saveSetting("connections.autoGenLLM", autoGenId);
+        saveSetting("noThinkProfiles", { ...(settings.noThinkProfiles || {}) });
+        saveSetting("noThinkHardProfiles", { ...(settings.noThinkHardProfiles || {}) });
+    }));
 }
 
 // ─── Batch Scan ───────────────────────────────────────────
@@ -637,6 +1021,8 @@ function renderBatchScan($pane, settings) {
     `);
 
     $card.find("#rst-batch-scan").on("click", async function () {
+    const rstScope11 = captureChatScope();
+
         const $btn = $(this);
         const $progress = $card.find("#rst-batch-progress");
         const $fill = $progress.find(".rst-progress-bar-fill");
@@ -653,11 +1039,13 @@ function renderBatchScan($pane, settings) {
         $detail.text("Starting batch scan...");
         $stats.text("Elapsed: 0s | API calls: 0/0");
 
-        const { setProgressCallback, updateRateLimiterSettings } = await import("../llm/connections.js");
+        const { setProgressCallback, updateRateLimiterSettings } = await rstScope11.wait(() => (import("../llm/connections.js")));
         const currentSettings = getSettings();
         updateRateLimiterSettings(currentSettings.batchScan || {});
 
         setProgressCallback((data) => {
+    if (!rstScope11.isCurrent()) return;
+
             const percent = data.total > 0 ? Math.round((data.current / data.total) * 100) : 0;
             $fill.css("width", percent + "%");
             $phase.text(`Phase ${data.phase}/${data.totalPhases}: ${data.label}`);
@@ -671,8 +1059,8 @@ function renderBatchScan($pane, settings) {
         });
 
         try {
-            const { runBatchScan } = await import("../llm/batchScan.js");
-            const result = await runBatchScan();
+            const { runBatchScan } = await rstScope11.wait(() => (import("../llm/batchScan.js")));
+            const result = await rstScope11.wait(() => (runBatchScan()));
 
             setProgressCallback(null);
 
@@ -682,10 +1070,10 @@ function renderBatchScan($pane, settings) {
                 $detail.text(`Done! ${result.scenesCreated} scenes created, ${result.profilesCreated.length} new profiles.`);
                 $stats.text("Refreshing UI...");
 
-                const { renderHomeTab } = await import("./home.js");
-                const { renderLibraryTab } = await import("./library.js");
-                const { renderScenesTab } = await import("./scenes.js");
-                const { getPane } = await import("./panel.js");
+                const { renderHomeTab } = await rstScope11.wait(() => (import("./home.js")));
+                const { renderLibraryTab } = await rstScope11.wait(() => (import("./library.js")));
+                const { renderScenesTab } = await rstScope11.wait(() => (import("./scenes.js")));
+                const { getPane } = await rstScope11.wait(() => (import("./panel.js")));
 
                 renderHomeTab(getPane("home"));
                 renderLibraryTab(getPane("lib"));
@@ -696,7 +1084,7 @@ function renderBatchScan($pane, settings) {
             }
         } catch (err) {
             console.error("[RST] Batch scan failed:", err);
-            const { setProgressCallback } = await import("../llm/connections.js");
+            const { setProgressCallback } = await rstScope11.wait(() => (import("../llm/connections.js")));
             setProgressCallback(null);
             $detail.text("Batch scan failed. Check console for details.");
             toastr?.error?.("Batch scan failed. See console for details.");
@@ -708,39 +1096,80 @@ function renderBatchScan($pane, settings) {
     });
 
     $card.find("#rst-bs-scene-tokens").on("change", async function () {
+    const rstScope12 = captureChatScope();
+
         saveSetting("batchScan.sceneDetectionMaxTokens", parseInt($(this).val(), 10));
     });
     $card.find("#rst-bs-stat-tokens").on("change", async function () {
+    const rstScope13 = captureChatScope();
+
         saveSetting("batchScan.initialStatMaxTokens", parseInt($(this).val(), 10));
     });
     $rateCard.find("#rst-bs-rpm").on("change", async function () {
+    const rstScope14 = captureChatScope();
+
         saveSetting("batchScan.requestsPerMinute", parseInt($(this).val(), 10));
-        const { updateRateLimiterSettings } = await import("../llm/connections.js");
+        const { updateRateLimiterSettings } = await rstScope14.wait(() => (import("../llm/connections.js")));
         updateRateLimiterSettings(getSettings().batchScan || {});
     });
     $rateCard.find("#rst-bs-retries").on("change", async function () {
+    const rstScope15 = captureChatScope();
+
         saveSetting("batchScan.maxRetries", parseInt($(this).val(), 10));
-        const { updateRateLimiterSettings } = await import("../llm/connections.js");
+        const { updateRateLimiterSettings } = await rstScope15.wait(() => (import("../llm/connections.js")));
         updateRateLimiterSettings(getSettings().batchScan || {});
     });
     $rateCard.find("#rst-bs-delay").on("change", async function () {
+    const rstScope16 = captureChatScope();
+
         saveSetting("batchScan.baseRetryDelay", parseInt($(this).val(), 10));
-        const { updateRateLimiterSettings } = await import("../llm/connections.js");
+        const { updateRateLimiterSettings } = await rstScope16.wait(() => (import("../llm/connections.js")));
         updateRateLimiterSettings(getSettings().batchScan || {});
     });
     $advCard.find("#rst-bs-scene-delay").on("change", async function () {
+    const rstScope17 = captureChatScope();
+
         saveSetting("batchScan.perSceneDelay", parseInt($(this).val(), 10));
     });
     $advCard.find("#rst-bs-phase-delay").on("change", async function () {
+    const rstScope18 = captureChatScope();
+
         saveSetting("batchScan.interPhaseDelay", parseInt($(this).val(), 10));
     });
     $advCard.find("#rst-bs-combine").on("change", async function () {
+    const rstScope19 = captureChatScope();
+
         saveSetting("batchScan.combineRanges", $(this).is(":checked"));
     });
 
     $pane.append($card);
     $pane.append($rateCard);
     $pane.append($advCard);
+
+    const $saveBatch = appendSectionSaveButton($advCard, "rst-save-batch-settings", "Save Batch Scan Settings");
+    $saveBatch.on("click", () => commitSectionNow($saveBatch, "Batch Scan settings", async () => {
+        const readInt = ($el, fallback, min, max) => {
+            let value = parseInt($el.val(), 10);
+            if (!Number.isFinite(value)) value = fallback;
+            value = Math.max(min, Math.min(max, value));
+            $el.val(value);
+            return value;
+        };
+
+        const next = {
+            sceneDetectionMaxTokens: readInt($card.find("#rst-bs-scene-tokens"), 4000, 1000, 16000),
+            initialStatMaxTokens: readInt($card.find("#rst-bs-stat-tokens"), 3000, 1000, 16000),
+            requestsPerMinute: readInt($rateCard.find("#rst-bs-rpm"), 10, 1, 60),
+            maxRetries: readInt($rateCard.find("#rst-bs-retries"), 3, 0, 10),
+            baseRetryDelay: readInt($rateCard.find("#rst-bs-delay"), 1000, 500, 30000),
+            perSceneDelay: readInt($advCard.find("#rst-bs-scene-delay"), 0, 0, 10000),
+            interPhaseDelay: readInt($advCard.find("#rst-bs-phase-delay"), 0, 0, 30000),
+            combineRanges: $advCard.find("#rst-bs-combine").is(":checked"),
+        };
+        saveSetting("batchScan", { ...(getSettings().batchScan || {}), ...next });
+        const { updateRateLimiterSettings } = await import("../llm/connections.js");
+        updateRateLimiterSettings(getSettings().batchScan || {});
+    }));
 }
 
 // ─── Scene Summary Prompt ─────────────────────────────────
@@ -783,14 +1212,21 @@ function renderSceneSummaryPrompt($pane, settings) {
         input.type = "file";
         input.accept = ".txt";
         input.onchange = async (e) => {
+    const rstScope20 = captureChatScope();
+
             const file = e.target.files[0];
             if (!file) return;
-            const text = await file.text();
+            const text = await rstScope20.wait(() => (file.text()));
             $("#rst-summary-prompt").val(text);
             saveSetting("sceneSummaryPrompt", text);
         };
         input.click();
     });
+
+    const $saveSummary = appendSectionSaveButton($card, "rst-save-scene-summary", "Save Scene Summary Prompt");
+    $saveSummary.on("click", () => commitSectionNow($saveSummary, "Scene Summary Prompt", () => {
+        saveSetting("sceneSummaryPrompt", String($card.find("#rst-summary-prompt").val() || ""));
+    }));
 
     $pane.append($card);
 }
@@ -859,8 +1295,10 @@ function renderStatSettings($pane, settings) {
 
     // Commit the range explicitly as one object. Per-input change/blur saving
     // could lose a typed value if the panel closed before the browser emitted
-    // the field change event. The button also snapshots the rest of Stat Settings.
-    $card.find("#rst-save-stat-settings").on("click", function () {
+    // the field change event. The button snapshots the entire section and then
+    // calls SillyTavern's immediate settings save instead of waiting on debounce.
+    const $saveStatSettings = $card.find("#rst-save-stat-settings");
+    $saveStatSettings.on("click", () => commitSectionNow($saveStatSettings, "Stat Settings", () => {
         let min = parseInt($card.find("#rst-range-min").val(), 10);
         let max = parseInt($card.find("#rst-range-max").val(), 10);
         let chance = parseInt($card.find("#rst-crit-chance").val(), 10);
@@ -886,9 +1324,7 @@ function renderStatSettings($pane, settings) {
         saveSetting("hardLocks.enabled", $card.find("#rst-hardlocks-enabled").prop("checked"));
         saveSetting("softLocks.enabled", $card.find("#rst-softlocks-enabled").prop("checked"));
         saveSetting("softLocks.maxActive", maxSoftLocks);
-
-        toastr?.success?.(`Stat settings saved. Normal range: ${min} to +${max}.`, "Relationship Stat Tracker");
-    });
+    }));
 
     $card.find("#rst-crit-enabled").on("change", function () {
         saveSetting("criticalChanges.enabled", $(this).prop("checked"));
@@ -939,7 +1375,7 @@ function renderDetectionSettings($pane, settings) {
     `);
     $card.append(`
         <div class="rst-setting-row">
-            <div><div class="rst-setting-label">New character popup</div><div class="rst-setting-sub">Prompt for approval when an unknown character is detected</div></div>
+            <div><div class="rst-setting-label">New character popup</div><div class="rst-setting-sub">Prompt before creating an unknown character. When off, unknown names are ignored; existing profiles are still tracked.</div></div>
             <label class="rst-toggle"><input type="checkbox" id="rst-new-char-popup" ${settings.newCharPopup !== false ? "checked" : ""}><span class="rst-slider"></span></label>
         </div>
     `);
@@ -953,6 +1389,7 @@ function renderDetectionSettings($pane, settings) {
             <span id="rst-name-blacklist-status" class="rst-name-blacklist-status" aria-live="polite"></span>
         </div>
     `);
+    const $saveDetection = appendSectionSaveButton($card, "rst-save-detection-settings", "Save Detection Settings");
 
     $pane.append($card);
 
@@ -968,6 +1405,8 @@ function renderDetectionSettings($pane, settings) {
     $newCharacterPopup.on("change", function () { saveSetting("newCharPopup", $(this).prop("checked")); });
 
     async function saveBlacklist(immediate = false) {
+    const rstScope21 = captureChatScope();
+
         const $button = $blacklistButton;
         const $status = $blacklistStatus;
         const raw = $blacklistInput.val();
@@ -981,7 +1420,7 @@ function renderDetectionSettings($pane, settings) {
 
         let saved = false;
         try {
-            saved = await Promise.resolve(saveNameBlacklist(list, immediate));
+            saved = await rstScope21.wait(() => (Promise.resolve(saveNameBlacklist(list, immediate))));
             $blacklistInput.val((getNameBlacklist() || []).join(", "));
         } catch (err) {
             console.warn("[RST] Failed to save name blacklist.", err);
@@ -1016,6 +1455,18 @@ function renderDetectionSettings($pane, settings) {
         event.stopPropagation();
         saveBlacklist(true);
     });
+
+    $saveDetection.on("click", () => commitSectionNow($saveDetection, "Detection Settings", async () => {
+        saveSetting("scanFrequency", parseInt($scanFrequency.val(), 10) || 5);
+        saveSetting("messagesToScan", parseInt($messagesToScan.val(), 10) || 10);
+        saveSetting("newCharPopup", $newCharacterPopup.prop("checked"));
+
+        const savedBlacklist = await Promise.resolve(saveNameBlacklist(parseNameBlacklist($blacklistInput.val()), true));
+        if (savedBlacklist === false) throw new Error("Name blacklist could not be persisted.");
+        $blacklistInput.val((getNameBlacklist() || []).join(", "));
+        $blacklistStatus.text("Saved");
+        setTimeout(() => $blacklistStatus.text(""), 1800);
+    }));
 }
 
 // ─── Injection Settings ───────────────────────────────────
@@ -1030,34 +1481,89 @@ function renderInjectionSettings($pane, settings) {
     const formatOptions = [{ value: "stats_only", label: "Stats only" },{ value: "stats_and_narrative", label: "Stats + narrative" }].map((o) => `<option value="${o.value}"${o.value === (inj.format || "stats_and_narrative") ? " selected" : ""}>${o.label}</option>`).join("");
     $card.append(`<div class="rst-setting-row"><div><div class="rst-setting-label">Injection format</div><div class="rst-setting-sub">What gets included in the injected block</div></div><select id="rst-inject-format" style="width:160px;flex-shrink:0">${formatOptions}</select></div>`);
 
-    const placementOptions = [{ value: "top", label: "Top of system prompt" },{ value: "above_card", label: "Above character card" },{ value: "below_card", label: "Below character card" }].map((o) => `<option value="${o.value}"${o.value === (inj.placement || "above_card") ? " selected" : ""}>${o.label}</option>`).join("");
-    $card.append(`<div class="rst-setting-row"><div><div class="rst-setting-label">Injection placement</div><div class="rst-setting-sub">Where in the system prompt the block is inserted</div></div><select id="rst-inject-placement" style="width:160px;flex-shrink:0">${placementOptions}</select></div>`);
+    const placementOptions = [{ value: "top", label: "Before main prompt (legacy top)" },{ value: "above_card", label: "Before main prompt" },{ value: "below_card", label: "After main prompt" }].map((o) => `<option value="${o.value}"${o.value === (inj.placement || "above_card") ? " selected" : ""}>${o.label}</option>`).join("");
+    $card.append(`<div class="rst-setting-row"><div><div class="rst-setting-label">Injection placement</div><div class="rst-setting-sub">Before or after the main prompt; exact card order follows your preset</div></div><select id="rst-inject-placement" style="width:160px;flex-shrink:0">${placementOptions}</select></div>`);
 
     const roleOptions = [{ value: "system", label: "System" },{ value: "user", label: "User" },{ value: "assistant", label: "Assistant" }].map((o) => `<option value="${o.value}"${(o.value === (inj.libraryRefRole || "system")) ? " selected" : ""}>${o.label}</option>`).join("");
     $card.append(`<div class="rst-setting-row" style="border-top:1px solid var(--rst-border);padding-top:12px;margin-top:4px"><div><div class="rst-setting-label">Passive library reference</div><div class="rst-setting-sub">Inject library as freely-referenceable context — LLM can reference any tracked character's full relationship data when relevant</div></div><label class="rst-toggle"><input type="checkbox" id="rst-passive-ref" ${inj.passiveLibraryRef ? "checked" : ""}><span class="rst-slider"></span></label></div>`);
     $card.append(`<div class="rst-setting-row"><div><div class="rst-setting-label">Stat lookup tool (function calling)</div><div class="rst-setting-sub">Lets the main LLM request a character's stats on demand — even when they aren't present. Requires a Chat Completion backend with tool calling enabled.</div></div><label class="rst-toggle"><input type="checkbox" id="rst-stat-tool" ${inj.statToolEnabled !== false ? "checked" : ""}><span class="rst-slider"></span></label></div>`);
-    $card.append(`<div class="rst-setting-row"><div><div class="rst-setting-label">Library reference depth</div><div class="rst-setting-sub">Where in the context the library block is inserted (higher = later in context)</div></div><select id="rst-ref-depth" style="width:160px;flex-shrink:0"><option value="0"${(inj.libraryRefDepth === 0) ? " selected" : ""}>Top of prompt</option><option value="1"${(inj.libraryRefDepth === 1 || inj.libraryRefDepth === undefined) ? " selected" : ""}>Above character card</option><option value="2"${(inj.libraryRefDepth === 2) ? " selected" : ""}>Below character card</option></select></div>`);
+    $card.append(`<div class="rst-setting-row"><div><div class="rst-setting-label">Library reference depth</div><div class="rst-setting-sub">Chat depth counted backward from the newest message</div></div><select id="rst-ref-depth" style="width:160px;flex-shrink:0"><option value="0"${(inj.libraryRefDepth === 0) ? " selected" : ""}>Depth 0 (newest)</option><option value="1"${(inj.libraryRefDepth === 1 || inj.libraryRefDepth === undefined) ? " selected" : ""}>Depth 1</option><option value="2"${(inj.libraryRefDepth === 2) ? " selected" : ""}>Depth 2</option></select></div>`);
     $card.append(`<div class="rst-setting-row"><div><div class="rst-setting-label">Library reference role</div><div class="rst-setting-sub">Speaker role for the injected library block</div></div><select id="rst-ref-role" style="width:160px;flex-shrink:0">${roleOptions}</select></div>`);
+    const $saveInjection = appendSectionSaveButton($card, "rst-save-injection-settings", "Save Injection Settings");
 
     $pane.append($card);
 
-    $("#rst-inject-stats").on("change", async function () { saveSetting("injection.injectStats", $(this).prop("checked")); const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); });
-    $("#rst-inject-profile").on("change", async function () { saveSetting("injection.injectProfile", $(this).prop("checked")); const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); });
-    $("#rst-inject-format").on("change", async function () { saveSetting("injection.format", $(this).val()); const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); });
-    $("#rst-inject-placement").on("change", async function () { saveSetting("injection.placement", $(this).val()); const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); });
-    $("#rst-passive-ref").on("change", async function () { saveSetting("injection.passiveLibraryRef", $(this).prop("checked")); const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); });
+    $("#rst-inject-stats").on("change", async function () {
+    const rstScope22 = captureChatScope();
+ saveSetting("injection.injectStats", $(this).prop("checked")); const { updateInjection } = await rstScope22.wait(() => (import("../inject/promptInjector.js"))); updateInjection(); });
+    $("#rst-inject-profile").on("change", async function () {
+    const rstScope23 = captureChatScope();
+ saveSetting("injection.injectProfile", $(this).prop("checked")); const { updateInjection } = await rstScope23.wait(() => (import("../inject/promptInjector.js"))); updateInjection(); });
+    $("#rst-inject-format").on("change", async function () {
+    const rstScope24 = captureChatScope();
+ saveSetting("injection.format", $(this).val()); const { updateInjection } = await rstScope24.wait(() => (import("../inject/promptInjector.js"))); updateInjection(); });
+    $("#rst-inject-placement").on("change", async function () {
+    const rstScope25 = captureChatScope();
+ saveSetting("injection.placement", $(this).val()); const { updateInjection } = await rstScope25.wait(() => (import("../inject/promptInjector.js"))); updateInjection(); });
+    $("#rst-passive-ref").on("change", async function () {
+    const rstScope26 = captureChatScope();
+ saveSetting("injection.passiveLibraryRef", $(this).prop("checked")); const { updateInjection } = await rstScope26.wait(() => (import("../inject/promptInjector.js"))); updateInjection(); });
     $("#rst-stat-tool").on("change", function () { saveSetting("injection.statToolEnabled", $(this).prop("checked")); });
-    $("#rst-ref-depth").on("change", async function () { saveSetting("injection.libraryRefDepth", parseInt($(this).val(), 10)); const { updateInjection } = await import("../inject/promptInjector.js"); updateInjection(); });
-    $("#rst-ref-role").on("change", async function () { saveSetting("injection.libraryRefRole", $(this).val()); const { updatePassiveLibraryRef } = await import("../inject/promptInjector.js"); updatePassiveLibraryRef(); });
+    $("#rst-ref-depth").on("change", async function () {
+    const rstScope27 = captureChatScope();
+ saveSetting("injection.libraryRefDepth", parseInt($(this).val(), 10)); const { updateInjection } = await rstScope27.wait(() => (import("../inject/promptInjector.js"))); updateInjection(); });
+    $("#rst-ref-role").on("change", async function () {
+    const rstScope28 = captureChatScope();
+ saveSetting("injection.libraryRefRole", $(this).val()); const { updatePassiveLibraryRef } = await rstScope28.wait(() => (import("../inject/promptInjector.js"))); updatePassiveLibraryRef(); });
+
+    $saveInjection.on("click", () => commitSectionNow($saveInjection, "Injection Settings", async () => {
+        saveSetting("injection.injectStats", $card.find("#rst-inject-stats").prop("checked"));
+        saveSetting("injection.injectProfile", $card.find("#rst-inject-profile").prop("checked"));
+        saveSetting("injection.format", String($card.find("#rst-inject-format").val() || "stats_and_narrative"));
+        saveSetting("injection.placement", String($card.find("#rst-inject-placement").val() || "above_card"));
+        saveSetting("injection.passiveLibraryRef", $card.find("#rst-passive-ref").prop("checked"));
+        saveSetting("injection.statToolEnabled", $card.find("#rst-stat-tool").prop("checked"));
+        saveSetting("injection.libraryRefDepth", parseInt($card.find("#rst-ref-depth").val(), 10) || 0);
+        saveSetting("injection.libraryRefRole", String($card.find("#rst-ref-role").val() || "system"));
+
+        const { updateInjection, updatePassiveLibraryRef } = await import("../inject/promptInjector.js");
+        updateInjection();
+        updatePassiveLibraryRef();
+    }));
 }
 
 // ─── Data Section ─────────────────────────────────────────
 
 function renderDataSection($pane) {
+    const settings = getSettings();
+    const configuredMilestonesPerPage = Number.parseInt(settings.milestonesPerPage, 10);
+    const milestonesPerPage = Number.isFinite(configuredMilestonesPerPage)
+        ? Math.min(50, Math.max(1, configuredMilestonesPerPage))
+        : 5;
+    const $displayCard = $(
+        `<div class="rst-card">
+            <div class="rst-setting-row">
+                <div>
+                    <div class="rst-setting-label">Milestones per page</div>
+                    <div class="rst-setting-sub">Number of relationship milestones shown at once in each Character Library profile.</div>
+                </div>
+                <input type="number" id="rst-milestones-per-page" min="1" max="50" step="1" value="${milestonesPerPage}" style="width:72px">
+            </div>
+        </div>`
+    );
+    $displayCard.find("#rst-milestones-per-page").on("change", function () {
+        const value = Math.min(50, Math.max(1, Number.parseInt($(this).val(), 10) || 5));
+        $(this).val(value);
+        saveSetting("milestonesPerPage", value);
+        toastr?.success?.(`Character Library will show ${value} milestone${value === 1 ? "" : "s"} per page.`);
+    });
+
     const $btnRow = $(`<div class="rst-btn-row"><button class="rst-btn" id="rst-import-all">Import all</button><button class="rst-btn" id="rst-export-all">Export all</button></div>`);
 
     $btnRow.find("#rst-export-all").on("click", async () => {
-        const data = await exportAllData();
+    const rstScope29 = captureChatScope();
+
+        const data = await rstScope29.wait(() => (exportAllData()));
         const blob = new Blob([data], { type: "application/json" });
         const url = URL.createObjectURL(blob);
         const _cn = String(getContext()?.name2 || "chat").replace(/[^a-zA-Z0-9 _-]/g, "").trim().replace(/\s+/g, "_") || "chat";
@@ -1069,14 +1575,16 @@ function renderDataSection($pane) {
     $btnRow.find("#rst-import-all").on("click", () => {
         const input = document.createElement("input"); input.type = "file"; input.accept = ".json";
         input.onchange = async (e) => {
+    const rstScope30 = captureChatScope();
+
             const file = e.target.files[0]; if (!file) return;
-            const text = await file.text();
+            const text = await rstScope30.wait(() => (file.text()));
             const success = await importAllData(text);
-            if (success) { toastr?.success?.("Data imported successfully."); renderSettingsTab($pane); }
+            if (success) { toastr?.success?.("Data imported successfully."); renderSettingsTab(getPane("settings")); }
             else { toastr?.error?.("Failed to import data."); }
         };
         input.click();
     });
 
-    $pane.append($btnRow);
+    $pane.append($displayCard, $btnRow);
 }

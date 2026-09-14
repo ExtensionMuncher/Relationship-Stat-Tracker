@@ -9,8 +9,8 @@
  *
  * Why this exists:
  *   - Passive injection only covers characters the sidecar detects as present.
- *   - Sometimes the narrative references an absent character ("Mira wonders
- *     how Kellan feels about him now") and the model needs that character's
+ *   - Sometimes the narrative references an absent character and the model
+ *     needs that character's
  *     current stats to stay consistent.
  *   - Rather than injecting the entire library every message (expensive), the
  *     model deliberately asks for one character on demand.
@@ -51,14 +51,14 @@ export function registerStatLookupTool() {
     ToolManager.registerFunctionTool({
         name: TOOL_NAME,
         displayName: "Look Up Relationship Stats",
-        description: "Use when an NPC’s response depends on relationship standing, trajectory, temporary conditions, milestones, trust, locks, or progression with the persona or another character.",
+        description: "Use when an NPC’s response depends on their relationship standing, trajectory, temporary conditions, milestones, trust, locks, or progression with the persona.",
         stealth: false,
         parameters: {
             type: "object",
             properties: {
                 character: {
                     type: "string",
-                    description: "The full name of the character whose relationship stats you want to look up (e.g. 'Jane Doe'). Aliases and partial names are matched where possible.",
+                    description: "The full name of the character whose relationship stats you want to look up. Aliases and partial names are matched where possible.",
                 },
             },
             required: ["character"],
@@ -122,24 +122,6 @@ async function lookupStats(characterName) {
     const extras = [];
     const trajectory = deriveRelationshipTrajectory(profile);
     extras.push(`Trajectory: ${trajectory.label}`);
-
-    const conditions = Array.isArray(profile.relationshipConditions) ? profile.relationshipConditions : [];
-    if (conditions.length) {
-        extras.push("Active temporary conditions:");
-        for (const condition of conditions) {
-            const def = getRelationshipConditionDefinition(condition.type);
-            if (!def) continue;
-            extras.push(`- ${def.label}: ${condition.reason || def.meaning} Effect: ${def.effect}`);
-        }
-    }
-
-    const milestones = Array.isArray(profile.relationshipMilestones) ? profile.relationshipMilestones.slice(-3) : [];
-    if (milestones.length) {
-        extras.push("Recent relationship milestones:");
-        for (const milestone of milestones) {
-            extras.push(`- ${milestone.title}: ${milestone.description}`);
-        }
-    }
 
     return `${block}\n\n${extras.join("\n")}`;
 }

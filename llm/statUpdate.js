@@ -1,3 +1,7 @@
+import { normalizeNameForMatch } from "../lib/nameIdentity.js";
+import { captureChatScope } from "../lib/chatScope.js";
+import { isMeaningfulCharacterUpdate, snapshotRelationshipState } from "../data/approval.js";
+import { inferActivePresenceMode } from "./sidecar.js";
 /**
  * statUpdate.js — Main LLM: scene review + stat generation
  * Reviews closed scenes, generates stat changes, commentary, dynamic titles,
@@ -8,34 +12,40 @@ import { chat } from "../../../../../script.js";
 import { getContext } from "../../../../extensions.js";
 import { getPersonaContext } from "./connections.js";
 import { makeRequest } from "./connections.js";
-import { getSettings, isNameBlacklisted } from "../data/storage.js";
-import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter, getSoftLockAvailability, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
+import { getSettings, isNameBlacklisted, getChatData } from "../data/storage.js";
+import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter, deleteCharacter, getSoftLockAvailability, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneTitle, getClosedSceneCount, getClosedSceneCountForChar } from "../data/scenes.js";
 import { dlog } from "../lib/debug.js";
 import { deriveRelationshipTrajectory } from "../data/trajectory.js";
-import { applyRelationshipInertia, getRelationshipInertiaContext } from "../data/inertia.js";
+import { applyRelationshipInertia, assertRelationshipInertiaProcessed } from "../data/inertia.js";
 import { getRelationshipConditionCatalogForPrompt, getRelationshipConditionDefinition, MAX_ACTIVE_RELATIONSHIP_CONDITIONS, MAX_NEW_CONDITIONS_PER_UPDATE } from "../data/conditions.js";
+import { isNarrativeMessage } from "../lib/chatMessages.js";
 
 // ─── Auto-created Character Tracking ──────────────────────
 // Tracks which character IDs were auto-created during a generation cycle
 // so dismiss handlers can reliably clean them up without relying on
 // heuristic checks like `source === "auto_generated"`.
 /** @type {Set<string>} */
-let _autoCreatedIds = new Set();
+const autoCreatedByChat = new WeakMap();
+function autoCreatedIdsForChat() {
+    const data = getChatData();
+    if (!autoCreatedByChat.has(data)) autoCreatedByChat.set(data, new Set());
+    return autoCreatedByChat.get(data);
+}
 
 /**
  * Get the set of auto-created character IDs from the current generation cycle.
  * @returns {string[]}
  */
 export function getAutoCreatedIds() {
-    return [..._autoCreatedIds];
+    return [...autoCreatedIdsForChat()];
 }
 
 /**
  * Reset the auto-created IDs tracker for a new generation cycle.
  */
 export function resetAutoCreatedIds() {
-    _autoCreatedIds = new Set();
+    autoCreatedByChat.set(getChatData(), new Set());
 }
 
 // ─── Main Generation Function ─────────────────────────────
@@ -48,7 +58,18 @@ export function resetAutoCreatedIds() {
  * @param {string} [guidance] - Optional user guidance for regeneration
  * @returns {Promise<object>} The full update result
  */
+const runningUpdates = new WeakSet();
+export function isStatUpdateRunning() { return runningUpdates.has(getChatData()); }
 export async function generateStatUpdate(sceneId, guidance = "") {
+    const data = getChatData();
+    if (runningUpdates.has(data)) throw new Error("A stat update is already running in this chat.");
+    runningUpdates.add(data);
+    try { return await generateStatUpdateImpl(sceneId, guidance); }
+    finally { runningUpdates.delete(data); }
+}
+async function generateStatUpdateImpl(sceneId, guidance = "") {
+    const rstScope1 = captureChatScope();
+
     // Reset auto-created character tracker for this generation cycle
     resetAutoCreatedIds();
 
@@ -62,13 +83,11 @@ export async function generateStatUpdate(sceneId, guidance = "") {
     const sceneMessages = getSceneMessages(scene);
     const characters = getSceneCharacters(scene);
     const pastSummaries = getAllSceneSummaries();
+    const initialStates = new Map(getAllCharacters().map(c => [c.id, snapshotRelationshipState(c)]));
 
     dlog("[RST] generateStatUpdate scene messages:", sceneMessages.length, "characters:", characters.length, "pastSummaries:", pastSummaries.length);
 
-    if (characters.length === 0) {
-        console.warn("[RST] No characters found in scene — cannot generate stat update");
-        throw new Error("No characters found in scene");
-    }
+    if (!sceneMessages.length) throw new Error("No narrative messages found in scene.");
 
     try {
         // Separate characters into new (all stats at 0%) and existing
@@ -82,11 +101,11 @@ export async function generateStatUpdate(sceneId, guidance = "") {
         let characterUpdates = [];
 
         // Handle new characters with flexible initial stat generation
-        if (newChars.length > 0) {
+        if (newChars.length > 0 || characters.length === 0) {
             toastr?.info?.("Generating initial stats for new characters...");
-            const initialResult = await generateInitialStatsForScene(
+            const initialResult = await rstScope1.wait(() => (generateInitialStatsForScene(
                 sceneMessages, newChars, profileName, settings
-            );
+            )));
             sceneSummary = initialResult.sceneSummary || "";
             sceneTitle = initialResult.sceneTitle || "";
             characterUpdates = characterUpdates.concat(initialResult.characterUpdates || []);
@@ -104,17 +123,17 @@ export async function generateStatUpdate(sceneId, guidance = "") {
                 guidance
             );
 
-            const resultText = await makeRequest(
+            const resultText = await rstScope1.wait(() => (makeRequest(
                 profileName,
                 systemPrompt,
                 requestPrompt,
                 20000,
                 0.3,
-            );
+            )));
 
             if (!resultText) throw new Error("No response from LLM");
 
-            const parsed = parseStatUpdateResponse(resultText, existingChars, sceneMessages.length);
+            const parsed = parseStatUpdateResponse(resultText, existingChars, sceneMessages.length, sceneMessages);
             // Only use initial scene summary if no new chars generated one
             if (!sceneSummary) {
                 sceneSummary = parsed.sceneSummary || "";
@@ -133,6 +152,15 @@ export async function generateStatUpdate(sceneId, guidance = "") {
             sceneSummary = "Scene reviewed for initial character stat generation.";
         }
 
+        characterUpdates = dedupeCharacterUpdates(characterUpdates);
+        for (const update of characterUpdates) update.stateBefore = initialStates.get(update.characterId) || snapshotRelationshipState(getCharacterProfile(update.characterId));
+        characterUpdates = characterUpdates.filter((update) => isMeaningfulCharacterUpdate(update, getCharacterProfile(update.characterId)));
+        const meaningfulIds = new Set(characterUpdates.map((update) => update.characterId));
+        for (const id of [...autoCreatedIdsForChat()]) {
+            if (meaningfulIds.has(id)) continue;
+            deleteCharacter(id);
+            autoCreatedIdsForChat().delete(id);
+        }
         return {
             sceneId,
             sceneSummary,
@@ -142,6 +170,8 @@ export async function generateStatUpdate(sceneId, guidance = "") {
             autoCreatedIds: getAutoCreatedIds(),
         };
     } catch (err) {
+        rstScope1.assertCurrent();
+
         console.error("[RST] Stat update generation failed:", err);
         toastr?.error?.("Stat update generation failed. Please try again.");
         throw err;
@@ -160,6 +190,8 @@ function buildStatUpdateSystemPrompt(settings) {
 
     return [
         'You are a relationship stat update generator.',
+        'IMMUTABLE RELATIONSHIP ANCHOR: Every stat, title, commentary, summary, milestone, condition, and lock describes TARGET CHARACTER -> USER/PERSONA. Narrative prominence never changes the anchor. A different NPC may dominate the scene or act as viewpoint character; that does NOT make NPC-to-NPC relationships valid output.',
+        'FAILSAFE CHARACTER DISCOVERY: Identify additional named participants missed by the roster/sidecar. Include them with full stats and commentary, grounded in the scene. Existing profiles use their established state; genuinely new profiles receive initial estimates for review. Do not include reference-only names or generic narrator/card labels.',
         'Output ONLY a JSON object.',
         '',
         'Schema:',
@@ -168,6 +200,7 @@ function buildStatUpdateSystemPrompt(settings) {
         '    "sceneSummary": "...",',
         '    "characters": {',
         '      "[NAME]": {',
+        '        "relationshipEvidence": "One factual sentence naming the USER/PERSONA and stating what this target character directly did, observed, learned, or decided about them in this scene; use an empty string when there is no relationship-relevant exposure",',
         '        "stats": {',
         '          "platonic": {"trust":-100-100,"openness":-100-100,"support":-100-100,"affection":-100-100},',
         '          "romantic": {"trust":-100-100,"openness":-100-100,"support":-100-100,"affection":-100-100},',
@@ -178,11 +211,10 @@ function buildStatUpdateSystemPrompt(settings) {
         '          "romantic": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"},',
         '          "sexual": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"}',
         '        },',
-        '        "proposedMilestones": [{"title":"...","description":"...","domains":["platonic"]}],',
+        '        "proposedMilestones": [],',
         '        "proposedConditions": [{"type":"guarded","reason":"why it is active now","resolution":"what would resolve it"}],',
         '        "resolvedConditions": [{"id":"condition id shown in current profile","reason":"why it resolved"}],',
         '        "dynamicTitle": "...",',
-        '        "milestoneReached": false,',
         '        "criticalStats": ["category.stat for any stat where a narratively pivotal moment justifies an unusually large shift"],',
         '        "proposedHardLocks": [{"stat":"category.stat","cap":NUMBER,"reason":"why this character\'s psychology caps this stat here"}],',
         '        "proposedSoftLocks": [{"stat":"category.stat","cap":NUMBER,"condition":"what {{user}} must do to unlock further growth","progress":"current prose progress toward it"}],',
@@ -190,7 +222,6 @@ function buildStatUpdateSystemPrompt(settings) {
         '        "softLockProgress": [{"stat":"category.stat","progress":"updated prose progress note for an existing, still-locked soft lock"}],',
         '        "hardLockPressureUpdates": [{"stat":"category.stat","change":-2|-1|0|1|2,"reason":"specific behavior that contradicts or reinforces the hard lock reason"}],',
         '        "hardLockReviews": [{"stat":"category.stat","recommendation":"maintain|raise_cap|convert_to_soft|remove","recommendedCap":NUMBER,"reason":"why the accumulated evidence justifies this"}],',
-        '        "milestoneDetail": "...",',
         '        "narrativeSummary": "..."',
         '      }',
         '    }',
@@ -198,27 +229,30 @@ function buildStatUpdateSystemPrompt(settings) {
         '',
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
+        '- Never substitute a prominent NPC for {{user}}. If the scene spends many paragraphs on another NPC, relationships between two NPCs are still OUT OF SCOPE.',
+        '- relationshipEvidence is REQUIRED for every returned character. It must explicitly name {{user}} and identify current scene evidence linking this character to {{user}}. If the character only interacts with another NPC, is merely present in that NPC\'s subplot, or has never met/learned/reacted to {{user}}, use an empty string and leave all relationship state unchanged.',
         '- Per-character category visibility is authoritative. If a character is shown with only some visible/active categories, ONLY output stats/commentary/criticalStats/locks/pressure/reviews for those visible categories. Do not infer, update, propose locks for, unlock, or mention hidden categories.',
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
-        '- proposedMilestones: OPTIONAL and RARE. RST milestones are ONLY about THIS CHARACTER <-> {{user}}. Never create a milestone for a relationship/event between two NPCs or other characters. A milestone must materially and durably redefine how this character and {{user}} relate to each other: major rupture/reconciliation, explicit commitment or vow, decisive betrayal/rescue, serious boundary violation, or comparably consequential disclosure/action. A thank-you, meal, ordinary comfort/encouragement, first meeting, routine apology, generic fight, or single vulnerable line is NOT enough by itself. Most scenes have zero. At most 1 milestone per character per scene. Give a short factual title/description and relevant domains.',
+        '- proposedMilestones is a REQUIRED ASSESSMENT FIELD for every returned character. Evaluate it on EVERY stat update; never omit the field. If this scene materially and durably redefines THIS CHARACTER <-> {{user}}, return exactly one milestone object {"title":"...","description":"...","domains":["platonic"]}. Qualifying examples include a major rupture/reconciliation, explicit commitment or vow, decisive betrayal/rescue, serious boundary violation, or comparably consequential disclosure/action. If no qualifying turning point occurred, return []. Rarity is not a reason to suppress a qualifying milestone, but do not invent one: a thank-you, meal, ordinary comfort/encouragement, first meeting, routine apology, generic fight, or single vulnerable line is not enough by itself. Never create a milestone for a relationship/event between two NPCs or other characters.',
         `- proposedConditions: OPTIONAL. Conditions are temporary contextual lenses, not permanent personality traits or buffs. At most ${MAX_NEW_CONDITIONS_PER_UPDATE} new condition per character per scene and never more than ${MAX_ACTIVE_RELATIONSHIP_CONDITIONS} active total. Allowed types: ${getRelationshipConditionCatalogForPrompt()}. Give why it is active and what specific narrative development should resolve it.`,
         '- resolvedConditions: ONLY for an active condition whose stated resolution has actually occurred in this scene. Use the exact condition id shown in CURRENT CHARACTER STATS and explain why it resolved.',
         '- Conditions influence how evidence should be interpreted, but NEVER override hard locks, soft locks, critical-change rules, or established personality. Example: Possessive can raise attention/affection without implying trust; Guarded can make ordinary warmth insufficient for openness.',
-        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Only a critical that actually fires mechanically bypasses relationship inertia. Still provide your normal stat value for it.',
+        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Only a critical that actually fires mechanically receives the wider critical range. Still provide your normal stat value for it.',
         '- proposedHardLocks: OPTIONAL. ONLY for characters marked "Hard-lock eligible: YES". If "NO", you MUST leave this empty for that character. When eligible, and if the character\'s defined personality/psychology/history makes a stat realistically incapable of exceeding a certain level (e.g. a deeply traumatized character who cannot trust past ~40%), propose a cap as {"stat":"category.stat","cap":NUMBER,"reason":"..."}. Propose ONLY when strongly justified \u2014 a hard lock is exceptional, reserved for a true defining ceiling, never routine. Most scenes should propose ZERO. Do not lock a stat just because it is plausible or currently low. When in doubt, leave it empty. Grounded in their stated personality — never guess on a blank slate. Leave empty for most characters. Do NOT propose caps below the stat\'s current value.',
         '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If no slots are open, propose NONE. The "Soft-lock slots OPEN" number is a CEILING, not a target — propose anywhere from zero up to that many, and zero or one is the typical, expected answer. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Each entry: {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. Never propose a lock just to use an available slot — only when it is genuinely warranted by the story.',
         '- unlockedSoftLocks: for any EXISTING soft lock listed in the character\'s data, if its condition was FULFILLED during this scene, list its "category.stat" here. The stat will then auto-unlock and resume normal growth. Only include locks that are genuinely satisfied by what happened.',
         '- softLockProgress: for existing soft locks that are NOT yet met, optionally provide an updated prose progress note reflecting movement toward the condition this scene.',
         '- hardLockPressureUpdates: ONLY for stats that ALREADY have a hard lock (shown with "pressure X/5"). NEVER create pressure for an unlocked stat. Pressure tracks EVIDENCE the character is acting against the lock\'s psychological REASON; it does NOT change the stat value. Scale: +2 major sustained contradiction; +1 meaningful contradiction; 0 no change (default for almost every scene); -1 reinforced the locked pattern; -2 severe regression. Changes must be RARE and evidence-based. Possessiveness, jealousy, attraction, fascination, sexual tension, protectiveness, or angst do NOT count unless the behavior directly contradicts the specific lock reason. COUNTS: relying on {{user}}\'s judgment without controlling the outcome (contradicts a belief that reliance is weakness). Does NOT count: becoming more fascinated (not structural), or protecting {{user}} because they consider {{user}} theirs (possessive protection reinforces the lock).',
         '- hardLockReviews: include an entry ONLY when a hard lock pressure reaches max (5/5) this scene. Shape {"stat":"category.stat","recommendation":"maintain|raise_cap|convert_to_soft|remove","recommendedCap":NUMBER,"reason":"..."}. Recommend a modest raise (+5/+10) unless evidence is overwhelming (+15 max). You only recommend; the user decides.',
-        '- RELATIONSHIP INERTIA: trajectory/history are context, NOT a momentum bonus. Repeated positive scenes do not justify progressively larger positive changes. Established psychologically rigid characters may require qualitatively specific evidence to move entrenched stats; merely accumulating pleasant interactions is insufficient. Likewise, one ordinary awkward scene should not violently reverse a deeply established direction. Use criticalStats for genuinely pivotal evidence rather than softening or hardening a character through repetition alone.',
+        '- STAGNATION IS NOT REGRESSION: if a relationship simply fails to progress, leave the relevant stats unchanged. Do not manufacture decreases merely because warmth, trust, openness, or affection did not increase this scene.',
+        '- DECREASES require direct negative relational evidence toward {{user}}: betrayal, rejection, fear, disgust, resentment, violated boundaries, credible disappointment, loss of confidence, or comparable concrete harm. Neutrality, awkwardness, silence, distance, an uneventful scene, or a missed opportunity to grow are not sufficient by themselves.',
         '- Affection, fascination, jealousy, protectiveness, possessiveness, sexual interest, or obsession MUST NOT be used as shortcuts for trust/openness/support. A character can become more attached while remaining internally rigid.',
         '- Range: -100 to 100. 0 = neutral.',
         `- Each stat MUST stay within ${range.min} to ${range.max} points of its current (pre-scene) value. For example, if Trust is currently 30 and the range is -5 to +5, the new Trust must be between 25 and 35.`,
         '- Stats are ABSOLUTE values (not deltas), but each must respect the per-scene change limit above.',
         '- Commentary: provide a brief narrative explanation for each stat (describe WHY this character feels this way based on scene events). Do NOT describe how much a stat changed numerically.',
-        '- Milestone: all four elements in a category cross 25/50/75/100%.',
+        '- Commentary must be DYNAMIC RELATIONSHIP COMMENTARY, not a scene summary: explain the character-to-{{user}} interpretation behind the stat, and preserve prior commentary when the stat did not actually change.',
     ].join('\n');
 }
 
@@ -255,11 +289,6 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
         parts.push(`  Current narrative: "${char.narrativeSummary || "None"}"`);
         const trajectory = deriveRelationshipTrajectory(char);
         parts.push(`  Relationship trajectory: ${trajectory.label} (${trajectory.explanation})`);
-        const inertiaHistory = getRelationshipInertiaContext(char);
-        if (inertiaHistory.length) {
-            parts.push(`  Recent approved per-stat movement for inertia (newest first; descriptive only, never a bonus):`);
-            for (const line of inertiaHistory) parts.push(`    ${line}`);
-        }
         const recentMilestones = Array.isArray(char.relationshipMilestones) ? char.relationshipMilestones.slice(-3) : [];
         if (recentMilestones.length) {
             parts.push(`  Recent relationship milestones (historical anchors; do not repeat unless a NEW turning point occurs):`);
@@ -344,6 +373,7 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
     // Scene messages
     const _persona = getPersonaContext();
     const userName = _persona.name || getContext().name1 || "User";
+    parts.push(`\nIMMUTABLE RELATIONSHIP SUBJECT: ${userName}. Every character entry must evaluate that character's relationship toward ${userName}, even if another NPC is the viewpoint character or occupies more of the scene. Never evaluate NPC-to-NPC relationships.`);
     if (_persona.description) {
         parts.push(`\nABOUT ${userName} (the user/player): ${_persona.description}`);
     }
@@ -360,16 +390,8 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
         parts.push(`\nUSER GUIDANCE: ${guidance}`);
     }
 
-    // Character discovery instruction — be INCLUSIVE by default
-    parts.push('');
-    parts.push('CRITICAL — Scan for ALL additional characters:');
-    parts.push('- You MUST identify EVERY named individual who appears, speaks, interacts, or is described as doing something in the scene messages.');
-    parts.push('- INCLUDE characters who: speak dialogue, are addressed by name, perform actions described by another speaker, interact with someone in the scene, or are described as being physically present or doing an activity.');
-    parts.push('- Example of INCLUDE: a character says "I talked with [Name]" or "[Name] handed me the package" or "[Name] and I went to the store" — [Name] is described as interacting and should be included.');
-    parts.push('- Example of EXCLUDE: "I heard about [Name]\'s reputation" or "someone mentioned [Name] is tall" — [Name] is merely discussed with no described interaction.');
-    parts.push('- When in doubt, INCLUDE the character. It is better to include a character unnecessarily than to miss someone.');
-    parts.push('Include them in your characters object with full stat updates using the same schema.');
-    parts.push('');
+    parts.push(`FAILSAFE CHARACTER DISCOVERY: The sidecar may have missed characters, and the supplied roster may be empty. Include an additional named participant ONLY when the messages show relationship-relevant exposure to ${userName}: they directly interact with, observe, learn about, direct, or currently react to ${userName}. Mere activity in another NPC's subplot is insufficient. Never invent a name or treat a generic narrator/card label as a person.`);
+    parts.push("NO CHANGE IS THE DEFAULT for a mere mention. A known character can change after directly interacting, watching, learning about, directing, or reacting to the persona in a parallel scene. Explain the actual exposure and what it changes toward the persona; NPC-to-NPC feelings do not count.");
 
     // Force JSON-only output
     parts.push('Return JSON only.');
@@ -448,7 +470,7 @@ function normalizeResolvedConditions(profile, arr) {
     for (const raw of arr) {
         if (!raw || typeof raw !== "object") continue;
         const id = String(raw.id || "").trim();
-        if (!activeIds.has(id)) continue;
+        if (!activeIds.has(id) || !String(raw.reason || "").trim()) continue;
         result.push({
             id,
             reason: String(raw.reason || "").trim().slice(0, 1200),
@@ -478,7 +500,7 @@ function filterCharacterDataByVisibleCategories(profile, data) {
 
 
 function normalizeCharacterName(name) {
-    return String(name || "").toLowerCase().trim();
+    return normalizeNameForMatch(name);
 }
 
 function findParsedCharacterEntryForProfile(parsedCharacters, profile, consumedKeys = null) {
@@ -487,7 +509,7 @@ function findParsedCharacterEntryForProfile(parsedCharacters, profile, consumedK
     const variants = new Set(getCharacterNameVariants(profile).map(normalizeCharacterName));
 
     // Prefer exact/canonical/alias matches first. Compare normalized strings so
-    // an LLM key like "Mira" still matches an alias saved as "mira".
+    // an LLM-returned name still matches the same saved alias after normalization.
     for (const key of keys) {
         if (consumedKeys?.has(key)) continue;
         if (variants.has(normalizeCharacterName(key))) {
@@ -546,7 +568,7 @@ function buildInitialCommentary(charData, statsAfter, char = null) {
 
 function createInitialUpdateEntry(char, charData, source = "llm_initial", messageCount = Infinity) {
     const filteredData = filterCharacterDataByVisibleCategories(char, charData || {});
-    const statsAfter = buildStatsFromInitialData(filteredData);
+    const statsAfter = applyDeltaRange(cloneStats(char.stats), buildStatsFromInitialData(filteredData), { min: -200, max: 200 }, [], getSettings(), char.hardLocks, char.softLocks, filteredData.unlockedSoftLocks, []);
     const commentary = buildInitialCommentary(filteredData, statsAfter, char);
     return {
         characterId: char.id,
@@ -559,11 +581,8 @@ function createInitialUpdateEntry(char, charData, source = "llm_initial", messag
         resolvedConditions: [],
         dynamicTitleBefore: char.dynamicTitle || "",
         dynamicTitleAfter: filteredData.dynamicTitle || char.dynamicTitle || "",
-        milestoneReached: false,
-        milestoneDetail: "",
         narrativeSummary: filteredData.narrativeSummary || char.narrativeSummary || "",
-        criticalStats: Array.isArray(filteredData.criticalStats) ? filteredData.criticalStats : [],
-        inertiaAdjustments: [],
+        criticalStats: [],
         raisedCaps: [],
         proposedHardLocks: Array.isArray(filteredData.proposedHardLocks) ? filteredData.proposedHardLocks : [],
         proposedSoftLocks: Array.isArray(filteredData.proposedSoftLocks) ? filteredData.proposedSoftLocks : [],
@@ -616,12 +635,76 @@ function dedupeCharacterUpdates(characterUpdates) {
 // ─── Response Parsing ─────────────────────────────────────
 
 /**
+ * Build one established-character relationship update through the canonical
+ * deterministic guard pipeline. Live updates, discovery fallbacks, and Batch
+ * Scan must all use this path once a profile is no longer brand-new.
+ */
+export function buildEstablishedCharacterUpdate(char, rawCharData, { source = "llm", settings = null } = {}) {
+    const leakedInternalKeys = Object.keys(rawCharData || {}).filter((key) => /inertia/i.test(key));
+    if (leakedInternalKeys.length) {
+        dlog("[Inertia] model returned forbidden internal-looking fields; ignored", { character: char?.name || char?.id, fields: leakedInternalKeys });
+    }
+    const charData = filterCharacterDataByVisibleCategories(char, rawCharData || {});
+    const resolvedSettings = settings || getSettings();
+    const statsBefore = cloneStats(char.stats);
+    const range = resolvedSettings.statChangeRange || { min: -5, max: 5 };
+    const mergedStats = mergeWithExistingStats(statsBefore, charData.stats || {});
+    const firedCriticals = resolveFiredCriticalStats(charData.criticalStats, resolvedSettings);
+    const inertiaResult = applyRelationshipInertia(char, statsBefore, clampStats(mergedStats), firedCriticals, range, charData.criticalStats);
+    const statsAfter = applyDeltaRange(
+        statsBefore,
+        inertiaResult.statsAfter,
+        range,
+        charData.criticalStats,
+        resolvedSettings,
+        char.hardLocks,
+        char.softLocks,
+        charData.unlockedSoftLocks,
+        firedCriticals,
+        true,
+    );
+    const raisedCaps = statsAfter.__raisedCaps || [];
+    const unlockedSoftLocks = statsAfter.__unlockedSoftLocks || [];
+
+    let commentary = charData.commentary || null;
+    if (!commentary || hasEmptyCommentary(commentary)) {
+        commentary = generateFallbackCommentary(statsBefore, statsAfter, char);
+    } else {
+        commentary = fillMissingCommentary(commentary, statsBefore, statsAfter, char);
+    }
+
+    return {
+        characterId: char.id,
+        characterName: char.name,
+        statsBefore,
+        statsAfter,
+        commentary,
+        proposedMilestones: normalizeProposedMilestones(char, charData.proposedMilestones),
+        proposedConditions: normalizeProposedConditions(char, charData.proposedConditions),
+        resolvedConditions: normalizeResolvedConditions(char, charData.resolvedConditions),
+        dynamicTitleBefore: char.dynamicTitle || "",
+        dynamicTitleAfter: charData.dynamicTitle || char.dynamicTitle || "",
+        narrativeSummary: charData.narrativeSummary || char.narrativeSummary || "",
+        criticalStats: firedCriticals,
+        raisedCaps,
+        proposedHardLocks: Array.isArray(charData.proposedHardLocks) ? charData.proposedHardLocks : [],
+        proposedSoftLocks: Array.isArray(charData.proposedSoftLocks) ? charData.proposedSoftLocks : [],
+        unlockedSoftLocks,
+        softLockProgress: Array.isArray(charData.softLockProgress) ? charData.softLockProgress : [],
+        hardLockPressureUpdates: Array.isArray(charData.hardLockPressureUpdates) ? charData.hardLockPressureUpdates : [],
+        hardLockReviews: Array.isArray(charData.hardLockReviews) ? charData.hardLockReviews : [],
+        source,
+        changeCount: countChanges(statsBefore, statsAfter),
+    };
+}
+
+/**
  * Parse the LLM response into structured update data.
  * @param {string} response - Raw LLM output
  * @param {Array} characters - Character profiles
  * @returns {{sceneSummary: string, characterUpdates: Array}}
  */
-function parseStatUpdateResponse(response, characters, messageCount = Infinity) {
+function parseStatUpdateResponse(response, characters, messageCount = Infinity, messages = [], allowDiscovery = true) {
     // Try primary JSON extraction
     let parsed = extractJsonFromResponse(response);
 
@@ -629,8 +712,8 @@ function parseStatUpdateResponse(response, characters, messageCount = Infinity) 
     if (!parsed) {
         const fallbackResult = parseStatUpdateAnalysisText(response, characters);
         if (fallbackResult) {
-            dlog("[RST] Parsed stat update response using analysis-text fallback");
-            return fallbackResult;
+            dlog("[RST] Analysis-text fallback lacks relationshipEvidence; preserving scene metadata and defaulting every relationship to no change.");
+            return { ...fallbackResult, characterUpdates: characters.map(createNoChangeEntry) };
         }
     }
 
@@ -641,6 +724,7 @@ function parseStatUpdateResponse(response, characters, messageCount = Infinity) 
         throw new Error("Failed to parse stat update response as JSON. Response may be truncated — try increasing max tokens.");
     }
 
+    if (!parsed.characters || typeof parsed.characters !== "object" || Array.isArray(parsed.characters)) throw new Error("Invalid stat response: missing characters object.");
     const sceneSummary = parsed.sceneSummary || "";
     const sceneTitle = parsed.sceneTitle || "";
     const characterUpdates = [];
@@ -657,160 +741,75 @@ function parseStatUpdateResponse(response, characters, messageCount = Infinity) 
             characterUpdates.push(createNoChangeEntry(char));
             continue;
         }
-        charData = filterCharacterDataByVisibleCategories(char, charData);
-
-        const statsBefore = cloneStats(char.stats);
-        const settings = getSettings();
-        const range = settings.statChangeRange || { min: -5, max: 5 };
-        // Merge LLM stats over existing stats so unmentioned ones don't default to 0
-        const mergedStats = mergeWithExistingStats(statsBefore, charData.stats || {});
-        const trajectory = deriveRelationshipTrajectory(char);
-        const firedCriticals = resolveFiredCriticalStats(charData.criticalStats, settings);
-        const inertiaResult = applyRelationshipInertia(char, statsBefore, clampStats(mergedStats), firedCriticals, trajectory.label, range);
-        const statsAfter = applyDeltaRange(statsBefore, inertiaResult.statsAfter, range, charData.criticalStats, settings, char.hardLocks, char.softLocks, charData.unlockedSoftLocks, firedCriticals);
-        const raisedCaps = statsAfter.__raisedCaps || [];
-        const unlockedSoftLocks = statsAfter.__unlockedSoftLocks || [];
-        // Use LLM commentary if provided, otherwise generate fallback
-        // Pass char to preserve old commentary for unchanged stats
-        let commentary = charData.commentary || null;
-        if (!commentary || hasEmptyCommentary(commentary)) {
-            commentary = generateFallbackCommentary(statsBefore, statsAfter, char);
-        } else {
-            commentary = fillMissingCommentary(commentary, statsBefore, statsAfter, char);
+        if (!hasGroundedRelationshipEvidence(char, charData, messages)) {
+            dlog(`[RST] Rejected update for ${char.name}: missing or ungrounded persona-anchored relationship evidence.`);
+            characterUpdates.push(createNoChangeEntry(char));
+            continue;
         }
-
-        // Count actual changes
-        const changeCount = countChanges(statsBefore, statsAfter);
-
-        characterUpdates.push({
-            characterId: char.id,
-            characterName: char.name,
-            statsBefore,
-            statsAfter,
-            commentary,
-            proposedMilestones: normalizeProposedMilestones(char, charData.proposedMilestones),
-            proposedConditions: normalizeProposedConditions(char, charData.proposedConditions),
-            resolvedConditions: normalizeResolvedConditions(char, charData.resolvedConditions),
-            dynamicTitleBefore: char.dynamicTitle || "",
-            dynamicTitleAfter: charData.dynamicTitle || char.dynamicTitle || "",
-            milestoneReached: charData.milestoneReached || false,
-            milestoneDetail: charData.milestoneDetail || "",
-            narrativeSummary: charData.narrativeSummary || char.narrativeSummary || "",
-            criticalStats: firedCriticals,
-            inertiaAdjustments: inertiaResult.adjustments,
-            raisedCaps,
-            proposedHardLocks: Array.isArray(charData.proposedHardLocks) ? charData.proposedHardLocks : [],
-            proposedSoftLocks: Array.isArray(charData.proposedSoftLocks) ? charData.proposedSoftLocks : [],
-            unlockedSoftLocks,
-            softLockProgress: Array.isArray(charData.softLockProgress) ? charData.softLockProgress : [],
-            hardLockPressureUpdates: Array.isArray(charData.hardLockPressureUpdates) ? charData.hardLockPressureUpdates : [],
-            hardLockReviews: Array.isArray(charData.hardLockReviews) ? charData.hardLockReviews : [],
-            source: "llm",
-            changeCount,
-        });
+        characterUpdates.push(buildEstablishedCharacterUpdate(char, charData, { source: "llm" }));
     }
 
-    // Handle LLM-discovered characters (in parsed.characters but not in input list)
-    if (parsed && parsed.characters) {
-        const inputNameVariants = new Set(characters.flatMap(c => getCharacterNameVariants(c)).map(normalizeCharacterName));
-        const allKnownChars = getAllCharacters();
-        for (const [llmName, rawLlmData] of Object.entries(parsed.characters)) {
-            let llmData = rawLlmData;
-            const lowerLlmName = normalizeCharacterName(llmName);
-            if (!consumedCharacterKeys.has(llmName) && !inputNameVariants.has(lowerLlmName) && llmData && llmData.stats) {
-                // Check if this LLM name matches an existing character (by alias, exact name, or fuzzy word match)
-                const matchedExisting = allKnownChars.find(c => {
-                    if (c.name.toLowerCase().trim() === lowerLlmName) return true;
-                    if (c.nameAliases && Array.isArray(c.nameAliases)) {
-                        if (c.nameAliases.some(a => a.toLowerCase().trim() === lowerLlmName)) return true;
-                    }
-                    const cWords = c.name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
-                    const llmWords = lowerLlmName.split(/\s+/).filter(Boolean).sort().join(" ");
-                    return cWords === llmWords;
-                });
-                if (matchedExisting) {
-                    if (characterUpdates.some((u) => u.characterId === matchedExisting.id)) {
-                        dlog(`[RST] Skipping duplicate LLM-discovered key "${llmName}" for existing character "${matchedExisting.name}".`);
-                        continue;
-                    }
-                    // Name matches existing character — create update entry instead of duplicate
-                    dlog(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating update entry`);
-                    llmData = filterCharacterDataByVisibleCategories(matchedExisting, llmData);
-                    const statsBefore = cloneStats(matchedExisting.stats);
-                    const settings = getSettings();
-                    const range = settings.statChangeRange || { min: -5, max: 5 };
-                    // Merge LLM stats over existing stats so unmentioned ones don't default to 0
-                    const mergedStats = mergeWithExistingStats(statsBefore, llmData.stats || {});
-                    const trajectory = deriveRelationshipTrajectory(matchedExisting);
-                    const firedCriticals = resolveFiredCriticalStats(llmData.criticalStats, settings);
-                    const inertiaResult = applyRelationshipInertia(matchedExisting, statsBefore, clampStats(mergedStats), firedCriticals, trajectory.label, range);
-                    const statsAfter = applyDeltaRange(statsBefore, inertiaResult.statsAfter, range, llmData.criticalStats, settings, matchedExisting.hardLocks, matchedExisting.softLocks, llmData.unlockedSoftLocks, firedCriticals);
-                    const raisedCaps = statsAfter.__raisedCaps || [];
-                    const unlockedSoftLocks = statsAfter.__unlockedSoftLocks || [];
-                    let commentary = llmData.commentary || null;
-                    if (!commentary || hasEmptyCommentary(commentary)) {
-                        commentary = generateFallbackCommentary(statsBefore, statsAfter, matchedExisting);
-                    } else {
-                        commentary = fillMissingCommentary(commentary, statsBefore, statsAfter, matchedExisting);
-                    }
-                    const changeCount = countChanges(statsBefore, statsAfter);
-                    characterUpdates.push({
-                        characterId: matchedExisting.id,
-                        characterName: matchedExisting.name,
-                        statsBefore,
-                        statsAfter,
-                        commentary,
-                        dynamicTitleBefore: matchedExisting.dynamicTitle || "",
-                        dynamicTitleAfter: llmData.dynamicTitle || matchedExisting.dynamicTitle || "",
-                        milestoneReached: llmData.milestoneReached || false,
-                        milestoneDetail: llmData.milestoneDetail || "",
-                        narrativeSummary: llmData.narrativeSummary || matchedExisting.narrativeSummary || "",
-                        criticalStats: firedCriticals,
-                        inertiaAdjustments: inertiaResult.adjustments,
-                        raisedCaps,
-                        proposedHardLocks: Array.isArray(llmData.proposedHardLocks) ? llmData.proposedHardLocks : [],
-                        proposedSoftLocks: Array.isArray(llmData.proposedSoftLocks) ? llmData.proposedSoftLocks : [],
-                        unlockedSoftLocks,
-                        softLockProgress: Array.isArray(llmData.softLockProgress) ? llmData.softLockProgress : [],
-                        hardLockPressureUpdates: Array.isArray(llmData.hardLockPressureUpdates) ? llmData.hardLockPressureUpdates : [],
-                        hardLockReviews: Array.isArray(llmData.hardLockReviews) ? llmData.hardLockReviews : [],
-                        source: "llm",
-                        changeCount,
-                    });
-                } else {
-                    // Truly new character — create new profile
-                    dlog("[RST] LLM discovered additional character:", llmName);
-                    const newChar = createCharacter(llmName, { source: "auto_generated" });
-                    if (newChar) {
-                        _autoCreatedIds.add(newChar.id);
-                        const statsAfter = clampStats(llmData.stats);
-                        let commentary = llmData.commentary || null;
-                        if (!commentary || hasEmptyCommentary(commentary)) {
-                            commentary = generateFallbackCommentary({}, statsAfter);
-                        } else {
-                            commentary = fillMissingCommentary(commentary, {}, statsAfter);
-                        }
-                        characterUpdates.push({
-                            characterId: newChar.id,
-                            characterName: newChar.name,
-                            statsBefore: null,
-                            statsAfter,
-                            commentary,
-                            dynamicTitleBefore: "",
-                            dynamicTitleAfter: llmData.dynamicTitle || "",
-                            milestoneReached: llmData.milestoneReached || false,
-                            milestoneDetail: llmData.milestoneDetail || "",
-                            narrativeSummary: llmData.narrativeSummary || "",
-                            source: "llm_discovered",
-                            changeCount: 12,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
+    if (allowDiscovery) appendDiscoveredCharacterUpdates(parsed, characters, characterUpdates, messages);
     return { sceneSummary, sceneTitle, characterUpdates: dedupeCharacterUpdates(characterUpdates) };
+}
+
+// Stat-update discovery is an independent fallback, not another sidecar call.
+// Validate identity against text without reusing the narrow active-verb validator
+// that the sidecar itself might have failed. Relevance is assessed in the prompt
+// and exposed on the ordinary pending approval card.
+function isDiscoveryNameAllowed(name, messages) {
+    const display = String(name || "").trim();
+    const normalized = normalizeCharacterName(display);
+    if (!normalized || display.length > 100 || !Array.isArray(messages)) return false;
+    if (isNameBlacklisted(display, [getContext().name1 || "", "user", "{{user}}", "narrator", "story", "assistant", "system"])) return false;
+    if (/\b(?:rpg|roleplay|role play|narrator|storyteller)\b/i.test(display)) return false;
+    return messages.some(message => {
+        if (!isNarrativeMessage(message)) return false;
+        const text = normalizeCharacterName(message.mes || "");
+        const namedSpeaker = !message.is_user && normalizeCharacterName(message.name || "") === normalized;
+        return namedSpeaker || (` ${text} `).includes(` ${normalized} `);
+    });
+}
+
+function appendDiscoveredCharacterUpdates(parsed, inputCharacters, updates, messages) {
+    const included = new Set(updates.map(update => update.characterId));
+    for (const [name, data] of Object.entries(parsed?.characters || {})) {
+        if (!data || typeof data !== "object" || !data.stats || !isDiscoveryNameAllowed(name, messages)) continue;
+        let profile = findCharacterByName(name) || findCharacterByFuzzyName(name);
+        if (profile && included.has(profile.id)) continue;
+        if (!profile) {
+            // Don't turn an ambiguous shortened known identity into a new person.
+            const words = normalizeCharacterName(name).split(" ").filter(Boolean);
+            const possible = getAllCharacters().filter(char => getCharacterNameVariants(char).some(variant => {
+                const tokens = normalizeCharacterName(variant).split(" ");
+                return words.every(word => tokens.includes(word));
+            }));
+            if (possible.length) continue;
+            profile = createCharacter(name, { source: "auto_generated" });
+            autoCreatedIdsForChat().add(profile.id);
+        }
+        let update;
+        if (isNewCharacter(profile)) {
+            if (!hasGroundedRelationshipEvidence(profile, data, messages)) {
+                dlog(`[RST] Rejected discovered initial stats for ${profile.name}: missing or invalid persona-anchored relationship evidence.`);
+                if (autoCreatedIdsForChat().has(profile.id)) {
+                    // Keep the temporary profile tied to the ordinary pending
+                    // lifecycle, but do not surface a speculative relationship
+                    // card. Dismiss-all/scene retry can still clean it up.
+                    updates.push(createNoChangeEntry(profile));
+                    included.add(profile.id);
+                }
+                continue;
+            }
+            update = createInitialUpdateEntry(profile, data, "llm_discovered_initial", messages.length);
+        }
+        else update = parseStatUpdateResponse(JSON.stringify({ characters: { [profile.name]: data } }), [profile], messages.length, messages, false).characterUpdates[0];
+        if (!update) continue;
+        // The fallback's pending card uses the same approval/dismissal lifecycle.
+        update.source = autoCreatedIdsForChat().has(profile.id) ? "llm_discovered" : update.source;
+        updates.push(update);
+        included.add(profile.id);
+    }
 }
 
 // ─── JSON Extraction Helpers ──────────────────────────────
@@ -1118,9 +1117,8 @@ function parseStatUpdateAnalysisText(text, characters) {
         const range = settings.statChangeRange || { min: -5, max: 5 };
         // Merge analysis-text stats over existing stats so unmentioned ones don't default to 0
         const mergedStats = mergeWithExistingStats(statsBefore, statsAfter);
-        const fallbackTrajectory = deriveRelationshipTrajectory(char);
-        const fallbackInertia = applyRelationshipInertia(char, statsBefore, clampStats(mergedStats), [], fallbackTrajectory.label, range);
-        const clampedAfter = applyDeltaRange(statsBefore, fallbackInertia.statsAfter, range);
+        const fallbackInertia = applyRelationshipInertia(char, statsBefore, clampStats(mergedStats), [], range);
+        const clampedAfter = applyDeltaRange(statsBefore, fallbackInertia.statsAfter, range, null, settings, char.hardLocks, char.softLocks, null, null, true);
         // Preserve old commentary for unchanged stats via fillMissingCommentary
         const filledCommentary = fillMissingCommentary(commentary, statsBefore, clampedAfter, char);
 
@@ -1133,11 +1131,8 @@ function parseStatUpdateAnalysisText(text, characters) {
             proposedMilestones: [],
             proposedConditions: [],
             resolvedConditions: [],
-            inertiaAdjustments: fallbackInertia.adjustments,
             dynamicTitleBefore: char.dynamicTitle || "",
             dynamicTitleAfter,
-            milestoneReached: false,
-            milestoneDetail: "",
             narrativeSummary: narrativeSummary || char.narrativeSummary || "",
             source: "llm_fallback",
             changeCount: countChanges(statsBefore, clampedAfter),
@@ -1174,7 +1169,7 @@ function getSceneMessages(scene) {
     if (!chat || !Array.isArray(chat)) return [];
     const start = scene.messageStart || 0;
     const end = scene.messageEnd !== null ? scene.messageEnd + 1 : chat.length;
-    return chat.slice(start, end);
+    return chat.slice(start, end).filter(isNarrativeMessage);
 }
 
 /**
@@ -1221,7 +1216,7 @@ function getSceneCharacters(scene) {
         for (const msg of sceneMessages) {
             const speaker = msg.name || "";
             if (!speaker || msg.is_user || isExcluded(speaker)) continue;
-            // Use alias-aware fuzzy matching so "Jane" matches "Jane Doe"
+            // Use alias-aware fuzzy matching so a unique short form can match a full name
             const match = findCharacterByFuzzyName(speaker) || allKnownChars.find((c) => c.name.toLowerCase().trim() === speaker.toLowerCase().trim());
             if (match) {
                 foundIds.add(match.id);
@@ -1233,34 +1228,29 @@ function getSceneCharacters(scene) {
         dlog("[RST] Multi-character RP detected — trusting scene.charactersPresent, skipping speaker-name scan.");
     }
 
-    // Step 3: Build character list from found IDs + auto-create unknowns
+    // Include known profiles named in the narrative, including remote/parallel
+    // participants; the updater must establish relational relevance, not merely mention.
+    const sceneText = normalizeCharacterName(sceneMessages.map(m => m.mes || "").join(" "));
+    for (const profile of allKnownChars) {
+        if (getCharacterNameVariants(profile).some(name => {
+            const normalized = normalizeCharacterName(name);
+            return normalized && (` ${sceneText} `).includes(` ${normalized} `);
+        })) foundIds.add(profile.id);
+    }
+    // Step 3: Build character list from the known roster
     const chars = [];
     for (const id of foundIds) {
         const profile = getCharacterProfile(id);
         if (profile) chars.push(profile);
     }
 
-    // Auto-create characters for unknown non-user speakers (single-character RP only)
-    if (unknownSpeakers.size > 0) {
-        dlog("[RST] Auto-creating", unknownSpeakers.size, "character(s) from scene speakers:", [...unknownSpeakers]);
-        for (const name of unknownSpeakers) {
-            const char = createCharacter(name, { source: "auto_generated" });
-            if (char) {
-                _autoCreatedIds.add(char.id);
-                chars.push(char);
-            }
-        }
-
-        // Update scene's charactersPresent so subsequent calls find them
-        try {
-            const allIds = [...foundIds, ...chars.filter(c => c && c.id).map(c => c.id)];
-            if (allIds.length > 0) {
-                updateSceneCharacters(scene.id, allIds);
-            }
-        } catch (e) {
-            console.warn("[RST] Could not update scene.charactersPresent:", e);
-        }
+    for (const name of unknownSpeakers) {
+        if (!isDiscoveryNameAllowed(name, sceneMessages)) continue;
+        const profile = createCharacter(name, { source: "auto_generated" });
+        autoCreatedIdsForChat().add(profile.id);
+        if (!chars.some(char => char.id === profile.id)) chars.push(profile);
     }
+    if (chars.length) updateSceneCharacters(scene.id, [...new Set(chars.map(char => char.id))]);
 
     // Step 4: Filter out any blacklisted/excluded characters from the final list
     const filteredChars = chars.filter(c => c && !isExcluded(c.name));
@@ -1316,7 +1306,9 @@ function clampStats(stats) {
 
 /**
  * Resolve which LLM-flagged critical candidates actually fire. RNG is resolved
- * before inertia so a candidate that loses its roll receives ordinary inertia.
+ * before inertia. The hidden inertia layer receives both the candidate set and
+ * the fired set: a candidate that loses RNG still gets the full *ordinary* range
+ * for a pivotal reversal, while only a fired critical receives the widened range.
  */
 function resolveFiredCriticalStats(criticalStats = null, settings = null) {
     const crit = settings?.criticalChanges || {};
@@ -1344,7 +1336,8 @@ function resolveFiredCriticalStats(criticalStats = null, settings = null) {
  * @param {{min: number, max: number}} range - Allowed delta range from settings
  * @returns {object} Clamped statsAfter values
  */
-function applyDeltaRange(statsBefore, statsAfter, range, criticalStats = null, settings = null, hardLocks = null, softLocks = null, metSoftLocks = null, preResolvedCriticalStats = null) {
+function applyDeltaRange(statsBefore, statsAfter, range, criticalStats = null, settings = null, hardLocks = null, softLocks = null, metSoftLocks = null, preResolvedCriticalStats = null, requireInertia = false) {
+    if (requireInertia) assertRelationshipInertiaProcessed(statsAfter, "established relationship stat update");
     // Resolve critical-change config. A stat goes critical only if (a) the feature
     // is enabled, (b) the LLM flagged it in criticalStats, AND (c) it wins an RNG
     // roll against the configured chance. Winners get a multiplier x wider ceiling.
@@ -1419,10 +1412,10 @@ function applyDeltaRange(statsBefore, statsAfter, range, criticalStats = null, s
                     if (isCrit) {
                         // A critical breaks through: the value is allowed past the
                         // cap, and the cap RISES to meet the new value.
-                        raisedCaps.push({ stat: cat + '.' + stat, from: cap, to: value });
+                        // Record the actual breakthrough after the soft-lock gate below.
                     } else {
                         // Normal growth cannot cross the cap.
-                        value = cap;
+                        value = Math.min(value, Math.max(before, cap));
                     }
                 }
             }
@@ -1438,10 +1431,11 @@ function applyDeltaRange(statsBefore, statsAfter, range, criticalStats = null, s
                 } else if (value > scap) {
                     // Still locked: gate growth at the soft cap. Criticals do NOT
                     // break soft locks — only the condition does.
-                    value = scap;
+                    value = Math.min(value, Math.max(before, scap));
                 }
             }
 
+            if (cap !== null && isCrit && value > cap && value > before) raisedCaps.push({ stat: statKey, from: cap, to: value });
             result[cat][stat] = value;
         }
     }
@@ -1522,27 +1516,19 @@ function fillMissingCommentary(commentary, statsBefore, statsAfter, char) {
         result[cat] = {};
         for (const stat of STAT_NAMES) {
             const existing = commentary?.[cat]?.[stat];
-            if (existing && existing.trim() !== "") {
-                // Preserve LLM-provided commentary
+            const before = statsBefore[cat]?.[stat] ?? 0;
+            const after = statsAfter[cat]?.[stat] ?? 0;
+            const diff = after - before;
+            if (diff === 0) {
+                // A model must not rewrite established interpretation when the
+                // underlying relationship stat did not move.
+                result[cat][stat] = getLatestCommentary(char, cat, stat) || (existing && existing.trim() ? existing : "");
+            } else if (existing && existing.trim() !== "") {
                 result[cat][stat] = existing;
+            } else if (diff > 0) {
+                result[cat][stat] = `Scene events positively influenced ${cat}.${stat}.`;
             } else {
-                const before = statsBefore[cat]?.[stat] ?? 0;
-                const after = statsAfter[cat]?.[stat] ?? 0;
-                const diff = after - before;
-                if (diff > 0) {
-                    result[cat][stat] = `Scene events positively influenced ${cat}.${stat}.`;
-                } else if (diff < 0) {
-                    result[cat][stat] = `Scene events negatively influenced ${cat}.${stat}.`;
-                } else {
-                    // Unchanged stat — preserve old commentary from update log
-                    const oldCommentary = getLatestCommentary(char, cat, stat);
-                    if (oldCommentary) {
-                        result[cat][stat] = oldCommentary;
-                    } else {
-                        // No old commentary either — leave empty (no overwrite)
-                        result[cat][stat] = "";
-                    }
-                }
+                result[cat][stat] = `Scene events negatively influenced ${cat}.${stat}.`;
             }
         }
     }
@@ -1628,6 +1614,7 @@ function countChanges(before, after) {
  * @returns {boolean}
  */
 function isNewCharacter(char) {
+    if (char?.updateLog?.length || char?.relationshipConditions?.length || char?.relationshipMilestones?.length) return false;
     if (!char || !char.stats) return true;
     for (const cat of STAT_CATEGORIES) {
         for (const stat of STAT_NAMES) {
@@ -1636,6 +1623,8 @@ function isNewCharacter(char) {
     }
     return true;
 }
+
+export const isUnestablishedCharacter = isNewCharacter;
 
 /**
  * Generate initial stats for brand-new characters using a flexible prompt
@@ -1647,15 +1636,17 @@ function isNewCharacter(char) {
  * @returns {Promise<{sceneSummary: string, characterUpdates: Array}>}
  */
 async function generateInitialStatsForScene(messages, characters, profileName, settings) {
+    const rstScope2 = captureChatScope();
+
     const systemPrompt = buildInitialStatSystemPrompt(settings);
     const requestPrompt = buildInitialStatRequestPrompt(messages, characters, settings);
 
-    const result = await makeRequest(profileName, systemPrompt, requestPrompt, 20000, 0.3);
+    const result = await rstScope2.wait(() => (makeRequest(profileName, systemPrompt, requestPrompt, 20000, 0.3)));
     if (!result) {
-        return { sceneSummary: "", characterUpdates: [] };
+        throw new Error("No initial-stat response; scene remains available for retry.");
     }
 
-    return parseInitialStatResponse(result, characters, messages.length);
+    return parseInitialStatResponse(result, characters, messages.length, messages);
 }
 
 /**
@@ -1666,6 +1657,7 @@ async function generateInitialStatsForScene(messages, characters, profileName, s
 function buildInitialStatSystemPrompt(settings) {
     return [
         'You are a relationship stat generator for new characters.',
+        'IMMUTABLE RELATIONSHIP ANCHOR: Every field evaluates TARGET CHARACTER -> USER/PERSONA. Narrative prominence never changes the anchor. Do not evaluate relationships between NPCs.',
         'Output ONLY a JSON object.',
         '',
         '',
@@ -1675,6 +1667,7 @@ function buildInitialStatSystemPrompt(settings) {
         '    "sceneSummary": "Concise summary of the scene...",',
         '    "characters": {',
         '      "[CHARACTER_NAME]": {',
+        '        "relationshipEvidence": "One factual sentence naming the USER/PERSONA and stating what this character directly did, observed, learned, or decided about them in this scene; empty string if none",',
         '        "stats": {',
         '          "platonic": {"trust":-100-100,"openness":-100-100,"support":-100-100,"affection":-100-100},',
         '          "romantic": {"trust":-100-100,"openness":-100-100,"support":-100-100,"affection":-100-100},',
@@ -1685,7 +1678,7 @@ function buildInitialStatSystemPrompt(settings) {
         '          "romantic": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"},',
         '          "sexual": {"trust":"reason","openness":"reason","support":"reason","affection":"reason"}',
         '        },',
-        '        "proposedMilestones": [{"title":"...","description":"...","domains":["platonic"]}],',
+        '        "proposedMilestones": [],',
         '        "proposedConditions": [{"type":"guarded","reason":"why it is active now","resolution":"what would resolve it"}],',
         '        "dynamicTitle": "...",',
         '        "narrativeSummary": "...",',
@@ -1700,20 +1693,24 @@ function buildInitialStatSystemPrompt(settings) {
         '',
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
+        '- relationshipEvidence is REQUIRED. Explicitly name {{user}}. If this character only interacts with or thinks about another NPC, or has no relationship-relevant exposure to {{user}}, use an empty string and return unchanged zero stats with empty relationship prose.',
+        '- A prominent viewpoint NPC is never a substitute for {{user}}. Do not output any NPC-to-NPC relationship under a character entry.',
         '- Per-character category visibility is authoritative. If a character is shown with only some visible/active categories, ONLY output stats/commentary/criticalStats/locks/pressure/reviews for those visible categories. Do not infer, update, propose locks for, unlock, or mention hidden categories.',
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
-        '- proposedMilestones: OPTIONAL and RARE. RST milestones are ONLY about THIS CHARACTER <-> {{user}}; never use an NPC<->NPC event. Require a durable, consequential relationship redefinition, not a thank-you, food/comfort gesture, ordinary encouragement, first meeting, routine apology, generic fight, or single vulnerable line. At most 1 per character, with factual title/description and relevant domains.',
+        '- proposedMilestones is a REQUIRED ASSESSMENT FIELD for every returned character. Evaluate it on EVERY initial/update result and never omit it. If this scene materially and durably redefines THIS CHARACTER <-> {{user}}, return exactly one factual milestone object with title, description, and relevant domains; otherwise return []. Rarity is not a reason to suppress a qualifying milestone, but do not invent one. Never use an NPC<->NPC event, and do not treat a thank-you, food/comfort gesture, ordinary encouragement, first meeting, routine apology, generic fight, or single vulnerable line as a milestone by itself.',
         `- proposedConditions: OPTIONAL. At most ${MAX_NEW_CONDITIONS_PER_UPDATE} new temporary relationship condition. Allowed types: ${getRelationshipConditionCatalogForPrompt()}. Give why it is active and a specific resolution condition. Conditions are contextual lenses, not permanent personality traits or stat bonuses.`,
-        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Only a critical that actually fires mechanically bypasses relationship inertia. Still provide your normal stat value for it.',
+        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Only a critical that actually fires mechanically receives the wider critical range. Still provide your normal stat value for it.',
         '- proposedHardLocks: OPTIONAL. ONLY for characters marked "Hard-lock eligible: YES". If "NO", you MUST leave this empty for that character. When eligible, and if the character\'s defined personality/psychology/history makes a stat realistically incapable of exceeding a certain level (e.g. a deeply traumatized character who cannot trust past ~40%), propose a cap as {"stat":"category.stat","cap":NUMBER,"reason":"..."}. Propose ONLY when strongly justified \u2014 a hard lock is exceptional, reserved for a true defining ceiling, never routine. Most scenes should propose ZERO. Do not lock a stat just because it is plausible or currently low. When in doubt, leave it empty. Grounded in their stated personality — never guess on a blank slate. Leave empty for most characters. Do NOT propose caps below the stat\'s current value.',
         '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If no slots are open, propose NONE. The "Soft-lock slots OPEN" number is a CEILING, not a target — propose anywhere from zero up to that many, and zero or one is the typical, expected answer. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Each entry: {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. Never propose a lock just to use an available slot — only when it is genuinely warranted by the story.',
         '- unlockedSoftLocks: for any EXISTING soft lock listed in the character\'s data, if its condition was FULFILLED during this scene, list its "category.stat" here. The stat will then auto-unlock and resume normal growth. Only include locks that are genuinely satisfied by what happened.',
         '- softLockProgress: for existing soft locks that are NOT yet met, optionally provide an updated prose progress note reflecting movement toward the condition this scene.',
         '- hardLockPressureUpdates: ONLY for stats that ALREADY have a hard lock (shown with "pressure X/5"). NEVER create pressure for an unlocked stat. Pressure tracks EVIDENCE the character is acting against the lock\'s psychological REASON; it does NOT change the stat value. Scale: +2 major sustained contradiction; +1 meaningful contradiction; 0 no change (default for almost every scene); -1 reinforced the locked pattern; -2 severe regression. Changes must be RARE and evidence-based. Possessiveness, jealousy, attraction, fascination, sexual tension, protectiveness, or angst do NOT count unless the behavior directly contradicts the specific lock reason. COUNTS: relying on {{user}}\'s judgment without controlling the outcome (contradicts a belief that reliance is weakness). Does NOT count: becoming more fascinated (not structural), or protecting {{user}} because they consider {{user}} theirs (possessive protection reinforces the lock).',
         '- hardLockReviews: include an entry ONLY when a hard lock pressure reaches max (5/5) this scene. Shape {"stat":"category.stat","recommendation":"maintain|raise_cap|convert_to_soft|remove","recommendedCap":NUMBER,"reason":"..."}. Recommend a modest raise (+5/+10) unless evidence is overwhelming (+15 max). You only recommend; the user decides.',
+        '- STAGNATION IS NOT REGRESSION: no growth is a valid outcome. Do not turn a flat or uneventful interaction into a negative stat movement.',
+        '- DECREASES require direct negative relational evidence toward {{user}}; mere distance, silence, awkwardness, or lack of progress is insufficient.',
         '- Range: -100 to 100. 0 = neutral.',
-        '- Commentary: explain each stat from scene events.',
+        '- Commentary must be DYNAMIC RELATIONSHIP COMMENTARY, not a scene summary: explain the character-to-{{user}} interpretation behind the stat.',
         '- Dynamic title: character\'s relationship role/attitude toward {{user}}.',
     ].join('\n');
 }
@@ -1753,7 +1750,9 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
     parts.push("");
 
     // Scene messages
-    const userName = getContext().name1 || "User";
+    const persona = getPersonaContext();
+    const userName = persona.name || getContext().name1 || "User";
+    parts.push(`IMMUTABLE RELATIONSHIP SUBJECT: ${userName}. Every stat and every prose field must describe the listed character's relationship toward ${userName}. Another NPC's screen time, viewpoint, family, friends, or subplot cannot replace ${userName} as the subject.`);
     parts.push("SCENE MESSAGES (\"" + userName + "\" is the user/player, all other named speakers are characters):");
     messages.forEach((m, i) => {
         const speaker = m.name || "Unknown";
@@ -1765,12 +1764,12 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
     // Character discovery instruction — be INCLUSIVE by default
     parts.push('');
     parts.push('CRITICAL — Scan for ALL additional characters:');
-    parts.push('- You MUST identify EVERY named individual who appears, speaks, interacts, or is described as doing something in the scene messages.');
-    parts.push('- INCLUDE characters who: speak dialogue, are addressed by name, perform actions described by another speaker, interact with someone in the scene, or are described as being physically present or doing an activity.');
+    parts.push(`- Identify named individuals only when they have relationship-relevant exposure to ${userName}: direct interaction, observation, learning, direction, or a current reaction/decision about ${userName}.`);
+    parts.push(`- EXCLUDE a character whose only scene role is interacting with another NPC. Being present, speaking, or doing something in an NPC-only subplot does not establish a relationship with ${userName}.`);
     parts.push('- Example of INCLUDE: a character says "I talked with [Name]" or "[Name] handed me the package" — [Name] is interacting. ALSO INCLUDE remote involvement: "[Name] watched the feed of her" or "[Name]\'s operatives tailed her on his orders" — [Name] is shaping/observing the scene from afar and IS affected by it.');
     parts.push('- Example of EXCLUDE: "I heard about [Name]\'s reputation" — [Name] is merely discussed with no described interaction.');
-    parts.push('- When in doubt, INCLUDE the character.');
-    parts.push('Include them in your characters object with full stat estimates based on their scene behavior.');
+    parts.push(`- When uncertain whether the evidence concerns ${userName} rather than another NPC, do not initialize the relationship.`);
+    parts.push(`Include qualifying characters with full estimates grounded only in their behavior, knowledge, and decisions toward ${userName}.`);
     parts.push('');
 
     // Force JSON-only output
@@ -1785,24 +1784,19 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
  * @param {Array} characters - Character profiles
  * @returns {{sceneSummary: string, characterUpdates: Array}}
  */
-function parseInitialStatResponse(response, characters, messageCount = Infinity) {
+function parseInitialStatResponse(response, characters, messageCount = Infinity, messages = []) {
     const parsed = extractJsonFromResponse(response);
     if (!parsed) {
         // Try analysis-text fallback before giving up on character data
         const fallbackResult = parseStatUpdateAnalysisText(response, characters);
         if (fallbackResult) {
-            dlog("[RST] Parsed initial stat response using analysis-text fallback");
-            return fallbackResult;
+            dlog("[RST] Initial analysis-text fallback lacks relationshipEvidence; preserving scene metadata and defaulting every relationship to no change.");
+            return { ...fallbackResult, characterUpdates: characters.map(createNoChangeEntry) };
         }
-        const partial = extractPartialData(response);
-        console.warn(`[RST] Could not fully parse initial stat response. Using partial data.`, partial);
-        return {
-            sceneSummary: partial.sceneSummary,
-            sceneTitle: partial.sceneTitle,
-            characterUpdates: [],
-        };
+        throw new Error("Invalid initial stat response. Retry the scene review.");
     }
 
+    if (!parsed.characters || typeof parsed.characters !== "object" || Array.isArray(parsed.characters)) throw new Error("Invalid stat response: missing characters object.");
     const sceneSummary = parsed.sceneSummary || "";
     const sceneTitle = parsed.sceneTitle || "";
     const characterUpdates = [];
@@ -1814,8 +1808,9 @@ function parseInitialStatResponse(response, characters, messageCount = Infinity)
         const charEntry = findParsedCharacterEntryForProfile(parsed.characters, char, consumedCharacterKeys);
         const charData = charEntry?.data;
         if (charEntry?.key) consumedCharacterKeys.add(charEntry.key);
-        if (!charData || !charData.stats) {
+        if (!charData || !charData.stats || !hasGroundedRelationshipEvidence(char, charData, messages)) {
             // Character not in response — create a no-change entry at zero
+            if (charData?.stats) dlog(`[RST] Rejected initial stats for ${char.name}: missing or invalid persona-anchored relationship evidence.`);
             characterUpdates.push(createNoChangeEntry(char));
             continue;
         }
@@ -1823,144 +1818,86 @@ function parseInitialStatResponse(response, characters, messageCount = Infinity)
         characterUpdates.push(createInitialUpdateEntry(char, charData, "llm_initial", messageCount));
     }
 
-    // Handle LLM-discovered characters (in parsed.characters but not in input list)
-    if (parsed && parsed.characters) {
-        const inputNameVariants = new Set(characters.flatMap(c => getCharacterNameVariants(c)).map(normalizeCharacterName));
-        const allKnownChars = getAllCharacters();
-        for (const [llmName, llmData] of Object.entries(parsed.characters)) {
-            const lowerLlmName = normalizeCharacterName(llmName);
-            if (!consumedCharacterKeys.has(llmName) && !inputNameVariants.has(lowerLlmName) && llmData && llmData.stats) {
-                // Check if this LLM name matches an existing character (by alias, exact name, or fuzzy word match)
-                const matchedExisting = allKnownChars.find(c => {
-                    if (c.name.toLowerCase().trim() === lowerLlmName) return true;
-                    if (c.nameAliases && Array.isArray(c.nameAliases)) {
-                        if (c.nameAliases.some(a => a.toLowerCase().trim() === lowerLlmName)) return true;
-                    }
-                    const cWords = c.name.toLowerCase().trim().split(/\s+/).filter(Boolean).sort().join(" ");
-                    const llmWords = lowerLlmName.split(/\s+/).filter(Boolean).sort().join(" ");
-                    return cWords === llmWords;
-                });
-                if (matchedExisting) {
-                    if (characterUpdates.some((u) => u.characterId === matchedExisting.id)) {
-                        dlog(`[RST] Skipping duplicate initial LLM key "${llmName}" for existing character "${matchedExisting.name}".`);
-                        continue;
-                    }
-                    // Name matches existing character — create one initial stat entry
-                    // against that existing profile. If the profile is still all-zero,
-                    // do NOT clamp by statChangeRange; this is first-time initialization.
-                    dlog(`[RST] LLM name "${llmName}" matches existing character "${matchedExisting.name}" — creating initial stat update entry`);
-                    if (isNewCharacter(matchedExisting)) {
-                        characterUpdates.push(createInitialUpdateEntry(matchedExisting, llmData, "llm_initial", messageCount));
-                    } else {
-                        const filteredData = filterCharacterDataByVisibleCategories(matchedExisting, llmData);
-                        const statsBefore = cloneStats(matchedExisting.stats);
-                        const settings = getSettings();
-                        const range = settings.statChangeRange || { min: -5, max: 5 };
-                        const mergedStats = mergeWithExistingStats(statsBefore, filteredData.stats || {});
-                        const matchedTrajectory = deriveRelationshipTrajectory(matchedExisting);
-                        const firedCriticals = resolveFiredCriticalStats(filteredData.criticalStats, settings);
-                        const matchedInertia = applyRelationshipInertia(matchedExisting, statsBefore, clampStats(mergedStats), firedCriticals, matchedTrajectory.label, range);
-                        const clampedAfter = applyDeltaRange(statsBefore, matchedInertia.statsAfter, range, filteredData.criticalStats, settings, matchedExisting.hardLocks, matchedExisting.softLocks, filteredData.unlockedSoftLocks, firedCriticals);
-                        const raisedCaps = clampedAfter.__raisedCaps || [];
-                        const unlockedSoftLocks = clampedAfter.__unlockedSoftLocks || [];
-                        let commentary = filteredData.commentary || null;
-                        if (!commentary || hasEmptyCommentary(commentary)) {
-                            commentary = generateFallbackCommentary(statsBefore, clampedAfter, matchedExisting);
-                        } else {
-                            commentary = fillMissingCommentary(commentary, statsBefore, clampedAfter, matchedExisting);
-                        }
-                        characterUpdates.push({
-                            characterId: matchedExisting.id,
-                            characterName: matchedExisting.name,
-                            statsBefore,
-                            statsAfter: clampedAfter,
-                            commentary,
-                                            proposedMilestones: [],
-                            proposedConditions: [],
-                            resolvedConditions: [],
-                            dynamicTitleBefore: matchedExisting.dynamicTitle || "",
-                            dynamicTitleAfter: filteredData.dynamicTitle || matchedExisting.dynamicTitle || "",
-                            milestoneReached: false,
-                            milestoneDetail: "",
-                            narrativeSummary: filteredData.narrativeSummary || matchedExisting.narrativeSummary || "",
-                            criticalStats: firedCriticals,
-                            inertiaAdjustments: matchedInertia.adjustments,
-                            raisedCaps,
-                            proposedHardLocks: Array.isArray(filteredData.proposedHardLocks) ? filteredData.proposedHardLocks : [],
-                            proposedSoftLocks: Array.isArray(filteredData.proposedSoftLocks) ? filteredData.proposedSoftLocks : [],
-                            unlockedSoftLocks,
-                            softLockProgress: Array.isArray(filteredData.softLockProgress) ? filteredData.softLockProgress : [],
-                            hardLockPressureUpdates: Array.isArray(filteredData.hardLockPressureUpdates) ? filteredData.hardLockPressureUpdates : [],
-                            hardLockReviews: Array.isArray(filteredData.hardLockReviews) ? filteredData.hardLockReviews : [],
-                            source: "llm",
-                            changeCount: countChanges(statsBefore, clampedAfter),
-                        });
-                    }
-                } else {
-                    // Truly new character — create new profile
-                    dlog("[RST] LLM discovered additional character (initial stat):", llmName);
-                    const newChar = createCharacter(llmName, { source: "auto_generated" });
-                    if (newChar) {
-                        _autoCreatedIds.add(newChar.id);
-                        const statsAfter = {};
-                        for (const cat of STAT_CATEGORIES) {
-                            statsAfter[cat] = {};
-                            for (const stat of STAT_NAMES) {
-                                const val = llmData.stats[cat]?.[stat];
-                                statsAfter[cat][stat] = typeof val === "number" ? Math.max(-100, Math.min(100, val)) : 0;
-                            }
-                        }
-                        const commentary = llmData.commentary || null;
-                        if (!commentary || hasEmptyCommentary(commentary)) {
-                            const fallback = {};
-                            for (const cat of STAT_CATEGORIES) {
-                                fallback[cat] = {};
-                                for (const stat of STAT_NAMES) {
-                                    const val = statsAfter[cat][stat];
-                                    if (val > 0) {
-                                        fallback[cat][stat] = "First impressions suggest positive feelings.";
-                                    } else if (val < 0) {
-                                        fallback[cat][stat] = "First impressions suggest negative feelings.";
-                                    } else {
-                                        fallback[cat][stat] = "No strong initial impression formed.";
-                                    }
-                                }
-                            }
-                            characterUpdates.push({
-                                characterId: newChar.id,
-                                characterName: newChar.name,
-                                statsBefore: null,
-                                statsAfter,
-                                commentary: fallback,
-                                dynamicTitleBefore: "",
-                                dynamicTitleAfter: llmData.dynamicTitle || "",
-                                milestoneReached: false,
-                                milestoneDetail: "",
-                                narrativeSummary: llmData.narrativeSummary || "",
-                                source: "llm_discovered_initial",
-                                changeCount: 12,
-                            });
-                        } else {
-                            characterUpdates.push({
-                                characterId: newChar.id,
-                                characterName: newChar.name,
-                                statsBefore: null,
-                                statsAfter,
-                                commentary,
-                                dynamicTitleBefore: "",
-                                dynamicTitleAfter: llmData.dynamicTitle || "",
-                                milestoneReached: false,
-                                milestoneDetail: "",
-                                narrativeSummary: llmData.narrativeSummary || "",
-                                source: "llm_discovered_initial",
-                                changeCount: 12,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    appendDiscoveredCharacterUpdates(parsed, characters, characterUpdates, messages);
     return { sceneSummary, sceneTitle, characterUpdates: dedupeCharacterUpdates(characterUpdates) };
+}
+
+/**
+ * New/zero-stat profiles are especially vulnerable to a parallel NPC subplot
+ * becoming the accidental relationship anchor. Require the model to identify
+ * concrete evidence that explicitly names the active persona before accepting
+ * a non-zero initialization. This still permits remote observation, secondhand
+ * learning, and parallel reactions; it only rejects NPC-to-NPC material and
+ * explicit statements that no relationship/exposure exists.
+ */
+export function hasGroundedRelationshipEvidence(profile, charData, messages = []) {
+    const evidence = String(charData?.relationshipEvidence || "").trim();
+    if (!evidence) return false;
+
+    const persona = getPersonaContext();
+    const personaName = String(persona?.name || getContext().name1 || "").trim();
+    const normalizedEvidence = normalizeNameForMatch(evidence);
+    const personaKeys = [personaName, ...personaName.split(/\s+/)]
+        .map(normalizeNameForMatch)
+        .filter((key) => key.length >= 3);
+    const namesPersona = personaKeys.some((key) => {
+        const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, "i").test(normalizedEvidence);
+    });
+    if (!namesPersona) return false;
+
+    const profileNames = getCharacterNameVariants(profile || {}).map(normalizeNameForMatch).filter(Boolean);
+    if (!profileNames.some((key) => {
+        const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, "i").test(normalizedEvidence);
+    })) return false;
+
+    if (/\b(?:never|hasn['’]?t|has not|hadn['’]?t|had not)\s+(?:met|interacted|spoken|talked|learned|heard|observed|seen|encountered)\b/i.test(evidence)) return false;
+    if (/\b(?:no|without)\s+(?:direct\s+)?(?:relationship|interaction|contact|awareness|knowledge|exposure)\b/i.test(evidence)) return false;
+    if (/\b(?:unknown|a stranger|an abstract concept)\s+to\b/i.test(evidence)) return false;
+
+    if (!Array.isArray(messages) || messages.length === 0) return true;
+
+    const normalizedProfileNames = new Set(profileNames);
+    const hasPersonaReference = (text) => {
+        const normalized = normalizeNameForMatch(text || "");
+        if (/\b(?:you|your|yours|yourself)\b/i.test(normalized)) return true;
+        return personaKeys.some((key) => {
+            const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, "i").test(normalized);
+        });
+    };
+
+    return messages.some((message, index) => {
+        if (!isNarrativeMessage(message)) return false;
+        if (profileNames.some((variant) => inferActivePresenceMode(message, variant, personaName) !== "unknown")) return true;
+
+        const relationalVerb = /\b(?:greet(?:ed|ing|s)?|meet(?:s|ing)?|met|introduc(?:e|es|ed|ing)|speak(?:s|ing)?|spoke|talk(?:s|ed|ing)?|ask(?:s|ed|ing)?|tell(?:s|ing)?|told|answer(?:s|ed|ing)?|reply|replies|replied|watch(?:es|ed|ing)?|observ(?:e|es|ed|ing)|monitor(?:s|ed|ing)?|surveil(?:s|led|ling)?|learn(?:s|ed|ing)?|hear(?:s|d|ing)?|help(?:s|ed|ing)?|protect(?:s|ed|ing)?|treat(?:s|ed|ing)?|touch(?:es|ed|ing)?|hug(?:s|ged|ging)?|kiss(?:es|ed|ing)?|attack(?:s|ed|ing)?|threaten(?:s|ed|ing)?|thank(?:s|ed|ing)?|apologi[sz](?:e|es|ed|ing))\b/i;
+        for (const segment of String(message.mes || "").split(/(?<=[.!?])\s+|\n+/)) {
+            const normalizedSegment = normalizeNameForMatch(segment);
+            const namesCharacter = profileNames.some((variant) => {
+                const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, "i").test(normalizedSegment);
+            });
+            if (namesCharacter && hasPersonaReference(segment) && relationalVerb.test(normalizedSegment)) return true;
+        }
+
+        if (message.is_user === true) {
+            const normalizedText = normalizeNameForMatch(message.mes || "");
+            const namesCharacter = profileNames.some((variant) => {
+                const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, "i").test(normalizedText);
+            });
+            if (namesCharacter && /\b(?:look(?:ed|ing)?|turn(?:ed|ing)?|face[ds]?|approach(?:ed|ing)?|greet(?:ed|ing)?|ask(?:ed|ing)?|tell|told|speak|spoke|talk(?:ed|ing)?|reply|replied|answer(?:ed|ing)?|touch(?:ed|ing)?|hug(?:ged|ging)?|kiss(?:ed|ing)?|help(?:ed|ing)?|thank(?:ed|ing)?|follow(?:ed|ing)?|join(?:ed|ing)?|nod(?:ded|ding)?|smile[ds]?|gesture[ds]?|wave[ds]?)\b/i.test(normalizedText)) return true;
+        }
+
+        const speaker = normalizeNameForMatch(message.name || "");
+        if (message.is_user !== true && normalizedProfileNames.has(speaker)) {
+            if (hasPersonaReference(message.mes)) return true;
+            // A named-character reply directly adjacent to a user turn is a
+            // grounded exchange even when the reply uses only pronouns.
+            return [messages[index - 1], messages[index + 1]].some((nearby) => nearby?.is_user === true);
+        }
+        return false;
+    });
 }

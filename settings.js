@@ -1,3 +1,8 @@
+import { invalidateChatScopes } from "./lib/chatScope.js";
+import { getChatData, persistChatData, getCharacters, saveAllCharacters } from "./data/storage.js";
+import { validateProfile } from "./data/characters.js";
+import { updateInjection } from "./inject/promptInjector.js";
+import { captureChatScope } from "./lib/chatScope.js";
 /**
  * settings.js — Settings management for RST
  * Handles initialization, loading, and saving of extension settings
@@ -14,6 +19,8 @@ import { dlog } from "./lib/debug.js";
  * Merges defaults with any existing saved settings.
  */
 export async function initSettings() {
+    const rstScope1 = captureChatScope();
+
     const current = getSettings();
     const defaults = getDefaultSettings();
 
@@ -118,38 +125,43 @@ export function getInjectionSettings() {
  * @returns {string}
  */
 export async function exportAllData() {
-    const data = {
-        settings: getSettings(),
-        characters: (await import("./data/storage.js")).getCharacters(),
-        version: "0.1.0",
-        exportedAt: new Date().toISOString(),
-    };
-    return JSON.stringify(data, null, 2);
+    return JSON.stringify({ settings: getSettings(), characters: getCharacters(), chatData: getChatData(), version: "0.1.24", exportedAt: new Date().toISOString() }, null, 2);
 }
 
-/**
- * Import all RST data from a JSON string.
- * @param {string} jsonString
- * @returns {boolean} True if imported successfully
- */
 export async function importAllData(jsonString) {
     try {
-        const data = JSON.parse(jsonString);
-        if (!data.settings || typeof data.settings !== "object") {
-            throw new Error("Invalid data format: missing settings");
+        const data = JSON.parse(jsonString, (key, value) => ["__proto__", "constructor", "prototype"].includes(key) ? undefined : value);
+        if (!data || !data.settings || typeof data.settings !== "object" || Array.isArray(data.settings)) throw new Error("Invalid settings object.");
+        const importedCharacters = data.chatData?.characters ?? data.characters;
+        if (!importedCharacters || typeof importedCharacters !== "object" || Array.isArray(importedCharacters)) throw new Error("Invalid character map.");
+        for (const [id, profile] of Object.entries(importedCharacters)) {
+            const errors = validateProfile(profile);
+            if (errors.length) throw new Error(`${id}: ${errors.join("; ")}`);
+            profile.id = id;
         }
-
-        const { saveAllCharacters } = await import("./data/storage.js");
-
-        // Import settings
-        saveAllSettings(data.settings);
-
-        // Import characters
-        if (data.characters && typeof data.characters === "object") {
-            saveAllCharacters(data.characters);
+        if (data.chatData !== undefined) {
+            if (!data.chatData || typeof data.chatData !== "object" || Array.isArray(data.chatData)) throw new Error("Invalid chat data.");
+            for (const field of ["scenes", "folders", "presentCharacters", "nameBlacklist"]) {
+                if (data.chatData[field] !== undefined && !Array.isArray(data.chatData[field])) throw new Error(`Invalid ${field}.`);
+            }
         }
-
-        dlog("[RST] Data imported successfully");
+        const settings = deepMerge(getDefaultSettings(), data.settings);
+        saveAllSettings(settings);
+        if (data.chatData) {
+            const current = getChatData();
+            for (const key of Object.keys(current)) delete current[key];
+            Object.assign(current, data.chatData, { characters: importedCharacters });
+            // Re-run namespace migration after assignment so legacy internal-only
+            // fields (including old inertia diagnostics) are stripped immediately.
+            getChatData();
+            persistChatData();
+        } else {
+            saveAllCharacters(importedCharacters); // legacy backup
+            getChatData();
+            persistChatData();
+        }
+        invalidateChatScopes();
+        updateInjection();
         return true;
     } catch (err) {
         console.error("[RST] Failed to import data:", err);
@@ -168,7 +180,9 @@ export async function importAllData(jsonString) {
  */
 function deepMerge(target, source) {
     const result = { ...target };
-    for (const key of Object.keys(source)) {
+    for (const key of Object.keys(source || {})) {
+        if (["__proto__", "constructor", "prototype"].includes(key)) continue;
+        if (target[key] && typeof target[key] === "object" && !Array.isArray(target[key]) && (!source[key] || typeof source[key] !== "object" || Array.isArray(source[key]))) continue;
         if (
             source[key] &&
             typeof source[key] === "object" &&

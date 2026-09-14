@@ -123,8 +123,8 @@ const rateLimiter = new RateLimiter();
  * @param {object} batchSettings - The batchScan settings object
  */
 export function updateRateLimiterSettings(batchSettings = {}) {
-    rateLimiter.requestsPerMinute = batchSettings.requestsPerMinute ?? 10;
-    rateLimiter.maxRetries = batchSettings.maxRetries ?? 3;
+    rateLimiter.requestsPerMinute = Math.max(1, Number(batchSettings.requestsPerMinute) || 10);
+    rateLimiter.maxRetries = Math.max(0, Math.min(10, Number(batchSettings.maxRetries ?? 3) || 0));
     rateLimiter.baseDelayMs = batchSettings.baseRetryDelay ?? 1000;
 }
 
@@ -191,6 +191,53 @@ export function getConnectionProfile(profileName) {
     }
 }
 
+/**
+ * Extract only the model's public answer from SillyTavern's request result.
+ *
+ * ST 1.18 deliberately returns reasoning separately from content.  Reasoning is
+ * not an alternate answer channel: it may contain an unfinished chain of
+ * thought, examples from the prompt, or partial JSON.  Treating it as the
+ * answer allowed a reasoning-only/truncated response to reach RST's permissive
+ * parsers and become a presence or stat proposal.
+ *
+ * @param {unknown} response
+ * @returns {string|null}
+ */
+export function extractPublicAnswer(response) {
+    if (typeof response === "string") {
+        return response.trim() ? response : null;
+    }
+
+    if (!response || typeof response !== "object") return null;
+
+    // Current ConnectionManagerRequestService extractData result.
+    if (Object.prototype.hasOwnProperty.call(response, "content")) {
+        const content = typeof response.content === "string" ? response.content : "";
+        if (content.trim()) return content;
+        if (typeof response.reasoning === "string" && response.reasoning.trim()) {
+            console.warn("[RST] The selected model returned reasoning but no public answer. RST discarded the private reasoning instead of parsing it as data.");
+        }
+        return null;
+    }
+
+    // Compatibility with callers that disable ST's extractData option.
+    const message = response.choices?.[0]?.message;
+    if (message && Object.prototype.hasOwnProperty.call(message, "content")) {
+        const content = typeof message.content === "string" ? message.content : "";
+        if (content.trim()) return content;
+        if (typeof message.reasoning === "string" && message.reasoning.trim()) {
+            console.warn("[RST] The selected model returned reasoning but no public answer. RST discarded the private reasoning instead of parsing it as data.");
+        }
+        return null;
+    }
+
+    if (typeof response.response === "string" && response.response.trim()) {
+        return response.response;
+    }
+
+    return null;
+}
+
 // ─── LLM Request API ──────────────────────────────────────
 
 /**
@@ -233,8 +280,8 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
     // profiles until a per-profile map is set.
     const softMap = getSetting("noThinkProfiles", null);
     const hardMap = getSetting("noThinkHardProfiles", null);
-    const softOn = (softMap && typeof softMap === "object") ? !!softMap[profileId] : getSetting("noThink", false);
-    const hardOn = (hardMap && typeof hardMap === "object") ? !!hardMap[profileId] : getSetting("noThinkHard", false);
+    const softOn = (softMap && Object.prototype.hasOwnProperty.call(softMap, profileId)) ? !!softMap[profileId] : getSetting("noThink", false);
+    const hardOn = (hardMap && Object.prototype.hasOwnProperty.call(hardMap, profileId)) ? !!hardMap[profileId] : getSetting("noThinkHard", false);
 
     try {
         // Wrap the actual API call with rate limiter + retry logic
@@ -289,67 +336,13 @@ export async function makeRequest(profileId, systemPrompt, userPrompt, maxTokens
             );
         });
 
-        // Extract content from response — handle multiple response formats
-        if (typeof response === "string") {
-            return response;
+        const answer = extractPublicAnswer(response);
+        if (answer === null) {
+            console.warn("[RST] Connection Manager returned no usable public answer.", {
+                hasReasoning: !!(response && typeof response === "object" && response.reasoning),
+            });
         }
-
-        if (response && typeof response === "object") {
-            // ST ChatCompletion format: { choices: [{ message: { content, reasoning? }, finish_reason? }] }
-            if (response.choices && Array.isArray(response.choices) && response.choices[0]?.message?.content !== undefined) {
-                const content = response.choices[0].message.content;
-                const reasoning = response.choices[0].message.reasoning;
-                const finishReason = response.choices[0].finish_reason;
-                dlog("[RST] makeRequest raw — hasContent:", !!content, "hasReasoning:", !!reasoning,
-                    "contentLen:", (content || "").length, "reasoningLen:", (reasoning || "").length,
-                    "finishReason:", finishReason,
-                    "contentPreview:", (content || "").substring(0, 120));
-                // Gemma/DeepSeek thinking models route all output through `reasoning`,
-                // leaving `content` empty. The reasoning contains the model's analysis
-                // AND may contain the answer. Pass it through — parseDetectedNames will
-                // safely handle it (JSON extraction first, bail out if pure prose).
-                if (!content && reasoning) {
-                    dlog("[RST] makeRequest: content empty, returning reasoning (len=" + (reasoning || "").length +
-                        ", finishReason=" + finishReason + ")");
-                    return reasoning;
-                }
-                // Thinking/reasoning models (e.g. Gemma, DeepSeek-R1) may put
-                // chain-of-thought in `content` and the actual answer in `reasoning`.
-                // Detect this case: if both exist and content looks like prose/thinking
-                // rather than the requested structured output, prefer reasoning.
-                if (content && reasoning) {
-                    const trimmedContent = (content || "").trim();
-                    const trimmedReasoning = (reasoning || "").trim();
-                    // If content looks like thinking prose (doesn't start with JSON)
-                    // but reasoning starts with JSON, prefer reasoning.
-                    const contentLooksLikeJSON = /^\s*[\[{]/.test(trimmedContent);
-                    const reasoningLooksLikeJSON = /^\s*[\[{]/.test(trimmedReasoning);
-                    if (!contentLooksLikeJSON && reasoningLooksLikeJSON) {
-                        dlog("[RST] makeRequest: content appears to be thinking prose, preferring reasoning field as answer");
-                        return trimmedReasoning;
-                    }
-                    // If both are prose but reasoning is shorter (likely the answer),
-                    // still prefer reasoning as it's less likely to be the thinking trace.
-                    if (!contentLooksLikeJSON && !reasoningLooksLikeJSON && trimmedReasoning.length < trimmedContent.length) {
-                        dlog("[RST] makeRequest: both fields are prose, preferring shorter reasoning field as answer");
-                        return trimmedReasoning;
-                    }
-                }
-                return content;
-            }
-            // Simple { content: "..." } format (TextCompletion or some ST versions)
-            if (response.content !== undefined) {
-                // Reasoning models may return empty content with reasoning at top level
-                return response.content || response.reasoning || '';
-            }
-            // Some ST versions may use different field names
-            if (response.response) {
-                return response.response;
-            }
-        }
-
-        console.warn("[RST] Unexpected response format from ConnectionManagerRequestService:", response);
-        return null;
+        return answer;
     } catch (err) {
         console.error(`[RST] LLM request failed for profile "${profileId}" after retries:`, err);
         toastr?.error?.(`LLM request failed after retries. Check your connection settings for "${profileId}".`);

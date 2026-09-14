@@ -1992,14 +1992,38 @@ dialog.popup .editor_maximize:hover {
 .rst-milestone-item:first-child { border-top: 0; }
 .rst-milestone-title { font-size: 12px; font-weight: 600; }
 .rst-milestone-description { font-size: 11px; line-height: 1.5; margin-top: 2px; }
-
-.rst-inertia-note {
-    margin-top: 4px;
-    font-size: 10px;
-    line-height: 1.45;
-    color: var(--rst-text-muted);
+.rst-milestone-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 9px;
+    padding-top: 7px;
+    border-top: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #888) 12%, transparent);
 }
-.rst-inertia-note i { margin-right: 4px; opacity: 0.8; }
+.rst-milestone-page-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 27px;
+    height: 25px;
+    padding: 0;
+    border: 0.5px solid var(--rst-border);
+    border-radius: 5px;
+    background: transparent;
+    color: var(--rst-text-muted);
+    cursor: pointer;
+}
+.rst-milestone-page-btn:hover:not(:disabled) {
+    color: var(--rst-text);
+    background: rgba(127, 127, 127, 0.12);
+}
+.rst-milestone-page-btn:disabled { opacity: 0.35; cursor: default; }
+.rst-milestone-page-status {
+    min-width: 72px;
+    text-align: center;
+    color: var(--rst-text-muted);
+    font-size: 11px;
+}
 
 /* Milestone maintenance controls */
 .rst-milestone-head {

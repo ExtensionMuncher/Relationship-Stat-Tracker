@@ -1,11 +1,11 @@
 {
-	"display_name": "Relationship Stat Tracker",
-	"loading_order": 2,
-	"default_state": "enabled",
-	"requires": [],
-	"optional": [],
-	"js": "index.js",
-	"css": "style.css",
-	"author": "ExtensionMuncher",
-	"version": "0.1.0"
+    "display_name": "Relationship Stat Tracker",
+    "loading_order": 2,
+    "default_state": "enabled",
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "ExtensionMuncher",
+    "version": "0.1.24"
 }

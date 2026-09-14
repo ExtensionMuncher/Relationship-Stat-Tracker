@@ -1,3 +1,4 @@
+import { captureChatScope } from "../lib/chatScope.js";
 /**
  * batchScan.js — Full chat history batch scan
  * Scans existing chat history, auto-detects scene boundaries, identifies characters,
@@ -11,10 +12,14 @@ import { getContext } from "../../../../extensions.js";
 import { makeRequest, reportProgress, updateRateLimiterSettings } from "./connections.js";
 import { getSettings, getNameBlacklist, isNameBlacklisted } from "../data/storage.js";
 import { getScenes, saveScenes } from "../data/storage.js";
-import { findCharacterByName, findCharacterByFuzzyName, createCharacter, updateCharacterStats, getCharacterProfile, addUpdateLogEntry, updateCharacterProfile, getAllCharacters, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
+import { findCharacterByName, findCharacterByFuzzyName, createCharacter, updateCharacterStats, getCharacterProfile, addUpdateLogEntry, updateCharacterProfile, getAllCharacters, getCharacterNameVariants, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { initSceneCounter, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
 import { showPanelLoading, hidePanelLoading } from "../ui/panel.js";
 import { dlog } from "../lib/debug.js";
+import { isNarrativeMessage } from "../lib/chatMessages.js";
+import { inferActivePresenceMode } from "./sidecar.js";
+import { hasGroundedRelationshipEvidence, buildEstablishedCharacterUpdate, isUnestablishedCharacter } from "./statUpdate.js";
+import { isMeaningfulCharacterUpdate } from "../data/approval.js";
 
 // ─── Constants ─────────────────────────────────────────────
 
@@ -35,7 +40,7 @@ const EXCLUDED_NAMES = new Set(["{{user}}", "user", "User"]);
 export function buildHistoricalScanChunks(options = {}) {
     const maxMessages = Math.max(10, Math.min(100, Number(options.maxMessages) || 30));
     const maxChars = Math.max(20000, Math.min(120000, Number(options.maxChars) || 60000));
-    const visibleMessages = (chat || []).filter((m) => !m?.is_system);
+    const visibleMessages = Array.isArray(chat) ? chat : [];
     if (visibleMessages.length === 0) return [];
 
     const closedScenes = (getScenes() || [])
@@ -78,7 +83,7 @@ export function buildHistoricalScanChunks(options = {}) {
         const lines = [];
         for (let i = current.start; i <= current.end; i++) {
             const m = visibleMessages[i];
-            if (!m) continue;
+            if (!isNarrativeMessage(m)) continue;
             const speaker = String(m.name || "Unknown");
             const text = String(m.mes || "");
             messages.push({ index: i, name: speaker, isUser: !!m.is_user, text });
@@ -104,7 +109,9 @@ export function buildHistoricalScanChunks(options = {}) {
             while (partEnd + 1 <= end && count < maxMessages) {
                 const nextIndex = partEnd + 1;
                 const m = visibleMessages[nextIndex];
-                const nextChars = String(m?.mes || "").length + String(m?.name || "").length + 16;
+                const nextChars = isNarrativeMessage(m)
+                    ? String(m?.mes || "").length + String(m?.name || "").length + 16
+                    : 0;
                 if (count > 0 && chars + nextChars > maxChars) break;
                 partEnd = nextIndex;
                 chars += nextChars;
@@ -142,21 +149,69 @@ export function buildHistoricalScanChunks(options = {}) {
 /**
  * Normalize a name for comparison by stripping parenthetical annotations,
  * normalizing diacritics (ō -> o, ū -> u, etc.), and lowercasing.
- * This allows LLM-returned names like "José Muñoz" or "Renée Dubois (referenced)"
- * to match chat speaker names like "Jose Munoz" or "Renee Dubois".
+ * This allows LLM-returned names with punctuation, ordering, or parenthetical annotations
+ * to match equivalent chat speaker names.
  * @param {string} name
  * @returns {string} Normalized name, or empty string if name is invalid.
  */
 function normalizeNameForComparison(name) {
     if (!name) return "";
     let cleaned = name
-        // Strip parenthetical annotations: "(referenced)", "(Mira)", etc.
+        // Strip parenthetical annotations such as "(referenced)" or role labels.
         .replace(/\s*\([^)]*\)\s*/g, "")
         .trim();
     if (!cleaned) return "";
     // Normalize Unicode diacritics: decompose (NFD) then strip combining marks
     cleaned = cleaned.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
     return cleaned.toLowerCase().trim();
+}
+
+/**
+ * Validate one scene-detection name against the actual messages in that scene.
+ * Sender metadata is accepted when it directly names the character; otherwise
+ * the same active-presence evidence rules used by the sidecar must succeed.
+ * Mention-only, historical, hypothetical, document-only, and reference-object
+ * names therefore cannot enter Batch Scan's profile-creation roster.
+ */
+function isBatchSceneCharacterGrounded(name, sceneMessages, personaName = "") {
+    const profile = findCharacterByFuzzyName(name) || findCharacterByName(name);
+    const variants = profile ? getCharacterNameVariants(profile) : [name];
+    const normalizedVariants = new Set(variants.map(normalizeNameForComparison).filter(Boolean));
+
+    for (const message of sceneMessages) {
+        if (!isNarrativeMessage(message)) continue;
+        if (!message.is_user && normalizedVariants.has(normalizeNameForComparison(message.name || ""))) return true;
+        for (const variant of variants) {
+            if (inferActivePresenceMode(message, variant, personaName) !== "unknown") return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Ground every LLM-proposed scene roster against its own message range before
+ * any profile is created or any scene object is persisted.
+ */
+function validateBatchSceneRosters(detectedScenes, allMessages, personaName = "") {
+    return detectedScenes.map((scene) => {
+        const start = Math.max(0, Number(scene.messageStart) || 0);
+        const end = Math.min(allMessages.length - 1, Number(scene.messageEnd) || start);
+        const sceneMessages = allMessages.slice(start, end + 1);
+        const accepted = [];
+        const seen = new Set();
+        for (const rawName of (Array.isArray(scene.characters) ? scene.characters : [])) {
+            const name = String(rawName || "").trim();
+            const key = normalizeNameForComparison(name);
+            if (!key || seen.has(key)) continue;
+            if (!isBatchSceneCharacterGrounded(name, sceneMessages, personaName)) {
+                dlog(`[RST] Batch roster rejected reference-only/unverified name "${name}" for scene ${start}-${end}.`);
+                continue;
+            }
+            accepted.push(name);
+            seen.add(key);
+        }
+        return { ...scene, characters: accepted };
+    });
 }
 
 // ─── Main Entry Point ─────────────────────────────────────
@@ -174,6 +229,8 @@ function normalizeNameForComparison(name) {
  * @returns {Promise<{scenesCreated: number, profilesCreated: string[]}>}
  */
 export async function runBatchScan() {
+    const rstScope1 = captureChatScope();
+
     const settings = getSettings();
     const autoGenProfile = settings.connections.autoGenLLM;
     const statUpdateProfile = settings.connections.statUpdateLLM;
@@ -225,11 +282,13 @@ export async function runBatchScan() {
 
     const existingScenes = getScenes();
 
-    // Respect ST's message hiding: only process visible (non-system) messages.
-    // ST marks hidden messages with is_system=true, mirroring how ST's Generate()
-    // builds coreChat = chat.filter(x => !x.is_system ...) for the context window.
-    const allMessages = chat.filter(m => !m.is_system);
-    dlog(`[RST] Processing ${allMessages.length} visible messages out of ${chat.length} total (${chat.length - allMessages.length} hidden)`);
+    // Preserve ST's absolute positions while excluding non-narrative records
+    // from every prompt built below.
+    // Preserve original SillyTavern indices. Prompts filter each range with
+    // isNarrativeMessage(), but scene/evidence references remain absolute.
+    const allMessages = structuredClone(chat);
+    const narrativeCount = chat.filter(isNarrativeMessage).length;
+    dlog(`[RST] Processing ${narrativeCount} narrative messages out of ${chat.length} total (${chat.length - narrativeCount} excluded)`);
 
     // Non-compounding: determine unprocessed message ranges (only within visible messages)
     const ranges = getUnprocessedRanges(existingScenes, allMessages.length, 0);
@@ -258,7 +317,7 @@ export async function runBatchScan() {
     });
 
     // Phase 1: Detect scenes via LLM (pass combineRanges flag)
-    const detectedScenes = await detectScenes(allMessages, ranges, autoGenProfile, settings, combineRanges);
+    let detectedScenes = await rstScope1.wait(() => (detectScenes(allMessages, ranges, autoGenProfile, settings, combineRanges)));
     completedApiCalls += 1; // Phase 1 counts as one progress step
 
     reportProgress({
@@ -280,70 +339,29 @@ export async function runBatchScan() {
         return { scenesCreated: 0, profilesCreated: [] };
     }
 
-    // Phase 2: Create profiles for unknown characters (filtering out {{user}} and resolved names)
+    const personaNameForRoster = getContext().name1
+        || allMessages.find((message) => isNarrativeMessage(message) && message.is_user)?.name
+        || "";
+    detectedScenes = validateBatchSceneRosters(detectedScenes, allMessages, personaNameForRoster);
+    dlog("[RST-DEBUG] Grounded Batch Scan scene rosters:", JSON.stringify(detectedScenes.map((scene) => ({
+        start: scene.messageStart, end: scene.messageEnd, characters: scene.characters,
+    }))));
+
+    // Phase 2: Create profiles only from names grounded as active scene participants.
     // Detect the user's persona name from chat messages
-    const userNameFromChat = allMessages.find(m => m.is_user)?.name || "";
+    const userNameFromChat = allMessages.find(m => isNarrativeMessage(m) && m.is_user)?.name || "";
     const userNamesToExclude = new Set([...EXCLUDED_NAMES, userNameFromChat, ...(getNameBlacklist() || [])]);
     const profilesCreated = [];
     const allCharNames = new Set();
 
-    // Build a set of all actual speaker names from the chat messages (normalized).
-    const chatSpeakerNames = new Set();
-    for (const msg of allMessages) {
-        if (msg.name && !msg.is_user) {
-            chatSpeakerNames.add(normalizeNameForComparison(msg.name));
-        }
-    }
-    dlog("[RST-DEBUG] chatSpeakerNames:", [...chatSpeakerNames]);
-
-    // --- Multi-character RP detection ---
-    // In multi-character roleplay, a single {{char}} card generates ALL character dialogue,
-    // so every assistant message has msg.name = the character card's display name
-    // (e.g., "Fantasy Academy AU RPG"). Individual character names like "Mira", "Kellan"
-    // never appear as sender names in message metadata.
-    //
-    // We detect this scenario: if there's only 1 unique non-user speaker name but the LLM
-    // detected multiple distinct character names, we're in a multi-character RP.
-    // In that case, we trust the LLM's character detection (it reads message *content*)
-    // rather than filtering against speaker names.
-    const uniqueSpeakers = chatSpeakerNames.size;
-    const llmDetectedCharCount = new Set();
+    // Scene detection is advisory only. validateBatchSceneRosters() has already
+    // grounded every name against active evidence in that scene, so Phase 2 can
+    // now consume one validated roster regardless of single-card or multi-card RP.
     for (const scene of detectedScenes) {
-        for (const n of scene.characters) {
-            const clean = normalizeNameForComparison(n);
-            if (clean) llmDetectedCharCount.add(clean);
-        }
-    }
-    const isMultiCharRP = uniqueSpeakers <= 1 && llmDetectedCharCount.size > 1;
-    dlog(`[RST-DEBUG] Multi-character RP detection: uniqueSpeakers=${uniqueSpeakers}, llmDetectedNames=${llmDetectedCharCount.size}, isMultiCharRP=${isMultiCharRP}`);
-
-    if (isMultiCharRP) {
-        // Multi-character RP: trust the LLM's character detection from message content.
-        // The LLM scene detection prompt already excludes {{user}}, so just filter excluded names.
-        dlog("[RST-DEBUG] Multi-character RP detected — trusting LLM character names, bypassing speaker-name filter.");
-        for (const scene of detectedScenes) {
-            for (const name of scene.characters) {
-                if (isNameBlacklisted(name, [...userNamesToExclude])) continue;
-                const cleanName = normalizeNameForComparison(name);
-                if (!cleanName) continue;
-                dlog(`[RST-DEBUG] Phase2 (multi-char): accepting name="${name}" -> clean="${cleanName}"`);
-                allCharNames.add(name);
-            }
-        }
-    } else {
-        // Single-character RP (or ambiguous): use speaker-name verification filter.
-        // This prevents descriptive {{char}} titles (e.g., "Fantasy AU RPG") from being
-        // treated as character names, while preserving legitimate character names like
-        // "Doe Jane" that DO appear as message senders.
-        for (const scene of detectedScenes) {
-            for (const name of scene.characters) {
-                if (isNameBlacklisted(name, [...userNamesToExclude])) continue;
-                const cleanName = normalizeNameForComparison(name);
-                const found = chatSpeakerNames.has(cleanName);
-                dlog(`[RST-DEBUG] Phase2 check: name="${name}" -> clean="${cleanName}" -> found=${found}`);
-                if (!cleanName || !found) continue;
-                allCharNames.add(name);
-            }
+        for (const name of scene.characters) {
+            if (isNameBlacklisted(name, [...userNamesToExclude])) continue;
+            if (!normalizeNameForComparison(name)) continue;
+            allCharNames.add(name);
         }
     }
     dlog("[RST-DEBUG] Phase 2: Character names to create profiles for:", [...allCharNames]);
@@ -367,6 +385,8 @@ export async function runBatchScan() {
     for (const detected of detectedScenes) {
         const charIds = detected.characters
             .map((name) => {
+    if (!rstScope1.isCurrent()) return;
+
                 const profile = findCharacterByFuzzyName(name) || findCharacterByName(name);
                 if (!profile) {
                     console.warn(`[RST-DEBUG] findCharacterByName returned null for "${name}"`);
@@ -379,11 +399,9 @@ export async function runBatchScan() {
         // Determine if {{user}} (resolved persona name) is present in this scene.
         // If the persona name is "{{user}}" or empty (can't resolve), default to true
         // since the parser strips "{{user}}" from scene characters before Phase 3.
-        let hasUserInteraction = true;
-        if (userNameFromChat && !EXCLUDED_NAMES.has(userNameFromChat)) {
-            hasUserInteraction = detected.characters.some(name => name === userNameFromChat);
-        }
-        dlog(`[RST-DEBUG] Scene ${detected.messageStart}-${detected.messageEnd}: hasUserInteraction=${hasUserInteraction} (userNameFromChat="${userNameFromChat}")`);
+        // Missing relevance from older responses remains eligible for analysis;
+        // absence from a character roster is not evidence of no exposure.
+        const hasUserInteraction = detected.hasPlayerRelevantInvolvement !== false;
 
         // Create scene as closed (historical)
         const scenes = getScenes();
@@ -437,7 +455,7 @@ export async function runBatchScan() {
             detail: `Waiting ${interPhaseDelay}ms before generating stats...`,
             elapsed: Date.now() - scanStartTime,
         });
-        await new Promise(r => setTimeout(r, interPhaseDelay));
+        await rstScope1.wait(() => (new Promise(r => setTimeout(r, interPhaseDelay))));
     }
 
     const perSceneDelay = bsSettings.perSceneDelay || 0;
@@ -450,13 +468,13 @@ export async function runBatchScan() {
             // Skip stat generation for scenes without {{user}} interaction
             if (!scene.hasUserInteraction) {
                 dlog(`[RST] Scene ${scene.id} (${scene.messageStart}-${scene.messageEnd}): No {{user}} interaction — saving scene as reference only, skipping stat generation.`);
-                updateSceneSummary(scene.id, "(Reference only — no direct {{user}} interaction in this scene)");
+                updateSceneSummary(scene.id, "(Reference only — no relationship-relevant player exposure in this scene)");
                 scenesProcessed++;
                 continue;
             }
 
             // Filter out hidden (is_system) messages from the scene data sent to the LLM
-            const sceneMessages = allMessages.slice(scene.messageStart, scene.messageEnd + 1).filter(m => !m.is_system);
+            const sceneMessages = allMessages.slice(scene.messageStart, scene.messageEnd + 1).filter(isNarrativeMessage);
             const characters = scene.charactersPresent
                 .map((id) => getCharacterProfile(id))
                 .filter(Boolean);
@@ -483,7 +501,7 @@ export async function runBatchScan() {
                 elapsed: Date.now() - scanStartTime,
             });
 
-            const result = await generateInitialStats(sceneMessages, characters, statUpdateProfile, settings);
+            const result = await rstScope1.wait(() => (generateInitialStats(sceneMessages, characters, statUpdateProfile, settings)));
 
             completedApiCalls++;
 
@@ -500,7 +518,7 @@ export async function runBatchScan() {
             // Apply initial stats + save commentary/log to character profiles
             for (const charUpdate of result.characterUpdates) {
                 const profile = getCharacterProfile(charUpdate.characterId);
-                if (profile) {
+                if (profile && isMeaningfulCharacterUpdate(charUpdate, profile)) {
                     updateCharacterStats(charUpdate.characterId, charUpdate.statsAfter);
 
                     // Save narrative summary and dynamic title
@@ -537,10 +555,13 @@ export async function runBatchScan() {
             // Per-scene delay (skip after the last scene)
             if (perSceneDelay > 0 && sceneIdx < createdScenes.length - 1) {
                 dlog(`[RST] Per-scene delay: waiting ${perSceneDelay}ms before next scene...`);
-                await new Promise(r => setTimeout(r, perSceneDelay));
+                await rstScope1.wait(() => (new Promise(r => setTimeout(r, perSceneDelay))));
             }
         } catch (err) {
+        rstScope1.assertCurrent();
+
             console.error(`[RST] Batch scan: Failed to process scene ${scene.id}:`, err);
+            throw new Error(`Batch scan stopped at ${scene.id}. Earlier scene results remain saved; process this and later scenes individually. ${err.message || ""}`);
         }
     }
 
@@ -565,6 +586,8 @@ export async function runBatchScan() {
  * @returns {Promise<Array<{messageStart: number, messageEnd: number, characters: string[]}>>}
  */
 async function detectScenes(allMessages, ranges, profileName, settings, combineRanges = false) {
+    const rstScope2 = captureChatScope();
+
     const systemPrompt = buildSceneDetectionSystemPrompt();
     const maxTokens = settings.batchScan?.sceneDetectionMaxTokens ?? 6000;
     const MAX_UNCHUNKED_SIZE = 500; // Safety guard: only chunk ranges > 500 messages
@@ -579,7 +602,7 @@ async function detectScenes(allMessages, ranges, profileName, settings, combineR
         if (totalMessages <= MAX_UNCHUNKED_SIZE) {
             dlog(`[RST] Combining ${ranges.length} ranges (${totalMessages} total messages) into single scene detection call.`);
             const requestPrompt = buildSceneDetectionRequest(allMessages, ranges);
-            const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
+            const result = await rstScope2.wait(() => (makeRequest(profileName, systemPrompt, requestPrompt, maxTokens)));
             if (result) {
                 dlog(`[RST-DEBUG] Scene detection LLM response (combined ${ranges.length} ranges):`, result.substring(0, 500));
                 const parsed = parseSceneDetectionResponse(result, ranges, _sceneBlacklist);
@@ -598,7 +621,7 @@ async function detectScenes(allMessages, ranges, profileName, settings, combineR
             // Send the full range in a single LLM call for natural boundary detection
             // This avoids artificial cuts at fixed intervals
             const requestPrompt = buildSceneDetectionRequest(allMessages, [range]);
-            const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
+            const result = await rstScope2.wait(() => (makeRequest(profileName, systemPrompt, requestPrompt, maxTokens)));
             if (result) {
                 dlog(`[RST-DEBUG] Scene detection LLM response (range ${range.start}-${range.end}):`, result.substring(0, 500));
                 const parsed = parseSceneDetectionResponse(result, [range], _sceneBlacklist);
@@ -612,7 +635,7 @@ async function detectScenes(allMessages, ranges, profileName, settings, combineR
                 const ce = Math.min(cs + MAX_UNCHUNKED_SIZE - 1, range.end);
                 const windowRange = { start: cs, end: ce };
                 const requestPrompt = buildSceneDetectionRequest(allMessages, [windowRange]);
-                const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
+                const result = await rstScope2.wait(() => (makeRequest(profileName, systemPrompt, requestPrompt, maxTokens)));
                 if (result) {
                     dlog(`[RST-DEBUG] Scene detection LLM response (window ${cs}-${ce}):`, result.substring(0, 500));
                     // Only take scenes within the non-overlapping portion
@@ -655,13 +678,15 @@ A "scene" is a substantial narrative unit with a consistent setting, time period
 - Exclude "{{user}}" or "User" from the character list — only list non-user characters
 - Exclude descriptive titles or narrative descriptors (e.g., "the narrator", "storyteller") — only list actual character names
 
+- Set hasPlayerRelevantInvolvement to true for direct interaction OR meaningful observation, remote influence, or learning/reacting to the persona in a parallel scene. Example: an NPC tells a distant character how {{user}} handled a dangerous situation, and the character re-evaluates them. Mere mention without exposure/reaction is insufficient.
 # RESPONSE FORMAT — return ONLY valid JSON:
 {
   "scenes": [
     {
       "messageStart": <int>,
       "messageEnd": <int>,
-      "characters": ["Character1", "Character2"]
+      "characters": ["Character1", "Character2"],
+      "hasPlayerRelevantInvolvement": true
     }
   ]
 }`;
@@ -683,7 +708,7 @@ function buildSceneDetectionRequest(allMessages, ranges) {
         parts.push(`--- MESSAGE RANGE ${range.start} to ${range.end} ---`);
         for (let i = range.start; i <= range.end && i < allMessages.length; i++) {
             const m = allMessages[i];
-            if (m.is_system) continue; // Skip hidden/context-excluded messages
+            if (!isNarrativeMessage(m)) continue; // Skip non-narrative utility/context messages
             const speaker = m.name || "Unknown";
             const text = (m.mes || "");
             parts.push(`[${i}] ${speaker}: ${text}`);
@@ -693,8 +718,8 @@ function buildSceneDetectionRequest(allMessages, ranges) {
 
     // Schema reminder + character completeness
     parts.push('');
-    parts.push('Also scan the messages for ALL characters who speak, appear, or are referenced. List every one of them.');
-    parts.push('Return JSON only: {"scenes": [{"messageStart": <int>, "messageEnd": <int>, "characters": ["Name1", ...]}]}');
+    parts.push('List actual named active participants, including remote or parallel participants. Do not list reference-only names or a generic narrator label.');
+    parts.push('Return JSON only: {"scenes": [{"messageStart": <int>, "messageEnd": <int>, "characters": ["Name1", ...], "hasPlayerRelevantInvolvement": true}]}');
 
     return parts.join("\n");
 }
@@ -750,6 +775,7 @@ function parseSceneDetectionResponse(response, ranges, blacklistSet = new Set())
             messageStart: start,
             messageEnd: end,
             characters,
+            hasPlayerRelevantInvolvement: scene.hasPlayerRelevantInvolvement !== false,
         });
     }
 
@@ -972,16 +998,18 @@ function getUnprocessedRanges(existingScenes, totalMessages, startIdx = 0) {
  * @returns {Promise<{sceneSummary: string, sceneTitle: string, characterUpdates: Array}>}
  */
 async function generateInitialStats(messages, characters, profileName, settings) {
+    const rstScope3 = captureChatScope();
+
     const systemPrompt = buildInitialStatSystemPrompt(settings);
     const requestPrompt = buildInitialStatRequestPrompt(messages, characters, settings);
 
     const maxTokens = settings.batchScan?.initialStatMaxTokens ?? 3000;
-    const result = await makeRequest(profileName, systemPrompt, requestPrompt, maxTokens);
+    const result = await rstScope3.wait(() => (makeRequest(profileName, systemPrompt, requestPrompt, maxTokens)));
     if (!result) {
-        return { sceneSummary: "", sceneTitle: "", characterUpdates: [] };
+        throw new Error("Invalid or missing batch stat response.");
     }
 
-    return parseInitialStatResponse(result, characters);
+    return parseInitialStatResponse(result, characters, messages);
 }
 
 /**
@@ -990,12 +1018,12 @@ async function generateInitialStats(messages, characters, profileName, settings)
  * @returns {string}
  */
 function buildInitialStatSystemPrompt(settings) {
-    return `You are a relationship analysis assistant. Your job is to assess initial character relationship states based on their first interactions in a scene.
+    return `You are a relationship analysis assistant. Your job is to assess relationship state from a historical scene. Brand-new profiles receive an initial assessment; established profiles must be updated from their supplied CURRENT STATS without resetting unrelated values.
 
 Generate:
 1. A concise SCENE SUMMARY (factual, clinical — short paragraph)
 2. A SCENE TITLE (short, descriptive name for this scene)
-3. For each character, an INITIAL relationship stat assessment based on their behavior in the scene
+3. For each character, a relationship stat assessment based on their behavior in the scene
 
 # PERSPECTIVE RULE (CRITICAL — DO NOT VIOLATE):
 - All stats represent how the DETECTED CHARACTER feels toward {{user}} — NOT the other way around!
@@ -1014,12 +1042,13 @@ Generate:
 - Support: Being there emotionally, mentally, and sometimes physically.
 - Affection: Expressing love and care through words, actions, or physical touch.
 
-# INITIAL STAT RULES:
+# STAT RULES:
 - Each stat is a percentage from -100% to 100%
 - A stat of 0% means neutral/undeveloped
-- Initial values should reflect first impressions and early interactions
-- Values can range more broadly than scene-to-scene changes (this is an initial assessment)
-- A dynamic title should capture the character's starting relationship role/attitude toward {{user}}
+- If the request marks a character UNESTABLISHED, assess initial values from first impressions and early interactions
+- If the request supplies CURRENT STATS, those values are the baseline: no change is the default, preserve unrelated stats, and only move values when this scene contains relationship-relevant evidence
+- Decreases require direct negative relational evidence; silence, distance, awkwardness, or lack of progress are not regression
+- A dynamic title should capture the character's current relationship role/attitude toward {{user}}
 
 RESPONSE FORMAT — return ONLY valid JSON:
 {
@@ -1027,6 +1056,7 @@ RESPONSE FORMAT — return ONLY valid JSON:
   "sceneSummary": "Concise summary of the scene...",
   "characters": {
     "[CHARACTER_NAME]": {
+      "relationshipEvidence": "One factual sentence naming both this character and {{user}} and stating their direct interaction, observation, learning, or decision about {{user}} in this scene; empty string when none",
       "stats": {
         "platonic": { "trust": X, "openness": X, "support": X, "affection": X },
         "romantic": { "trust": X, "openness": X, "support": X, "affection": X },
@@ -1061,7 +1091,15 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
     const userName = getContext().name1 || "User";
     parts.push(`CHARACTERS IN THIS SCENE (stats represent character → {{user}} perspective):`);
     for (const char of characters) {
-        parts.push(`- ${char.name}`);
+        if (isUnestablishedCharacter(char)) {
+            parts.push(`- ${char.name} — UNESTABLISHED profile; generate an initial assessment.`);
+        } else {
+            parts.push(`- ${char.name} — CURRENT STATS (baseline; preserve unless this scene justifies movement):`);
+            for (const cat of STAT_CATEGORIES) {
+                const values = STAT_NAMES.map((stat) => `${stat}=${char.stats?.[cat]?.[stat] ?? 0}`).join(", ");
+                parts.push(`    ${cat}: ${values}`);
+            }
+        }
     }
     parts.push("");
 
@@ -1074,9 +1112,10 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
         parts.push(`[${i}]${isUser} ${speaker}: ${text}`);
     });
 
-    // Character discovery instruction
+    // Phase 2 already owns character discovery. Phase 4 must never invent or
+    // resurrect profiles from mentions/references that were not validated there.
     parts.push('');
-    parts.push('Also scan the messages for ANY additional characters (named individuals) who appear, speak, or are referenced. Include them in your characters object with full stat updates using the same schema.');
+    parts.push('Return updates ONLY for the characters listed above. Do not add, infer, or return any other character names.');
     parts.push('');
 
     // Clean close
@@ -1091,7 +1130,7 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
  * @param {Array} characters - Character profiles
  * @returns {{sceneSummary: string, sceneTitle: string, characterUpdates: Array}}
  */
-function parseInitialStatResponse(response, characters) {
+function parseInitialStatResponse(response, characters, messages = []) {
     // Try robust JSON extraction first (handles code fences, truncation)
     const parsed = extractBatchStatJson(response);
     if (!parsed) {
@@ -1099,7 +1138,7 @@ function parseInitialStatResponse(response, characters) {
         const msg = `[RST] Batch scan: Could not parse initial stat response. Preview: "${preview}"`;
         console.warn(msg);
         toastr?.error?.("Batch scan: Could not parse the stat generation response. The LLM may have returned malformed JSON.", "RST Batch Scan");
-        return { sceneSummary: "", sceneTitle: "", characterUpdates: [] };
+        throw new Error("Invalid or missing batch stat response.");
     }
 
     const sceneSummary = parsed.sceneSummary || "";
@@ -1109,7 +1148,15 @@ function parseInitialStatResponse(response, characters) {
     // Process known characters from input list
     for (const char of characters) {
         const charData = parsed.characters?.[char.name];
-        if (!charData || !charData.stats) continue;
+        if (!charData || !charData.stats || !hasGroundedRelationshipEvidence(char, charData, messages)) {
+            if (charData?.stats) dlog(`[RST] Batch stat update rejected for ${char.name}: relationship evidence was absent or not grounded in this scene.`);
+            continue;
+        }
+
+        if (!isUnestablishedCharacter(char)) {
+            characterUpdates.push(buildEstablishedCharacterUpdate(char, charData, { source: "batch_scan", settings: getSettings() }));
+            continue;
+        }
 
         const statsAfter = {};
         for (const cat of STAT_CATEGORIES) {
@@ -1123,55 +1170,27 @@ function parseInitialStatResponse(response, characters) {
         characterUpdates.push({
             characterId: char.id,
             characterName: char.name,
-            statsBefore: null,
+            statsBefore: structuredClone(char.stats),
             statsAfter,
             commentary: charData.commentary || {},
             dynamicTitleBefore: "",
             dynamicTitleAfter: charData.dynamicTitle || "",
-            milestoneReached: false,
-            milestoneDetail: "",
             narrativeSummary: charData.narrativeSummary || "",
             source: "batch_scan",
-            changeCount: 12,
+            changeCount: countBatchStatChanges(char.stats, statsAfter),
         });
     }
 
-    // Handle LLM-discovered characters (in parsed.characters but not in input list)
-    if (parsed && parsed.characters) {
-        const inputNames = new Set(characters.map(c => c.name));
-        for (const [llmName, llmData] of Object.entries(parsed.characters)) {
-            if (!inputNames.has(llmName) && llmData && llmData.stats) {
-                dlog("[RST] Batch scan: LLM discovered additional character:", llmName);
-                const newChar = createCharacter(llmName, { source: "auto_generated" });
-                if (newChar) {
-                    const statsAfter = {};
-                    for (const cat of STAT_CATEGORIES) {
-                        statsAfter[cat] = {};
-                        for (const stat of STAT_NAMES) {
-                            const val = llmData.stats[cat]?.[stat];
-                            statsAfter[cat][stat] = typeof val === "number" ? Math.max(-100, Math.min(100, val)) : 0;
-                        }
-                    }
-                    characterUpdates.push({
-                        characterId: newChar.id,
-                        characterName: newChar.name,
-                        statsBefore: null,
-                        statsAfter,
-                        commentary: llmData.commentary || {},
-                        dynamicTitleBefore: "",
-                        dynamicTitleAfter: llmData.dynamicTitle || "",
-                        milestoneReached: false,
-                        milestoneDetail: "",
-                        narrativeSummary: llmData.narrativeSummary || "",
-                        source: "batch_scan_discovered",
-                        changeCount: 12,
-                    });
-                }
-            }
-        }
-    }
 
     return { sceneSummary, sceneTitle, characterUpdates };
+}
+
+function countBatchStatChanges(before, after) {
+    let count = 0;
+    for (const cat of STAT_CATEGORIES) for (const stat of STAT_NAMES) {
+        if ((before?.[cat]?.[stat] ?? 0) !== (after?.[cat]?.[stat] ?? 0)) count++;
+    }
+    return count;
 }
 
 // ─── JSON Extraction Helper ─────────────────────────────────

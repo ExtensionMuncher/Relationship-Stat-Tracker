@@ -1,3 +1,4 @@
+import { captureChatScope } from "../lib/chatScope.js";
 /**
  * milestoneScan.js — retroactive relationship milestone backfill.
  *
@@ -16,6 +17,8 @@ const MAX_MILESTONE_TEXT = 1200;
 const MAX_FINAL_MILESTONES_PER_CHARACTER = 12;
 
 export async function scanHistoricalMilestones() {
+    const rstScope1 = captureChatScope();
+
     const settings = getSettings();
     const profileName = settings.connections?.statUpdateLLM;
     if (!profileName) {
@@ -57,7 +60,7 @@ export async function scanHistoricalMilestones() {
     for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
         try {
-            const extracted = await extractChunkMilestones(chunk, roster, persona, personaAliases, profileName, settings);
+            const extracted = await rstScope1.wait(() => (extractChunkMilestones(chunk, roster, persona, personaAliases, profileName, settings)));
             for (const raw of extracted) {
                 if (!raw || !validIds.has(raw.characterId)) continue;
                 const domains = [...new Set((Array.isArray(raw.domains) ? raw.domains : [])
@@ -74,8 +77,10 @@ export async function scanHistoricalMilestones() {
                 candidatesByCharacter.get(raw.characterId).push(candidate);
             }
         } catch (err) {
-            errorCount++;
-            console.error(`[RST] Milestone backfill failed on history chunk ${chunk.start}-${chunk.end}:`, err);
+        rstScope1.assertCurrent();
+
+            throw err;
+
         }
     }
 
@@ -84,13 +89,15 @@ export async function scanHistoricalMilestones() {
         const candidates = candidatesByCharacter.get(char.id) || [];
         if (!candidates.length) continue;
         try {
-            const milestones = await synthesizeCharacterMilestones(char, candidates, persona, personaAliases, profileName, settings);
+            const milestones = await rstScope1.wait(() => (synthesizeCharacterMilestones(char, candidates, persona, personaAliases, profileName, settings)));
             if (milestones.length) {
                 results.push({ characterId: char.id, characterName: char.name, milestones });
             }
         } catch (err) {
-            errorCount++;
-            console.error(`[RST] Milestone synthesis failed for ${char.name}:`, err);
+        rstScope1.assertCurrent();
+
+            throw err;
+
         }
     }
 
@@ -102,11 +109,13 @@ export async function scanHistoricalMilestones() {
 }
 
 async function extractChunkMilestones(chunk, roster, persona, personaAliases, profileName, settings) {
+    const rstScope2 = captureChatScope();
+
     const systemPrompt = [
         "You are doing a RETROACTIVE relationship-history audit for Relationship Stat Tracker (RST).",
         "RST tracks ONLY the relationship between the USER/PERSONA and each individual RST character.",
         "Every milestone you return MUST describe a durable change in PERSONA <-> TARGET CHARACTER relationship. Third-party relationships are categorically invalid.",
-        "Examples of INVALID milestones: Mira bonding with Kellan, Dorian changing Kellan's life, two NPCs reconciling, or a character having an important event that does not materially change how that character and the persona relate to each other. Merely mentioning or worrying about the persona inside an NPC<->NPC scene does NOT make that scene a persona relationship milestone.",
+        "Examples of INVALID milestones: two NPCs bonding or reconciling, one NPC changing another NPC's life, or a character having an important event that does not materially change how that character and the persona relate to each other. Merely mentioning or worrying about the persona inside an NPC<->NPC scene does NOT make that scene a persona relationship milestone.",
         "A valid milestone is rare and durable: a major rupture, reconciliation, explicit commitment/vow, decisive betrayal, relationship-defining rescue/sacrifice, serious boundary violation, or a disclosure/action that materially changes how the target character and persona treat or understand EACH OTHER afterward.",
         "Do NOT inflate ordinary emotion into a milestone. A thank-you, sandwich, quiet companionship, encouragement, routine comfort, first conversation, first meeting, ordinary vulnerability, banter, generic fight, apology without durable consequence, or a dramatic scene is NOT a milestone by itself.",
         "'First genuine trust/vulnerability' qualifies only when the scene shows a consequential relationship-state change, not merely someone saying something personal once.",
@@ -129,12 +138,15 @@ async function extractChunkMilestones(chunk, roster, persona, personaAliases, pr
     ].filter(Boolean).join("\n");
 
     const maxTokens = Math.max(2500, Number(settings.batchScan?.initialStatMaxTokens) || 3000);
-    const raw = await makeRequest(profileName, systemPrompt, userPrompt, maxTokens, 0.15);
+    const raw = await rstScope2.wait(() => (makeRequest(profileName, systemPrompt, userPrompt, maxTokens, 0.15)));
     const parsed = extractJson(raw);
-    return Array.isArray(parsed?.milestones) ? parsed.milestones : [];
+    if (!Array.isArray(parsed?.milestones)) throw new Error("Invalid milestone extraction response.");
+    return parsed.milestones;
 }
 
 async function synthesizeCharacterMilestones(char, candidates, persona, personaAliases, profileName, settings) {
+    const rstScope3 = captureChatScope();
+
     const visibleDomains = getVisibleStatCategories(char);
     const existing = Array.isArray(char.relationshipMilestones) ? char.relationshipMilestones : [];
     const candidateById = new Map(candidates.map((c) => [c.candidateId, c]));
@@ -171,9 +183,10 @@ async function synthesizeCharacterMilestones(char, candidates, persona, personaA
     ].filter(Boolean).join("\n");
 
     const maxTokens = Math.max(3000, Number(settings.batchScan?.initialStatMaxTokens) || 3000);
-    const raw = await makeRequest(profileName, systemPrompt, userPrompt, maxTokens, 0.1);
+    const raw = await rstScope3.wait(() => (makeRequest(profileName, systemPrompt, userPrompt, maxTokens, 0.1)));
     const parsed = extractJson(raw);
-    const rawMilestones = Array.isArray(parsed?.milestones) ? parsed.milestones : [];
+    if (!Array.isArray(parsed?.milestones)) throw new Error("Invalid milestone synthesis response.");
+    const rawMilestones = parsed.milestones;
     const existingTitles = new Set(existing.map((m) => normalizeText(m.title)));
     const out = [];
 

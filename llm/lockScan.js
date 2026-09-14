@@ -1,3 +1,4 @@
+import { captureChatScope } from "../lib/chatScope.js";
 /**
  * llm/lockScan.js — retroactive threshold-lock audit.
  *
@@ -20,6 +21,8 @@ const LOCK_TEXT_MAX = 1500;
 const MAX_HISTORY_SIGNALS_PER_CHARACTER = 24;
 
 export async function scanForLocks() {
+    const rstScope1 = captureChatScope();
+
     const settings = getSettings();
     const profileName = settings.connections?.statUpdateLLM;
     if (!profileName) {
@@ -34,6 +37,8 @@ export async function scanForLocks() {
     const noPersonaCount = all.length - withPersona.length;
 
     const hasOpenSlot = (c) => {
+    if (!rstScope1.isCurrent()) return;
+
         for (const cat of getVisibleStatCategories(c)) {
             for (const stat of STAT_NAMES) {
                 const hard = c.hardLocks?.[cat]?.[stat];
@@ -63,7 +68,7 @@ export async function scanForLocks() {
         ? Math.max(10, Math.min(60, Math.round(configuredChunkSize)))
         : 30;
     const chunks = buildHistoricalScanChunks({ maxMessages, maxChars: 60000 });
-    const historyByCharacter = await collectHistoricalLockSignals(chunks, eligible, profileName, settings);
+    const historyByCharacter = await rstScope1.wait(() => (collectHistoricalLockSignals(chunks, eligible, profileName, settings)));
     const pastSummaries = getAllSceneSummaries();
 
     dlog(`[RST] Lock scan: ${eligible.length} eligible, ${noPersonaCount} skipped (no personality), ${fullSkipped} skipped (all visible lock slots occupied), ${chunks.length} history chunks.`);
@@ -74,8 +79,8 @@ export async function scanForLocks() {
 
     for (const char of eligible) {
         try {
-            const proposed = await scanOneCharacter(char, pastSummaries, historyByCharacter.get(char.id) || [], profileName);
-            if (proposed?.error) { errorCount++; continue; }
+            const proposed = await rstScope1.wait(() => (scanOneCharacter(char, pastSummaries, historyByCharacter.get(char.id) || [], profileName)));
+            if (proposed?.error) throw new Error(`Lock scan failed for ${char.name}.`);
             const hard = proposed?.hardLocks || [];
             const soft = proposed?.softLocks || [];
             if (hard.length || soft.length) {
@@ -84,8 +89,9 @@ export async function scanForLocks() {
                 proposedNoneCount++;
             }
         } catch (err) {
-            errorCount++;
-            console.error(`[RST] Lock scan failed for ${char.name}:`, err);
+        rstScope1.assertCurrent();
+
+            throw err;
         }
     }
 
@@ -97,6 +103,8 @@ export async function scanForLocks() {
 }
 
 async function collectHistoricalLockSignals(chunks, characters, profileName, settings) {
+    const rstScope2 = captureChatScope();
+
     const result = new Map(characters.map((c) => [c.id, []]));
     if (!chunks.length) return result;
     const validIds = new Set(characters.map((c) => c.id));
@@ -122,9 +130,10 @@ async function collectHistoricalLockSignals(chunks, characters, profileName, set
         ].filter(Boolean).join("\n");
         try {
             const maxTokens = Math.max(2500, Number(settings.batchScan?.initialStatMaxTokens) || 3000);
-            const raw = await makeRequest(profileName, systemPrompt, userPrompt, maxTokens, 0.15);
+            const raw = await rstScope2.wait(() => (makeRequest(profileName, systemPrompt, userPrompt, maxTokens, 0.15)));
             const parsed = extractLockJson(raw);
-            const charMap = parsed?.characters && typeof parsed.characters === "object" ? parsed.characters : {};
+            if (!parsed?.characters || typeof parsed.characters !== "object" || Array.isArray(parsed.characters)) throw new Error("Invalid lock-history response.");
+            const charMap = parsed.characters;
             for (const [charId, items] of Object.entries(charMap)) {
                 if (!validIds.has(charId) || !Array.isArray(items)) continue;
                 const bucket = result.get(charId);
@@ -144,13 +153,17 @@ async function collectHistoricalLockSignals(chunks, characters, profileName, set
                 }
             }
         } catch (err) {
-            console.error(`[RST] Lock history extraction failed for chunk ${chunk.start}-${chunk.end}:`, err);
+        rstScope2.assertCurrent();
+
+            throw err;
         }
     }
     return result;
 }
 
 async function scanOneCharacter(char, pastSummaries, historicalSignals, profileName) {
+    const rstScope3 = captureChatScope();
+
     const systemPrompt = [
         "You set relationship-stat threshold locks for a character based on established psychology AND grounded relationship history.",
         "There are TWO lock types:",
@@ -229,7 +242,7 @@ async function scanOneCharacter(char, pastSummaries, historicalSignals, profileN
     }
 
     parts.push("\nReturn JSON only.");
-    const resultText = await makeRequest(profileName, systemPrompt, parts.join("\n"), 20000, 0.2);
+    const resultText = await rstScope3.wait(() => (makeRequest(profileName, systemPrompt, parts.join("\n"), 20000, 0.2)));
     if (!resultText) return { hardLocks: [], softLocks: [], error: "no_response" };
 
     const parsed = extractLockJson(resultText);

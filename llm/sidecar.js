@@ -15,14 +15,18 @@ import {
     getPresentCharacters,
     getPresenceModes,
     isNameBlacklisted,
+    getNameMatchKeys,
+    normalizeNameForMatch,
 } from "../data/storage.js";
-import { getAllCharacters } from "../data/characters.js";
+import { getAllCharacters, findCharacterByName, findCharacterByFuzzyName } from "../data/characters.js";
 import { dlog } from "../lib/debug.js";
+import { isNarrativeMessage } from "../lib/chatMessages.js";
 
 const MAX_MESSAGE_CHARS = 2200;
 const MAX_TEXT_CANDIDATES = 20;
 const MAX_TOTAL_CANDIDATES = 28;
 const SIDECAR_MAX_TOKENS = 4096;
+const CATCHUP_MAX_TOKENS = 1200;
 
 const GENERIC_UNKNOWN_NAMES = new Set([
     "user", "assistant", "system", "narrator", "unknown", "someone", "somebody",
@@ -41,10 +45,10 @@ const DESCRIPTIVE_ALIAS_WORDS = new Set([
 
 /**
  * Reconcile current character presence from recent messages.
- * @param {number|null} [messageCount=null]
+ * @param {number|{messageCount?:number,transitionMessageCount?:number}|null} [options=null]
  * @returns {Promise<{detected:string[], unknown:string[], modes:Object, valid:boolean, reason?:string}>}
  */
-export async function detectCharacters(messageCount = null) {
+export async function detectCharacters(options = null) {
     const settings = getSettings();
     const allCharacters = getAllCharacters();
     const currentNames = getCurrentCanonicalNames(allCharacters);
@@ -55,7 +59,14 @@ export async function detectCharacters(messageCount = null) {
     }
 
     const profileName = settings.connections?.sidecarLLM;
-    const count = messageCount ?? (settings.messagesToScan || 10);
+    const legacyCount = typeof options === "number" ? options : null;
+    const requestedMessageCount = options && typeof options === "object" ? options.messageCount : null;
+    const requestedTransitionCount = options && typeof options === "object" ? options.transitionMessageCount : null;
+    const count = Math.max(1, Number(legacyCount ?? requestedMessageCount ?? settings.messagesToScan) || 10);
+    const transitionMessageCount = Math.max(
+        1,
+        Number(requestedTransitionCount ?? settings.scanFrequency) || 3,
+    );
     const messages = getRecentMessages(count);
     const personaName = getContext().name1 || "";
 
@@ -67,13 +78,17 @@ export async function detectCharacters(messageCount = null) {
         messages,
         allCharacters,
         personaName,
-        Math.max(1, Number(settings.scanFrequency) || 3),
+        transitionMessageCount,
     );
     const safeCurrentNames = candidateState.currentProfiles.map((profile) => profile.name);
     const safeCurrentModes = Object.fromEntries(
         candidateState.currentProfiles.map((profile) => [profile.name, candidateState.currentModes[profile.id] || "unknown"]),
     );
 
+    dlog("[RST] Candidate map:", JSON.stringify(candidateState.candidates.map(c => ({
+        id: c.key, character: c.profile.name, current: c.wasPresent,
+        newEvidence: [...c.transitionEvidence],
+    }))));
     const systemPrompt = buildSidecarSystemPrompt();
     const requestPrompt = buildSidecarRequestPrompt(messages, candidateState, personaName);
 
@@ -108,9 +123,12 @@ export async function detectCharacters(messageCount = null) {
         }
 
         const reconciled = reconcilePresenceDecision(decision, messages, candidateState, personaName);
+        if (reconciled.diagnostics?.rejected.length) {
+            dlog("[RST] Presence validation rejections:", JSON.stringify(reconciled.diagnostics.rejected));
+        }
         if (!reconciled.valid) {
             console.warn(`[RST] Presence response failed validation (${reconciled.reason}); preserving current presence.`);
-            return { detected: safeCurrentNames, unknown: [], modes: safeCurrentModes, valid: false, reason: reconciled.reason };
+            return { detected: safeCurrentNames, unknown: [], modes: safeCurrentModes, valid: false, reason: reconciled.reason, diagnostics: reconciled.diagnostics };
         }
 
         dlog(
@@ -124,6 +142,165 @@ export async function detectCharacters(messageCount = null) {
         toastr?.error?.("Sidecar character detection failed. Check your connection settings.");
         return { detected: safeCurrentNames, unknown: [], modes: safeCurrentModes, valid: false, reason: "request_error" };
     }
+}
+
+/**
+ * Debug/manual catch-up scan for unknown characters that may have appeared before
+ * the live sidecar checkpoint. This is intentionally discovery-only: it never
+ * mutates current presence, presence modes, or the live cadence checkpoint.
+ *
+ * @param {{messageCount?:number,chunkSize?:number,onProgress?:(current:number,total:number)=>void,shouldContinue?:()=>boolean}|null} [options=null]
+ * @returns {Promise<{candidates:Array<{name:string,mode:string}>,scannedMessages:number,totalChunks:number,failedChunks:number,cancelled:boolean}>}
+ */
+export async function scanMissedCharacters(options = null) {
+    const settings = getSettings();
+    const profileName = settings.connections?.sidecarLLM;
+    const messageCount = Math.max(1, Math.min(200, Number(options?.messageCount) || 30));
+    const chunkSize = Math.max(1, Math.min(12, Number(options?.chunkSize) || 5));
+    const onProgress = typeof options?.onProgress === "function" ? options.onProgress : null;
+    const shouldContinue = typeof options?.shouldContinue === "function" ? options.shouldContinue : (() => true);
+    const personaName = getContext().name1 || "";
+
+    if (!profileName) {
+        throw new Error("No sidecar connection profile is configured.");
+    }
+    if (!chat || !Array.isArray(chat)) {
+        return { candidates: [], scannedMessages: 0, totalChunks: 0, failedChunks: 0, cancelled: false };
+    }
+
+    const visibleMessages = chat.filter(isNarrativeMessage).slice(-messageCount);
+    if (!visibleMessages.length) {
+        return { candidates: [], scannedMessages: 0, totalChunks: 0, failedChunks: 0, cancelled: false };
+    }
+
+    const chunks = [];
+    for (let i = 0; i < visibleMessages.length; i += chunkSize) {
+        chunks.push(visibleMessages.slice(i, i + chunkSize));
+    }
+
+    const found = [];
+    const foundKeys = new Set();
+    let failedChunks = 0;
+
+    for (let index = 0; index < chunks.length; index++) {
+        if (!shouldContinue()) {
+            return { candidates: found, scannedMessages: visibleMessages.length, totalChunks: chunks.length, failedChunks, cancelled: true };
+        }
+
+        const chunk = chunks[index];
+        let result;
+        try {
+            result = await detectUnknownCharactersInChunk(chunk, profileName, personaName);
+        } catch (err) {
+            failedChunks++;
+            console.warn(`[RST] Missed-character catch-up chunk ${index + 1}/${chunks.length} failed.`, err);
+            onProgress?.(index + 1, chunks.length);
+            continue;
+        }
+
+        if (!result.valid) failedChunks++;
+        for (const candidate of result.candidates) {
+            // Re-check against the live library at aggregation time in case another
+            // workflow created this profile while the catch-up pass was running.
+            if (isKnownCharacterIdentity(candidate.name)) continue;
+            const keys = getNameMatchKeys(candidate.name);
+            if (keys.some((key) => foundKeys.has(key))) continue;
+            found.push(candidate);
+            keys.forEach((key) => foundKeys.add(key));
+        }
+
+        onProgress?.(index + 1, chunks.length);
+    }
+
+    return {
+        candidates: found,
+        scannedMessages: visibleMessages.length,
+        totalChunks: chunks.length,
+        failedChunks,
+        cancelled: false,
+    };
+}
+
+async function detectUnknownCharactersInChunk(messages, profileName, personaName) {
+    const embeddedDocumentIndices = new Set();
+    const lines = [];
+    for (let index = 0; index < messages.length; index++) {
+        const message = messages[index];
+        const embedded = isEmbeddedDocumentMessage(message, messages[index - 1]);
+        if (embedded) embeddedDocumentIndices.add(index);
+        const role = message.is_user ? "USER" : "ASSISTANT";
+        lines.push(embedded
+            ? `[M${index} ${role}] [EMBEDDED DOCUMENT OR IN-WORLD TEXT OMITTED — do not extract its cast]`
+            : `[M${index} ${role}] ${truncateMessage(message.mes || "")}`);
+    }
+
+    const ignoredNames = [...new Set([
+        personaName,
+        ...(getNameBlacklist() || []),
+    ].map((name) => String(name || "").trim()).filter(Boolean))];
+
+    const systemPrompt = [
+        "Find proper-named non-player characters who are actively involved in the narrative shown.",
+        "This is a historical catch-up scan, not current-presence reconciliation.",
+        "Do not return characters who are only mentioned, remembered, quoted, planned for later, or present only inside a document/report/book/message.",
+        "Output ONLY one valid JSON object. No markdown, reasoning, analysis, or commentary.",
+    ].join("\n");
+
+    const requestPrompt = [
+        "Return exactly one JSON object with this shape. Empty unknown is correct when there is no discovery:",
+        '{"sceneReset":{"active":false,"evidence":[]},"present":[],"departed":[],"unknown":[]}',
+        "unknown item shape: name = one proper name written verbatim in the cited message; mode = physical|call|surveillance|message|remote|parallel; evidence = zero-based M indices.",
+        "",
+        "RULES:",
+        "- Return only proper names written verbatim in the cited message.",
+        "- Each returned name must be actively participating, observing, reacting, deciding, acting, or engaging through a live remote channel in that cited message.",
+        "- Physical presence, live calls/messages/surveillance, and active parallel POV scenes can count.",
+        "- Mere mention/reference, memories, future plans, reports, books, posts, quoted history, or embedded documents do not count.",
+        "- Evidence numbers are zero-based M indices from this chunk.",
+        "- present and departed must always be empty arrays. Put discoveries only in unknown.",
+        "- Empty unknown is correct when no proper-named active NPC is shown.",
+        ignoredNames.length ? `- Never return ignored/player names: ${ignoredNames.join(", ")}` : "",
+        "",
+        "MESSAGES:",
+        ...lines,
+    ].filter(Boolean).join("\n");
+
+    const raw = await makeRequest(profileName, systemPrompt, requestPrompt, CATCHUP_MAX_TOKENS, 0.1);
+    const decision = parsePresenceDecision(raw);
+    if (!decision) {
+        return { candidates: [], valid: false, reason: "invalid_json" };
+    }
+
+    const candidates = [];
+    const localKeys = new Set();
+    for (const item of decision.unknown) {
+        const normalized = normalizeUnknownDecisionItem(item, messages.length);
+        if (!normalized) continue;
+        if (isNameBlacklisted(normalized.name, [personaName, "{{user}}", "user"])) continue;
+        if (!looksLikeProperName(normalized.name)) continue;
+        if (isKnownCharacterIdentity(normalized.name)) continue;
+
+        let mode = "unknown";
+        for (const evidenceIndex of normalized.evidence) {
+            if (embeddedDocumentIndices.has(evidenceIndex)) continue;
+            const inferred = findUnknownActiveMode(messages[evidenceIndex], normalized.name, personaName);
+            if (inferred === "unknown") continue;
+            mode = inferred;
+            break;
+        }
+        if (mode === "unknown") continue;
+
+        const keys = getNameMatchKeys(normalized.name);
+        if (keys.some((key) => localKeys.has(key))) continue;
+        candidates.push({ name: normalized.name.trim(), mode });
+        keys.forEach((key) => localKeys.add(key));
+    }
+
+    return { candidates, valid: true };
+}
+
+function isKnownCharacterIdentity(name) {
+    return Boolean(findCharacterByName(name) || findCharacterByFuzzyName(name));
 }
 
 // ─── Prompt Building ──────────────────────────────────────
@@ -159,9 +336,17 @@ function buildSidecarRequestPrompt(messages, candidateState, personaName) {
         ...(getNameBlacklist() || []),
     ].map((name) => String(name || "").trim()).filter(Boolean))];
 
+    const candidateIds = candidateState.candidates.map((candidate) => candidate.key);
+
     return [
-        "Return exactly this schema:",
-        '{"sceneReset":{"active":false,"evidence":[]},"present":[{"id":"C1","mode":"physical","evidence":[0]}],"departed":[{"id":"C2","evidence":[3]}],"unknown":[{"name":"Jane Doe","mode":"physical","evidence":[2]}]}',
+        "Return exactly one JSON object with this shape. Empty arrays are correct when there is no transition:",
+        '{"sceneReset":{"active":false,"evidence":[]},"present":[],"departed":[],"unknown":[]}',
+        "present item shape: id = one exact eligible candidate ID listed below; mode = physical|call|surveillance|message|remote|parallel; evidence = zero-based M indices.",
+        "departed item shape: id = one exact CURRENT eligible candidate ID listed below; evidence = zero-based M indices.",
+        "unknown item shape: name = one proper name written verbatim in the cited message; mode = physical|call|surveillance|message|remote|parallel; evidence = zero-based M indices.",
+        candidateIds.length
+            ? `Allowed known-character IDs for this request: ${candidateIds.join(", ")}.`
+            : "There are NO eligible known-character IDs in this request. present and departed MUST both be empty arrays.",
         "",
         "DEFINITIONS:",
         "- PHYSICAL: currently at the active scene location, participating, observing, or being acted upon. Use mode physical.",
@@ -446,6 +631,11 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
     const currentIds = new Set(candidateState.currentProfiles.map((profile) => profile.id));
     const selectedIds = new Set(currentIds);
     const selectedModes = { ...candidateState.currentModes };
+    const rejected = [];
+    let acceptedDepartures = 0;
+    const reject = (item, candidate, reason, evidenceReasons = []) => rejected.push({
+        id: item?.id || null, character: candidate?.profile.name || null, reason, evidence: item?.evidence || [], evidenceReasons,
+    });
 
     // Parallel POV presence is deliberately ephemeral. Keep it while the full
     // recent scan window still contains explicit active parallel evidence; once
@@ -466,7 +656,7 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
 
     const reset = normalizeSceneReset(decision.sceneReset, messages.length);
     const resetIndex = reset.active
-        ? reset.evidence.find((index) => isStrongSceneBoundary(messages[index], messages[index - 1]))
+        ? reset.evidence.find((index) => index >= candidateState.transitionStartIndex && isStrongSceneBoundary(messages[index], messages[index - 1]))
         : undefined;
 
     if (reset.active && resetIndex === undefined) {
@@ -479,7 +669,7 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
         // may continue across a location cut.
         for (const profile of candidateState.currentProfiles) {
             const mode = normalizeMode(selectedModes[profile.id]);
-            if ((!isRemoteMode(mode) || mode === "parallel") && mode !== "unknown") {
+            if (!isRemoteMode(mode) || mode === "parallel") {
                 selectedIds.delete(profile.id);
                 delete selectedModes[profile.id];
             }
@@ -500,7 +690,7 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
         if (!candidate || !currentIds.has(candidate.profile.id)) continue;
 
         const supported = normalized.evidence.some((index) => {
-            if (candidateState.embeddedDocumentIndices.has(index)) return false;
+            if (index < candidateState.transitionStartIndex || candidateState.embeddedDocumentIndices.has(index)) return false;
             return hasCandidateLinkedDeparture(
                 messages,
                 index,
@@ -511,6 +701,7 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
             );
         });
         if (!supported) continue;
+        acceptedDepartures++;
 
         selectedIds.delete(candidate.profile.id);
         delete selectedModes[candidate.profile.id];
@@ -518,10 +709,10 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
 
     for (const item of decision.present) {
         const normalized = normalizeKnownDecisionItem(item, messages.length);
-        if (!normalized) continue;
+        if (!normalized) { reject(item, null, "invalid_candidate_id"); continue; }
         const candidate = candidateState.candidateByKey.get(normalized.id);
-        if (!candidate) continue;
-        if (currentIds.has(candidate.profile.id)) {
+        if (!candidate) { reject(item, null, "id_not_in_candidate_map"); continue; }
+        if (currentIds.has(candidate.profile.id) && selectedIds.has(candidate.profile.id)) {
             selectedIds.add(candidate.profile.id);
             for (const index of normalized.evidence) {
                 if (!candidate.matchEvidence.has(index) || candidateState.embeddedDocumentIndices.has(index)) continue;
@@ -536,17 +727,23 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
 
         let supportedEvidence;
         let inferredMode = "unknown";
+        const evidenceReasons = [];
         for (const index of normalized.evidence) {
-            if (!candidate.matchEvidence.has(index) || !candidate.transitionEvidence.has(index)) continue;
-            if (candidateState.embeddedDocumentIndices.has(index)) continue;
+            if (index < candidateState.transitionStartIndex) { evidenceReasons.push({index, reason:"old_context_only"}); continue; }
+            if (resetIndex !== undefined && index < resetIndex) { evidenceReasons.push({index, reason:"before_scene_reset"}); continue; }
+            if (candidateState.embeddedDocumentIndices.has(index)) { evidenceReasons.push({index, reason:"embedded_document"}); continue; }
+            if (!candidate.matchEvidence.has(index)) { evidenceReasons.push({index, reason:"no_named_identity_in_message"}); continue; }
             const mode = findCandidateActiveMode(messages[index], candidate, candidateState.identityVariants, candidateState.personaName);
-            if (mode === "unknown") continue;
-            if (hasLaterEndingEvidence(messages, index, candidate, mode, candidateState.identityVariants, candidateState.personaName)) continue;
+            if (mode === "unknown") { evidenceReasons.push({index, reason:"active_involvement_not_confirmed"}); continue; }
+            if (hasLaterEndingEvidence(messages, index, candidate, mode, candidateState.identityVariants, candidateState.personaName)) { evidenceReasons.push({index, reason:"later_exit_or_scene_cut"}); continue; }
             supportedEvidence = index;
             inferredMode = mode;
             break;
         }
-        if (supportedEvidence === undefined) continue;
+        if (supportedEvidence === undefined) {
+            reject(item, candidate, "no_supported_new_presence_evidence", evidenceReasons);
+            continue;
+        }
 
         selectedIds.add(candidate.profile.id);
         selectedModes[candidate.profile.id] = inferredMode;
@@ -559,6 +756,7 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
     );
 
     const unknown = [];
+    const unknownKeys = new Set();
     for (const item of decision.unknown) {
         const normalized = normalizeUnknownDecisionItem(item, messages.length);
         if (!normalized) continue;
@@ -578,8 +776,10 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
         }
         if (supportedEvidence === undefined) continue;
 
-        if (!unknown.some((name) => normalizeForMatch(name) === normalizeForMatch(normalized.name))) {
+        const identityKeys = getNameMatchKeys(normalized.name);
+        if (!identityKeys.some((key) => unknownKeys.has(key))) {
             unknown.push(normalized.name.trim());
+            identityKeys.forEach((key) => unknownKeys.add(key));
             modes[normalized.name.trim()] = inferredMode;
         }
     }
@@ -593,7 +793,13 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
         return { detected: [], unknown: [], modes: {}, valid: false, reason: "suspicious_bulk_addition" };
     }
 
-    return { detected, unknown, modes, valid: true };
+    // A model claiming presence while all its evidence is rejected is not a
+    // confirmed empty scene. Keep the checkpoint due for a later retry.
+    if (decision.present.length && rejected.length === decision.present.length && resetIndex === undefined && !acceptedDepartures) {
+        return { detected: [], unknown: [], modes: {}, valid: false,
+            reason: "all_present_claims_rejected", diagnostics: { rejected } };
+    }
+    return { detected, unknown, modes, valid: true, diagnostics: { rejected } };
 }
 
 function normalizeSceneReset(value, messageCount) {
@@ -623,8 +829,8 @@ function normalizeEvidence(value, messageCount) {
     const values = Array.isArray(value) ? value : (value === undefined || value === null ? [] : [value]);
     return [...new Set(values
         .map((entry) => {
-            if (typeof entry === "string") return Number(entry.replace(/^M/i, ""));
-            return Number(entry);
+            if (typeof entry === "string" && /^(?:M)?\d+$/i.test(entry.trim())) return Number(entry.trim().replace(/^M/i, ""));
+            return typeof entry === "number" ? entry : NaN;
         })
         .filter((entry) => Number.isInteger(entry) && entry >= 0 && entry < messageCount))];
 }
@@ -690,6 +896,20 @@ function findCandidateActiveMode(message, candidate, identityVariants, personaNa
     return lastMode;
 }
 
+/**
+ * Pure evidence helper shared by non-sidecar workflows that need to verify a
+ * named character is actively involved in a specific narrative message. This
+ * performs the same mention/reference/future/document rejection used for
+ * unknown sidecar discoveries without making an LLM request or mutating state.
+ * @param {object} message
+ * @param {string} name
+ * @param {string} [personaName=""]
+ * @returns {string} normalized active-presence mode, or "unknown"
+ */
+export function inferActivePresenceMode(message, name, personaName = "") {
+    return findUnknownActiveMode(message, name, personaName);
+}
+
 function findUnknownActiveMode(message, name, personaName = "") {
     const text = message?.mes || "";
     if (!text || isEmbeddedDocumentMessage(message, null)) return "unknown";
@@ -741,7 +961,10 @@ function personaIdentityVariants(personaName) {
     if (!normalized) return [];
     const words = normalized.split(/\s+/).filter(Boolean);
     const variants = new Set([normalized]);
-    if (words.length > 1) variants.add(words.at(-1));
+    if (words.length > 1) {
+        // Persona names may appear in either full-name ordering; preserve useful token variants.
+        words.filter(word => word.length >= 3).forEach(word => variants.add(word));
+    }
     return [...variants];
 }
 
@@ -767,7 +990,7 @@ function hasDirectPlayerSceneAnchor(text, personaName) {
     const directProximity = /\b(?:both of you|beside you|next to you|across from you|in front of you|behind you|toward you|with you)\b/i;
     if (playerAction.test(normalized) || playerBodyOrPlace.test(normalized) || directProximity.test(normalized)) return true;
 
-    const physicalVerbs = "stood|sat|walked|looked|said|asked|replied|answered|slept|woke|entered|arrived|left|moved|turned|reached|held|took|waited|remained|coughed|breathed|nodded|smiled|frowned";
+    const physicalVerbs = "stands|sits|walks|looks|says|asks|replies|reaches|turns|holds|nods|stood|sat|walked|looked|said|asked|replied|answered|slept|woke|entered|arrived|left|moved|turned|reached|held|took|waited|remained|coughed|breathed|nodded|smiled|frowned";
     for (const variant of personaIdentityVariants(personaName)) {
         const escaped = escapeRegExp(searchableText(variant)).replace(/ /g, "\\s+");
         if (!escaped) continue;
@@ -907,7 +1130,8 @@ function hasStrongPhysicalEntry(segment, variant) {
 }
 
 function findSubjectLinkedMode(segment, variant) {
-    const text = searchableText(segment);
+    const narration = String(segment || "").replace(/“[^”]*”|"[^"]*"/g, " ");
+    const text = normalizeForMatch(narration).replace(/[*_`]/g, "");
     const needle = searchableText(variant);
     if (!text || !needle) return "unknown";
     const escaped = escapeRegExp(needle).replace(/ /g, "\\s+");
@@ -957,6 +1181,9 @@ function findSubjectLinkedMode(segment, variant) {
     }
 
     const physicalVerbs = [
+        "interrupts", "interrupted", "murmurs", "murmured", "whispers", "whispered",
+        "says", "asks", "replies", "answers", "nods", "smiles", "frowns", "laughs",
+        "stands", "sits", "leans", "turns", "looks", "reaches", "holds", "touches",
         "arrived", "entered", "stepped", "walked", "came", "stood", "sat", "crouched",
         "leaned", "approached", "reached", "grabbed", "held", "spoke", "said", "asked",
         "replied", "answered", "nodded", "smiled", "frowned", "laughed", "placed", "set",
@@ -965,7 +1192,7 @@ function findSubjectLinkedMode(segment, variant) {
         "lifted", "pulled", "pushed", "touched", "stared", "breathed", "sighed", "lay",
     ].join("|");
     const nameThenPhysicalAction = new RegExp(
-        `\\b${escaped}\\b(?:\\s+(?:quietly|carefully|slowly|immediately|suddenly|still|then|just)){0,3}\\s+\\b(?:${physicalVerbs})\\b`,
+        `\\b${escaped}(?:-(?:san|kun|chan|sama|sensei|senpai))?\\b(?:\\s+(?:quietly|carefully|slowly|immediately|suddenly|still|then|just)){0,3}\\s+\\b(?:${physicalVerbs})\\b`,
         "i",
     );
     if (nameThenPhysicalAction.test(local) && !referenceOnly) return "physical";
@@ -1061,7 +1288,7 @@ function hasSubjectLinkedDeparture(segment, variants) {
 
 function hasDepartureCue(text) {
     if (!text) return false;
-    return /\b(?:departed|exited|walked away|drove away|went home|returned home|hung up|disconnected|ended the call|call ended|line went dead|connection closed|signed off|said goodbye|bid [^.!?]{0,30} goodbye)\b/i.test(text)
+    return /\b(?:left(?!\s+(?:hand|arm|leg|eye|side|pocket|shoe|door|window|note|message|book|phone))|departed|exited|walked away|drove away|went home|returned home|hung up|disconnected|ended the call|call ended|line went dead|connection closed|signed off|said goodbye|bid [^.!?]{0,30} goodbye)\b/i.test(text)
         || /\b(?:he|she|they) left\b(?!\s+(?:hand|arm|leg|eye|side|pocket|shoe|door|window|note|message|book|phone))/i.test(text);
 }
 
@@ -1164,14 +1391,7 @@ function isRemoteMode(mode) {
 }
 
 function normalizeForMatch(value) {
-    return String(value || "")
-        .normalize("NFKD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .replace(/[’‘`]/g, "'")
-        .replace(/[‐‑‒–—−]/g, "-")
-        .toLowerCase()
-        .replace(/\s+/g, " ")
-        .trim();
+    return normalizeNameForMatch(value);
 }
 
 function searchableText(value) {
@@ -1187,7 +1407,7 @@ function nameAppears(text, variant) {
     if (!haystack || !needle) return false;
     if (containsCJK(needle)) return haystack.includes(needle);
     const escaped = escapeRegExp(needle).replace(/ /g, "\\s+");
-    return new RegExp(`(?:^|\\s)${escaped}(?:'s)?(?=\\s|$)`, "i").test(haystack);
+    return new RegExp(`(?:^|\\s)${escaped}(?:'s|-(?:san|kun|chan|sama|sensei|senpai))?(?=\\s|$)`, "i").test(haystack);
 }
 
 function containsCJK(value) {
@@ -1201,7 +1421,8 @@ function looksLikeProperName(name) {
     const words = normalized.split(/\s+/).filter(Boolean);
     if (words.length > 6) return false;
     if (/\b(the|a|an|this|that|someone|somebody|unknown|narrator|assistant|system)\b/i.test(normalized)) return false;
-    return /^[\p{L}\p{M}][\p{L}\p{M}'’.-]*(?:\s+[\p{L}\p{M}][\p{L}\p{M}'’.-]*)*$/u.test(name.trim());
+    if (!/^[\p{L}\p{M}][\p{L}\p{M}'’.-]*(?:\s+[\p{L}\p{M}][\p{L}\p{M}'’.-]*)*$/u.test(name.trim())) return false;
+    return containsCJK(name) || /\p{Lu}/u.test(name);
 }
 
 function splitEvidenceSegments(text) {
@@ -1225,6 +1446,6 @@ function truncateMessage(text) {
 
 function getRecentMessages(count) {
     if (!chat || !Array.isArray(chat)) return [];
-    const visibleMessages = chat.filter((message) => !message.is_system);
+    const visibleMessages = chat.filter(isNarrativeMessage);
     return visibleMessages.slice(-count);
 }

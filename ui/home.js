@@ -1,9 +1,12 @@
+import { captureChatScope } from "../lib/chatScope.js";
 /**
  * home.js — Home tab: toggle, pending updates, present characters
  * Renders the Home tab with pending update cards and present character list
  */
 
-import { getPendingUpdates, savePendingUpdates, getPresentCharacters, savePresentCharacters, getSettings, getMessageCounter, deleteCharacterData } from "../data/storage.js";
+import { commitCharacterUpdate, isMeaningfulCharacterUpdate } from "../data/approval.js";
+import { updateInjection } from "../inject/promptInjector.js";
+import { getPendingUpdates, savePendingUpdates, getPresentCharacters, savePresentCharacters, getSettings, getMessageCounter, getSidecarPauseCadence, getSidecarRetryDue, deleteCharacterData } from "../data/storage.js";
 import { getCharacterProfile, getInitials, getAllCharacters, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { getOpenScene, getSceneById, deleteScene, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
 import { generateStatUpdate } from "../llm/statUpdate.js";
@@ -13,7 +16,17 @@ import { switchTab, getPane, showPanelLoading, hidePanelLoading, refreshHomeHead
 import { chat } from "../../../../../script.js";
 import { Popup, POPUP_RESULT, POPUP_TYPE } from "../../../../../scripts/popup.js";
 import { dlog } from "../lib/debug.js";
+import { narrativeMessages } from "../lib/chatMessages.js";
 import { getRelationshipConditionDefinition, MAX_ACTIVE_RELATIONSHIP_CONDITIONS } from "../data/conditions.js";
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
 
 // ─── Sidecar Cadence Display ─────────────────────────────
 
@@ -22,9 +35,9 @@ let _sidecarScanRunning = false;
 /**
  * Refresh the quiet Home-tab sidecar cadence indicator.
  *
- * The scheduler itself fires only from MESSAGE_SENT (user messages), but its
- * cadence is measured against the live chat length, so both user and character
- * messages advance the countdown.
+ * The scheduler checks cadence on both MESSAGE_SENT and MESSAGE_RECEIVED.
+ * Both user and character messages advance the same persisted countdown, so
+ * checking both event types improves timing without increasing scan frequency.
  */
 export function refreshSidecarCadenceDisplay(liveCountOverride = null) {
     const $row = $("#rst-sidecar-cadence");
@@ -36,12 +49,16 @@ export function refreshSidecarCadenceDisplay(liveCountOverride = null) {
     const paused = settings.sidecarPaused === true;
     const frequency = Math.max(1, Number(settings.scanFrequency) || 5);
     const parsedLiveCount = Number(liveCountOverride);
-    const liveCount = Number.isFinite(parsedLiveCount) && parsedLiveCount >= 0
+    const liveCount = liveCountOverride !== null && liveCountOverride !== undefined && Number.isFinite(parsedLiveCount) && parsedLiveCount >= 0
         ? Math.floor(parsedLiveCount)
-        : (Array.isArray(chat) ? chat.length : 0);
+        : narrativeMessages(chat).length;
     const lastBaseline = Math.max(0, Number(getMessageCounter()) || 0);
-    const sinceBaseline = Math.max(0, liveCount - Math.min(lastBaseline, liveCount));
+    const pauseSnapshot = paused ? getSidecarPauseCadence() : null;
+    const cadenceLiveCount = pauseSnapshot ? pauseSnapshot.liveCount : liveCount;
+    const cadenceBaseline = pauseSnapshot ? pauseSnapshot.baseline : lastBaseline;
+    const sinceBaseline = Math.max(0, cadenceLiveCount - Math.min(cadenceBaseline, cadenceLiveCount));
     const nextIn = Math.max(0, frequency - sinceBaseline);
+    const retryDue = getSidecarRetryDue();
 
     let status = "ready";
     let label = "";
@@ -56,8 +73,8 @@ export function refreshSidecarCadenceDisplay(liveCountOverride = null) {
         status = "scanning";
         label = "Sidecar scan running…";
     } else if (nextIn === 0) {
-        status = "due";
-        label = "Sidecar ready · scan due on next user message";
+        status = retryDue ? "retry" : "due";
+        label = retryDue ? "Sidecar ready · retry due" : "Sidecar ready · scan due";
     } else {
         label = `Sidecar ready · next scan in ${nextIn} message${nextIn === 1 ? "" : "s"}`;
     }
@@ -66,7 +83,7 @@ export function refreshSidecarCadenceDisplay(liveCountOverride = null) {
     $text.text(label);
     $row.attr(
         "title",
-        `Cadence counts live chat messages (user + character). The sidecar itself only runs when a user message is sent. ${sinceBaseline}/${frequency} messages since the current baseline.`
+        `Cadence counts live chat messages (user + character). When the cadence becomes due, the sidecar may run after either a user or character message. ${sinceBaseline}/${frequency} messages since the current baseline.${retryDue ? " The previous sidecar attempt did not commit a valid result, so the same cadence checkpoint remains due for retry." : ""}`
     );
 }
 
@@ -155,19 +172,6 @@ $(document).on("rst:scene-state-changed", () => refreshPending($("#rst-p-home"))
 
 // ─── Pending Updates Section ──────────────────────────────
 
-function hasMeaningfulCharacterUpdate(update) {
-    if (!update) return false;
-    if (Number(update.changeCount || 0) > 0) return true;
-    const arrayFields = [
-        "proposedHardLocks", "proposedSoftLocks", "unlockedSoftLocks", "softLockProgress",
-        "hardLockPressureUpdates", "hardLockReviews", "proposedMilestones",
-        "proposedConditions", "resolvedConditions", "inertiaAdjustments",
-    ];
-    if (arrayFields.some((field) => Array.isArray(update[field]) && update[field].length > 0)) return true;
-    if ((update.dynamicTitleBefore || "") !== (update.dynamicTitleAfter || "")) return true;
-    return false;
-}
-
 function pendingUpdateScore(update) {
     if (!update) return -1;
     let score = 0;
@@ -184,18 +188,30 @@ function pendingUpdateScore(update) {
     if (Array.isArray(update.proposedHardLocks) && update.proposedHardLocks.length) score += 6;
     if (Array.isArray(update.proposedSoftLocks) && update.proposedSoftLocks.length) score += 6;
     if (Array.isArray(update.hardLockPressureUpdates) && update.hardLockPressureUpdates.length) score += 6;
+    if (Array.isArray(update.hardLockReviews) && update.hardLockReviews.length) score += 6;
+    if (Array.isArray(update.raisedCaps) && update.raisedCaps.length) score += 6;
+    if (Array.isArray(update.unlockedSoftLocks) && update.unlockedSoftLocks.length) score += 6;
+    if (Array.isArray(update.softLockProgress) && update.softLockProgress.length) score += 4;
     return score;
 }
 
 function normalizePendingCharacterUpdates(pending) {
-    if (!pending || !Array.isArray(pending.characterUpdates) || pending.characterUpdates.length < 2) return pending;
+    if (!pending || !Array.isArray(pending.characterUpdates)) return pending;
 
     const byId = new Map();
     const order = [];
     let changed = false;
 
     for (const update of pending.characterUpdates) {
-        if (!update || !update.characterId) continue;
+        const profile = update?.characterId ? getCharacterProfile(update.characterId) : null;
+        if (!update || !update.characterId || !isMeaningfulCharacterUpdate(update, profile)) {
+            changed = true;
+            if (update?.characterId && (pending.autoCreatedIds || []).includes(update.characterId)) {
+                deleteCharacterData(update.characterId);
+                pending.autoCreatedIds = pending.autoCreatedIds.filter((id) => id !== update.characterId);
+            }
+            continue;
+        }
         const prev = byId.get(update.characterId);
         if (!prev) {
             byId.set(update.characterId, update);
@@ -209,10 +225,11 @@ function normalizePendingCharacterUpdates(pending) {
         dlog(`[RST] Collapsed duplicate pending card for ${chosen.characterName || chosen.characterId}.`);
     }
 
-    if (!changed) return pending;
+    const normalized = order.map((id) => byId.get(id)).filter(Boolean);
+    if (!changed && normalized.length === pending.characterUpdates.length) return pending;
 
-    pending.characterUpdates = order.map((id) => byId.get(id)).filter(Boolean);
-    savePendingUpdates(pending);
+    pending.characterUpdates = normalized;
+    settlePendingAfterDecision(pending);
     return pending;
 }
 
@@ -232,18 +249,19 @@ function renderPendingSection($pane, pending) {
     $section.append(`
         <div class="rst-lbl">
             Pending updates
-            <span class="rst-badge-pending" style="text-transform:none;letter-spacing:0;font-weight:400;margin-left:6px">${sceneLabel}</span>
+            <span class="rst-badge-pending" style="text-transform:none;letter-spacing:0;font-weight:400;margin-left:6px">${escapeHtml(sceneLabel)}</span>
         </div>
     `);
 
-    // Scene summary card
-    renderSceneSummaryCard($section, pending);
+    // Scene summary has its own independent approval lifecycle. Once resolved,
+    // its card disappears while any remaining character cards stay pending.
+    if (!pending.summaryResolved) renderSceneSummaryCard($section, pending);
 
     // Per-character pending updates. Structural relationship changes (locks,
     // milestones, conditions) remain reviewable even when the numeric matrix
     // itself did not move.
     if (pending.characterUpdates) {
-        const meaningfulUpdates = pending.characterUpdates.filter(hasMeaningfulCharacterUpdate);
+        const meaningfulUpdates = pending.characterUpdates.filter((update) => isMeaningfulCharacterUpdate(update, getCharacterProfile(update.characterId)));
         if (meaningfulUpdates.length === 0) {
             $section.append(`<div style="font-size:12px;color:var(--rst-text-muted);padding:12px 0">No relationship changes detected for any characters.</div>`);
         } else {
@@ -262,7 +280,9 @@ function renderPendingSection($pane, pending) {
     `);
 
     $globalBtns.find("#rst-approve-all").on("click", async () => {
-        await approveAllPending(pending);
+    const rstScope1 = captureChatScope();
+
+        await rstScope1.wait(() => (approveAllPending(pending)));
     });
 
     $globalBtns.find("#rst-dismiss-all").on("click", () => {
@@ -287,18 +307,21 @@ function renderSceneSummaryCard($container, pending) {
         <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-edit-scene-summary" title="Expand the editor"></i>
     </div>`);
 
-    const $textarea = $(`<textarea id="rst-edit-scene-summary" rows="3" style="margin-bottom:8px">${pending.sceneSummary || ""}</textarea>`);
+    const $textarea = $(`<textarea id="rst-edit-scene-summary" rows="3" style="margin-bottom:8px">${escapeHtml(pending.sceneSummary || "")}</textarea>`);
     $card.append($textarea);
 
     const $btnRow = $(`
         <div class="rst-btn-row" style="margin-bottom:6px">
             <button class="rst-btn-approve">Approve summary</button>
+            <button class="rst-btn-danger rst-dismiss-summary">Dismiss summary</button>
             <button class="rst-btn rst-regen-toggle">Regenerate</button>
         </div>
     `);
 
     const $regenBox = renderRegenBox("regen-summary", async (guidance) => {
-        await regenerateSceneSummary(pending.sceneId, guidance);
+    const rstScope2 = captureChatScope();
+
+        await rstScope2.wait(() => (regenerateSceneSummary(pending.sceneId, guidance)));
     });
 
     $btnRow.find(".rst-regen-toggle").on("click", () => {
@@ -307,11 +330,16 @@ function renderSceneSummaryCard($container, pending) {
 
     $btnRow.find(".rst-btn-approve").on("click", () => {
         const summary = $textarea.val();
-        pending.sceneSummary = summary;
-        savePendingUpdates(pending);
-        // Also persist to the scene data
-        updateSceneSummary(pending.sceneId, summary);
-        toastr?.success?.("Scene summary approved.");
+        if (!approveSceneSummary(pending, summary)) return;
+        toastr?.success?.("Scene summary approved and saved.");
+        refreshPending(getPane("home"));
+        renderScenesTab(getPane("scenes"));
+    });
+
+    $btnRow.find(".rst-dismiss-summary").on("click", () => {
+        if (!dismissSceneSummaryProposal(pending)) return;
+        toastr?.info?.("Proposed scene summary dismissed.");
+        refreshPending(getPane("home"));
     });
 
     $card.append($btnRow);
@@ -336,8 +364,8 @@ function renderCharacterPending($container, charUpdate, sceneId) {
     // Header
     const $header = $(`
         <div class="rst-char-pending-hdr">
-            <div class="rst-av" style="width:28px;height:28px;font-size:11px">${initials}</div>
-            <span style="font-weight:500">${displayName}</span>
+            <div class="rst-av" style="width:28px;height:28px;font-size:11px">${escapeHtml(initials)}</div>
+            <span style="font-weight:500">${escapeHtml(displayName)}</span>
             <span style="margin-left:auto;font-size:11px;color:var(--rst-text-muted)">${changeCount} stat changes</span>
             <span style="font-size:11px;color:var(--rst-text-muted);margin-left:8px">▾</span>
         </div>
@@ -362,14 +390,14 @@ function renderCharacterPending($container, charUpdate, sceneId) {
     // Dynamic title
     if (charUpdate.dynamicTitleBefore && charUpdate.dynamicTitleAfter) {
         $body.append(
-            `<div class="rst-dyn" style="margin-bottom:8px">${charUpdate.dynamicTitleBefore} → ${charUpdate.dynamicTitleAfter}</div>`
+            `<div class="rst-dyn" style="margin-bottom:8px">${escapeHtml(charUpdate.dynamicTitleBefore)} → ${escapeHtml(charUpdate.dynamicTitleAfter)}</div>`
         );
     }
 
     // Narrative summary
     if (charUpdate.narrativeSummary) {
         $body.append(
-            `<div class="rst-narr" style="margin-bottom:10px">${charUpdate.narrativeSummary}</div>`
+            `<div class="rst-narr" style="margin-bottom:10px">${escapeHtml(charUpdate.narrativeSummary)}</div>`
         );
     }
 
@@ -409,6 +437,8 @@ function renderCharacterPending($container, charUpdate, sceneId) {
         $body.append($condWrap);
     }
 
+    renderPendingLockChanges($body, charUpdate);
+
     // Action buttons
     const $btnRow = $(`
         <div class="rst-btn-row">
@@ -420,7 +450,9 @@ function renderCharacterPending($container, charUpdate, sceneId) {
     `);
 
     const $regenBox = renderRegenBox(`regen-${charUpdate.characterId}`, async (guidance) => {
-        await regenerateCharacterUpdate(sceneId, charUpdate.characterId, guidance);
+    const rstScope3 = captureChatScope();
+
+        await rstScope3.wait(() => (regenerateCharacterUpdate(sceneId, charUpdate.characterId, guidance)));
     });
 
     $btnRow.find(".rst-regen-toggle").on("click", () => {
@@ -428,7 +460,9 @@ function renderCharacterPending($container, charUpdate, sceneId) {
     });
 
     $btnRow.find(".rst-btn-approve").on("click", async () => {
-        await approveCharacterUpdate(charUpdate, sceneId);
+    const rstScope4 = captureChatScope();
+
+        await rstScope4.wait(() => (approveCharacterUpdate(charUpdate, sceneId)));
     });
 
     $btnRow.find(".rst-edit-btn").on("click", () => {
@@ -443,6 +477,48 @@ function renderCharacterPending($container, charUpdate, sceneId) {
     $body.append($regenBox);
     $block.append($body);
     $container.append($block);
+}
+
+function renderPendingLockChanges($body, charUpdate) {
+    const rows = [];
+    const push = (title, detail = "") => rows.push({ title, detail });
+
+    for (const item of (charUpdate.raisedCaps || [])) {
+        push(`Critical cap breakthrough: ${item.stat}`, `Hard-lock cap ${item.from ?? "?"} → ${item.to ?? "?"}`);
+    }
+    for (const item of (charUpdate.proposedHardLocks || [])) {
+        push(`Proposed hard lock: ${item.stat}`, `Cap ${item.cap}${item.reason ? ` — ${item.reason}` : ""}`);
+    }
+    for (const item of (charUpdate.proposedSoftLocks || [])) {
+        push(`Proposed soft lock: ${item.stat}`, `Cap ${item.cap}${item.condition ? ` — unlock when: ${item.condition}` : ""}${item.progress ? ` · Progress: ${item.progress}` : ""}`);
+    }
+    for (const stat of (charUpdate.unlockedSoftLocks || [])) {
+        push(`Resolve soft lock: ${stat}`, "Its narrative condition was met in this scene.");
+    }
+    for (const item of (charUpdate.softLockProgress || [])) {
+        push(`Soft-lock progress: ${item.stat}`, item.progress || "Progress updated.");
+    }
+    for (const item of (charUpdate.hardLockPressureUpdates || [])) {
+        const change = Number(item.change || 0);
+        push(`Hard-lock pressure: ${item.stat} ${change > 0 ? "+" : ""}${change}`, item.reason || "Pressure evidence updated.");
+    }
+    for (const item of (charUpdate.hardLockReviews || [])) {
+        const cap = Number.isFinite(item.recommendedCap) ? ` · Suggested cap ${item.recommendedCap}` : "";
+        push(`Hard-lock review: ${item.stat}`, `${item.recommendation || "review"}${cap}${item.reason ? ` — ${item.reason}` : ""}`);
+    }
+
+    if (!rows.length) return;
+
+    const $wrap = $('<div class="rst-pending-system"></div>');
+    $wrap.append('<div class="rst-pending-system-title"><i class="fa-solid fa-lock"></i> Lock changes</div>');
+    for (const row of rows) {
+        const $item = $('<div class="rst-pending-system-item"></div>');
+        $item.append($('<div class="rst-pending-system-name"></div>').text(row.title));
+        if (row.detail) $item.append($('<div></div>').text(row.detail));
+        $wrap.append($item);
+    }
+    $wrap.append('<div class="rst-pending-system-resolution">Lock changes applied with approval.</div>');
+    $body.append($wrap);
 }
 
 // ─── Stat Category Rendering ──────────────────────────────
@@ -475,19 +551,12 @@ function renderStatCategory(cat, charUpdate, sceneId) {
         const statKey = cat + "." + stat;
         const isCritical = Array.isArray(charUpdate.criticalStats) && charUpdate.criticalStats.includes(statKey);
         const critBadge = isCritical ? ' <span class="rst-crit-badge"><i class="fa-solid fa-bolt"></i> critical</span>' : '';
-        const inertiaAdjustment = Array.isArray(charUpdate.inertiaAdjustments)
-            ? charUpdate.inertiaAdjustments.find((item) => item?.stat === statKey)
-            : null;
-        const inertia = inertiaAdjustment
-            ? `<div class="rst-inertia-note"><i class="fa-solid fa-anchor"></i> Inertia guard: ${inertiaAdjustment.proposedDelta > 0 ? "+" : ""}${inertiaAdjustment.proposedDelta} → ${inertiaAdjustment.adjustedDelta > 0 ? "+" : ""}${inertiaAdjustment.adjustedDelta}. ${inertiaAdjustment.reason}</div>`
-            : "";
-
         $cat.append(`
             <div class="rst-sr">
                 <span class="rst-sn">${stat.charAt(0).toUpperCase() + stat.slice(1)}${critBadge}</span>
                 <span>${display}</span>
             </div>
-            <div class="rst-sc">${commentary}${inertia}</div>
+            <div class="rst-sc">${escapeHtml(commentary)}</div>
         `);
     }
 
@@ -521,12 +590,16 @@ function renderRegenBox(id, onRegenerate) {
     `);
 
     $box.find(".rst-regen-with-prompt").on("click", async function () {
+    const rstScope5 = captureChatScope();
+
         const guidance = $box.find("textarea").val().trim();
-        await onRegenerate(guidance);
+        await rstScope5.wait(() => (onRegenerate(guidance)));
     });
 
     $box.find(".rst-regen-from-scene").on("click", async function () {
-        await onRegenerate("");
+    const rstScope6 = captureChatScope();
+
+        await rstScope6.wait(() => (onRegenerate("")));
     });
 
     return $box;
@@ -572,7 +645,7 @@ function renderPresentCharacters($pane) {
 
             const initials = getInitials(profile.name);
             let avContent = initials;
-            if (profile.avatar) { avContent = `<img src="${profile.avatar}" alt="">`; }
+            if (profile.avatar) { avContent = `<img src="${escapeHtml(profile.avatar)}" alt="">`; }
             const dyn = profile.dynamicTitle || "No dynamic yet";
             const topStat = (cat) => {
                 const stats = profile.stats?.[cat] || {};
@@ -585,15 +658,15 @@ function renderPresentCharacters($pane) {
                 <div class="rst-pcard" style="cursor:pointer">
                     <div class="rst-av">${avContent}</div>
                     <div class="rst-pinfo">
-                        <div class="rst-pname">${profile.name}</div>
-                        <div class="rst-pdyn">${dyn}</div>
+                        <div class="rst-pname">${escapeHtml(profile.name)}</div>
+                        <div class="rst-pdyn">${escapeHtml(dyn)}</div>
                     </div>
                     <div class="rst-pstat">
                         <div class="rst-pstat-item"><div class="rst-pstat-val ${getValueClass(plat)}">${plat}%</div><div class="rst-pstat-lbl">Plat</div></div>
                         <div class="rst-pstat-item"><div class="rst-pstat-val ${getValueClass(rom)}">${rom}%</div><div class="rst-pstat-lbl">Rom</div></div>
                         <div class="rst-pstat-item"><div class="rst-pstat-val ${getValueClass(sex)}">${sex}%</div><div class="rst-pstat-lbl">Sex</div></div>
                     </div>
-                    <span class="rst-present-remove" data-char-id="${charId}" title="Remove from presence"><i class="fa-solid fa-xmark"></i></span>
+                    <span class="rst-present-remove" data-char-id="${escapeHtml(charId)}" title="Remove from presence"><i class="fa-solid fa-xmark"></i></span>
                 </div>
             `);
 
@@ -605,6 +678,8 @@ function renderPresentCharacters($pane) {
 
             // Click on remove button removes character from presence
             $chip.find(".rst-present-remove").on("click", async (e) => {
+    const rstScope7 = captureChatScope();
+
                 e.preventDefault();
                 e.stopPropagation();
 
@@ -616,7 +691,7 @@ function renderPresentCharacters($pane) {
 
                 const filtered = getPresentCharacters().filter((id) => id !== idToRemove);
                 savePresentCharacters(filtered);
-                const { updateInjection } = await import("../inject/promptInjector.js");
+                const { updateInjection } = await rstScope7.wait(() => (import("../inject/promptInjector.js")));
                 updateInjection();
                 renderChips();
                 populateAddDropdown();
@@ -644,7 +719,7 @@ function renderPresentCharacters($pane) {
         const available = allChars.filter((c) => !currentIds.includes(c.id));
         $addSelect.find("option:not([value=''])").remove();
         for (const c of available) {
-            $addSelect.append(`<option value="${c.id}">${c.name}</option>`);
+            $addSelect.append(`<option value="${escapeHtml(c.id)}">${escapeHtml(c.name)}</option>`);
         }
         $addSelect.val("");
         $addBtn.prop("disabled", true);
@@ -655,13 +730,15 @@ function renderPresentCharacters($pane) {
     });
 
     $addBtn.on("click", async () => {
+    const rstScope8 = captureChatScope();
+
         const newId = $addSelect.val();
         if (!newId) return;
         const currentIds = getPresentCharacters();
         if (!currentIds.includes(newId)) {
             const updatedIds = [...currentIds, newId];
             savePresentCharacters(updatedIds);
-            const { updateInjection } = await import("../inject/promptInjector.js");
+            const { updateInjection } = await rstScope8.wait(() => (import("../inject/promptInjector.js")));
             updateInjection();
             renderChips();
             populateAddDropdown();
@@ -701,270 +778,52 @@ function renderNoPending($pane) {
 
 // ─── Approval Actions ─────────────────────────────────────
 
+function settlePendingAfterDecision(pending) {
+    if (!pending) return;
+    const hasCharacters = Array.isArray(pending.characterUpdates) && pending.characterUpdates.length > 0;
+    if (!hasCharacters && pending.summaryResolved) savePendingUpdates(null);
+    else savePendingUpdates(pending);
+}
+
+function approveSceneSummary(pending, summary) {
+    if (!pending || getPendingUpdates() !== pending || !pending.sceneId) return false;
+    pending.sceneSummary = String(summary || "");
+    pending.summaryResolved = true;
+    pending.summaryApproved = true;
+    updateSceneSummary(pending.sceneId, pending.sceneSummary);
+    settlePendingAfterDecision(pending);
+    return true;
+}
+
+function dismissSceneSummaryProposal(pending) {
+    if (!pending || getPendingUpdates() !== pending) return false;
+    pending.summaryResolved = true;
+    pending.summaryApproved = false;
+    settlePendingAfterDecision(pending);
+    return true;
+}
+
 /**
  * Approve a single character's pending update.
  * @param {object} charUpdate
  */
-async function approveCharacterUpdate(charUpdate, sceneId) {
+function approveCharacterUpdate(charUpdate, sceneId) {
     dlog("[RST] Approving update for:", charUpdate.characterName, { sceneId, statsBefore: charUpdate.statsBefore, statsAfter: charUpdate.statsAfter, commentary: charUpdate.commentary });
     try {
-        const { updateCharacterStats, updateCharacterProfile, addUpdateLogEntry } = await import("../data/characters.js");
-        const { updateSceneSummary } = await import("../data/scenes.js");
-
-        // Commit stats
-        dlog("[RST] Committing stats for:", charUpdate.characterName, charUpdate.statsAfter);
-        updateCharacterStats(charUpdate.characterId, charUpdate.statsAfter);
-
-        // Apply any hard-lock caps that a critical raised this scene. The cap
-        // rises to the broken-through value so future normal growth can fill up
-        // to the new ceiling, and a further critical is needed to climb again.
-        const hasRaised = Array.isArray(charUpdate.raisedCaps) && charUpdate.raisedCaps.length > 0;
-        const hasProposed = Array.isArray(charUpdate.proposedHardLocks) && charUpdate.proposedHardLocks.length > 0;
-        if (hasRaised || hasProposed) {
-            const { getCharacterProfile } = await import("../data/characters.js");
-            const prof = getCharacterProfile(charUpdate.characterId);
-            if (prof && prof.hardLocks) {
-                // Critical-raised caps: cap rises to the broken-through value.
-                for (const rc of (charUpdate.raisedCaps || [])) {
-                    const [cat, stat] = String(rc.stat).split(".");
-                    if (prof.hardLocks[cat] && prof.hardLocks[cat][stat]) {
-                        prof.hardLocks[cat][stat].cap = rc.to;
-                    }
-                }
-                // Newly proposed locks from the LLM (approved alongside the update).
-                // Hard requirement: never apply LLM-proposed locks to a character
-                // whose Personality (description) is empty — the model would be
-                // guessing on a blank slate. Manual user-set locks are unaffected.
-                const personaFilled = !!(prof.description && prof.description.trim());
-                for (const pl of (personaFilled ? (charUpdate.proposedHardLocks || []) : [])) {
-                    if (!pl || typeof pl.cap !== 'number') continue;
-                    const [cat, stat] = String(pl.stat).split(".");
-                    if (prof.hardLocks[cat] && prof.hardLocks[cat][stat]) {
-                        const cur = prof.hardLocks[cat][stat].cap;
-                        // Don't lower an existing higher cap; only set/tighten when sensible.
-                        if (cur === null || pl.cap > cur) {
-                            prof.hardLocks[cat][stat] = { cap: pl.cap, reason: pl.reason || "" };
-                        }
-                    }
-                }
-                updateCharacterProfile(charUpdate.characterId, { hardLocks: prof.hardLocks });
-                dlog("[RST] Applied lock changes:", { raised: charUpdate.raisedCaps, proposed: charUpdate.proposedHardLocks });
-            }
+        if (!isMeaningfulCharacterUpdate(charUpdate, getCharacterProfile(charUpdate?.characterId))) {
+            throw new Error("No relationship changes to approve.");
         }
 
-        // ── Soft lock application ──
-        const hasSoftProp = Array.isArray(charUpdate.proposedSoftLocks) && charUpdate.proposedSoftLocks.length > 0;
-        const hasUnlocked = Array.isArray(charUpdate.unlockedSoftLocks) && charUpdate.unlockedSoftLocks.length > 0;
-        const hasProgress = Array.isArray(charUpdate.softLockProgress) && charUpdate.softLockProgress.length > 0;
-        if (hasSoftProp || hasUnlocked || hasProgress) {
-            const { getCharacterProfile, updateCharacterProfile } = await import("../data/characters.js");
-            const prof = getCharacterProfile(charUpdate.characterId);
-            if (prof && prof.softLocks) {
-                const personaFilled = !!(prof.description && prof.description.trim());
-                const { getSoftLockAvailability } = await import("../data/characters.js");
-                const { getClosedSceneCountForChar } = await import("../data/scenes.js");
-                const sceneCount = getClosedSceneCountForChar(charUpdate.characterId);
-
-                // 1) Resolve met conditions FIRST (auto-unlock). Stamp setAtScene so
-                //    the cooldown clock starts ticking from when the lock resolved.
-                for (const key of (charUpdate.unlockedSoftLocks || [])) {
-                    const [cat, stat] = String(key).split(".");
-                    const sl = prof.softLocks[cat]?.[stat];
-                    if (sl && sl.cap !== null && !sl.met) {
-                        sl.met = true;
-                        sl.setAtScene = sceneCount; // resolution resets the cooldown clock
-                    }
-                }
-                // 2) Progress notes for still-locked soft locks.
-                for (const pr of (charUpdate.softLockProgress || [])) {
-                    if (!pr || !pr.stat) continue;
-                    const [cat, stat] = String(pr.stat).split(".");
-                    const sl = prof.softLocks[cat]?.[stat];
-                    if (sl && sl.cap !== null && !sl.met) {
-                        sl.progress = String(pr.progress || "").trim().slice(0, 1500);
-                    }
-                }
-                // 3) New proposed soft locks — gated by personality, the 1-active
-                //    cap, and the cooldown. Mechanical enforcement so the LLM can't
-                //    flood locks even if it ignores the CLOSED signal in the prompt.
-                //    Only the FIRST valid proposal is taken (cap = 1).
-                if (personaFilled) {
-                    const avail = getSoftLockAvailability(prof, sceneCount);
-                    if (avail.allowed) {
-                        let addedForChar = 0;
-                        for (const sl of (charUpdate.proposedSoftLocks || [])) {
-                            if (addedForChar >= avail.slotsFree) break; // respect the configurable max
-                            if (!sl || typeof sl.cap !== 'number') continue;
-                            const [cat, stat] = String(sl.stat).split(".");
-                            const slot = prof.softLocks[cat]?.[stat];
-                            if (!slot) continue;
-                            // Only fill an empty/resolved slot, and require a condition.
-                            if ((slot.cap === null || slot.met) && sl.condition && String(sl.condition).trim()) {
-                                prof.softLocks[cat][stat] = {
-                                    cap: sl.cap,
-                                    condition: String(sl.condition || "").trim().slice(0, 1500),
-                                    progress: String(sl.progress || "").trim().slice(0, 1500),
-                                    met: false,
-                                    setAtScene: sceneCount,
-                                };
-                                addedForChar++;
-                            }
-                        }
-                    } else {
-                        dlog("[RST] Soft lock proposal suppressed:", avail.reason);
-                    }
-                }
-                updateCharacterProfile(charUpdate.characterId, { softLocks: prof.softLocks });
-                dlog("[RST] Applied soft-lock changes:", { proposed: charUpdate.proposedSoftLocks, unlocked: charUpdate.unlockedSoftLocks });
-            }
-        }
-
-        // ── Hard lock pressure application ──
-        // Pressure tracks evidence against a lock's reason. It NEVER changes the
-        // stat value. Only stats that already have a hard lock can gain pressure.
-        const hasPressure = Array.isArray(charUpdate.hardLockPressureUpdates) && charUpdate.hardLockPressureUpdates.length > 0;
-        const hasReviews = Array.isArray(charUpdate.hardLockReviews) && charUpdate.hardLockReviews.length > 0;
-        if (hasPressure || hasReviews) {
-            const { getCharacterProfile, updateCharacterProfile, ensurePressure, HARD_LOCK_PRESSURE_MAX } = await import("../data/characters.js");
-            const prof = getCharacterProfile(charUpdate.characterId);
-            if (prof && prof.hardLocks) {
-                for (const pu of (charUpdate.hardLockPressureUpdates || [])) {
-                    if (!pu || !pu.stat) continue;
-                    const [cat, stat] = String(pu.stat).split(".");
-                    const lock = prof.hardLocks[cat]?.[stat];
-                    // Guard: pressure only applies where a hard lock actually exists.
-                    if (!lock || typeof lock.cap !== "number") continue;
-                    ensurePressure(lock);
-                    let change = parseInt(pu.change, 10);
-                    if (isNaN(change)) continue;
-                    change = Math.max(-2, Math.min(2, change));
-                    if (change === 0) continue;
-                    const before = lock.pressure.value;
-                    const max = lock.pressure.max || HARD_LOCK_PRESSURE_MAX;
-                    lock.pressure.value = Math.max(0, Math.min(max, before + change));
-                    lock.pressure.reason = String(pu.reason || "").trim().slice(0, 1500);
-                    lock.pressure.lastUpdated = Date.now();
-                    if (lock.pressure.value >= max) lock.pressure.needsReview = true;
-                    dlog(`[RST] Pressure ${cat}.${stat}: ${before} -> ${lock.pressure.value} (${change > 0 ? "+" : ""}${change})`);
-                }
-                // Attach any review recommendations the LLM provided for maxed locks.
-                for (const rv of (charUpdate.hardLockReviews || [])) {
-                    if (!rv || !rv.stat) continue;
-                    const [cat, stat] = String(rv.stat).split(".");
-                    const lock = prof.hardLocks[cat]?.[stat];
-                    if (!lock || typeof lock.cap !== "number") continue;
-                    ensurePressure(lock);
-                    // Only honor a review when the lock is actually at/over max pressure.
-                    if (lock.pressure.value < (lock.pressure.max || HARD_LOCK_PRESSURE_MAX)) continue;
-                    const rec = String(rv.recommendation || "maintain");
-                    const validRecs = ["maintain", "raise_cap", "convert_to_soft", "remove"];
-                    lock.pressure.needsReview = true;
-                    lock.pressure.recommendation = {
-                        recommendation: validRecs.includes(rec) ? rec : "maintain",
-                        recommendedCap: (typeof rv.recommendedCap === "number") ? Math.max(-100, Math.min(100, rv.recommendedCap)) : lock.cap,
-                        reason: String(rv.reason || "").trim().slice(0, 1500),
-                    };
-                }
-                updateCharacterProfile(charUpdate.characterId, { hardLocks: prof.hardLocks });
-                dlog("[RST] Applied hard-lock pressure changes.");
-            }
-        }
-
-        // Update dynamic title and narrative
-        updateCharacterProfile(charUpdate.characterId, {
-            dynamicTitle: charUpdate.dynamicTitleAfter,
-            narrativeSummary: charUpdate.narrativeSummary,
-        });
-
-        // Get actual message range from the scene
-        const scene = sceneId ? getSceneById(sceneId) : null;
-        const messageRange = scene
-            ? { start: scene.messageStart, end: scene.messageEnd }
-            : null; // No scene available — skip message range in log entry
-
-        // Commit read-only milestones + temporary conditions only after the user
-        // approves the same stat-update card. This keeps all three systems in sync.
-        const profileSystemChanges = { milestonesAdded: [], conditionsAdded: [], conditionsResolved: [] };
-        const profileState = getCharacterProfile(charUpdate.characterId);
-        if (profileState) {
-            const now = Date.now();
-            let milestones = Array.isArray(profileState.relationshipMilestones) ? [...profileState.relationshipMilestones] : [];
-            for (const ms of (charUpdate.proposedMilestones || [])) {
-                if (!ms?.title || !ms?.description) continue;
-                const milestone = {
-                    id: `milestone_${now}_${milestones.length}`,
-                    title: String(ms.title).trim().slice(0, 120),
-                    description: String(ms.description).trim().slice(0, 1200),
-                    domains: Array.isArray(ms.domains) ? ms.domains.slice(0, 3) : [],
-                    sceneId: sceneId || "",
-                    timestamp: now,
-                };
-                milestones.push(milestone);
-                profileSystemChanges.milestonesAdded.push(milestone.id);
-            }
-
-            let conditions = Array.isArray(profileState.relationshipConditions) ? [...profileState.relationshipConditions] : [];
-            const resolvedIds = new Set((charUpdate.resolvedConditions || []).map((c) => c?.id).filter(Boolean));
-            if (resolvedIds.size) {
-                profileSystemChanges.conditionsResolved = conditions
-                    .filter((condition) => resolvedIds.has(condition.id))
-                    .map((condition) => structuredClone(condition));
-                conditions = conditions.filter((condition) => !resolvedIds.has(condition.id));
-            }
-
-            const activeTypes = new Set(conditions.map((condition) => condition?.type).filter(Boolean));
-            for (const proposal of (charUpdate.proposedConditions || [])) {
-                if (conditions.length >= MAX_ACTIVE_RELATIONSHIP_CONDITIONS) break;
-                const def = getRelationshipConditionDefinition(proposal?.type);
-                if (!def || activeTypes.has(proposal.type)) continue;
-                const condition = {
-                    id: `condition_${proposal.type}_${now}_${conditions.length}`,
-                    type: proposal.type,
-                    reason: String(proposal.reason || "").trim().slice(0, 1200),
-                    resolution: String(proposal.resolution || "").trim().slice(0, 1200),
-                    sceneId: sceneId || "",
-                    startedAt: now,
-                };
-                conditions.push(condition);
-                profileSystemChanges.conditionsAdded.push(condition.id);
-                activeTypes.add(proposal.type);
-            }
-
-            updateCharacterProfile(charUpdate.characterId, {
-                relationshipMilestones: milestones,
-                relationshipConditions: conditions,
-            });
-        }
-
-        // Create update log entry
-        dlog("[RST] Adding update log entry for:", charUpdate.characterName, { statsBefore: charUpdate.statsBefore, statsAfter: charUpdate.statsAfter, commentary: charUpdate.commentary });
-        addUpdateLogEntry(charUpdate.characterId, {
-            sceneId: sceneId || "",
-            messageRange,
-            timestamp: Date.now(),
-            statsBefore: charUpdate.statsBefore,
-            statsAfter: charUpdate.statsAfter,
-            commentary: charUpdate.commentary,
-            dynamicTitleBefore: charUpdate.dynamicTitleBefore,
-            dynamicTitleAfter: charUpdate.dynamicTitleAfter,
-            narrativeSummary: charUpdate.narrativeSummary,
-            criticalStats: charUpdate.criticalStats || [],
-            inertiaAdjustments: Array.isArray(charUpdate.inertiaAdjustments) ? charUpdate.inertiaAdjustments : [],
-            profileSystemChanges,
-            source: charUpdate.source || "unknown",
-        });
+        commitCharacterUpdate(charUpdate, sceneId);
 
         // Remove from pending
         const pending = getPendingUpdates();
         if (pending && pending.characterUpdates) {
+            pending.autoCreatedIds = (pending.autoCreatedIds || []).filter(id => id !== charUpdate.characterId);
             pending.characterUpdates = pending.characterUpdates.filter(
                 (u) => u.characterId !== charUpdate.characterId
             );
-            if (pending.characterUpdates.length === 0) {
-                savePendingUpdates(null);
-            } else {
-                savePendingUpdates(pending);
-            }
+            settlePendingAfterDecision(pending);
         }
         dlog("[RST] Removed from pending:", charUpdate.characterName);
 
@@ -975,11 +834,13 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
         refreshPending($pane);
 
         // Update injection
-        const { updateInjection } = await import("../inject/promptInjector.js");
+
         updateInjection();
+        return true;
     } catch (err) {
         console.error("[RST] Failed to approve changes:", err);
-        toastr?.error?.("Failed to save stat changes. Please try again.");
+        toastr?.error?.(err.message || "Failed to save stat changes.");
+        return false;
     }
 }
 
@@ -987,23 +848,13 @@ async function approveCharacterUpdate(charUpdate, sceneId) {
  * Approve all pending updates at once.
  * @param {object} pending
  */
-async function approveAllPending(pending) {
-    if (!pending || !pending.characterUpdates) return;
-
-    // Save the scene summary first (if present)
-    if (pending.sceneId && pending.sceneSummary) {
-        try {
-            const { updateSceneSummary } = await import("../data/scenes.js");
-            updateSceneSummary(pending.sceneId, pending.sceneSummary);
-        } catch (err) {
-            console.error("[RST] Failed to save scene summary during approve-all:", err);
-        }
+function approveAllPending(pending) {
+    if (!pending?.characterUpdates || getPendingUpdates() !== pending) return;
+    if (!pending.summaryResolved) approveSceneSummary(pending, pending.sceneSummary || "");
+    normalizePendingCharacterUpdates(pending);
+    for (const charUpdate of [...pending.characterUpdates].filter((update) => isMeaningfulCharacterUpdate(update, getCharacterProfile(update.characterId)))) {
+        if (!approveCharacterUpdate(charUpdate, pending.sceneId)) return;
     }
-
-    for (const charUpdate of pending.characterUpdates) {
-        await approveCharacterUpdate(charUpdate, pending.sceneId);
-    }
-
     toastr?.success?.("All stat changes approved and saved.");
 }
 
@@ -1012,6 +863,7 @@ async function approveAllPending(pending) {
  */
 function dismissAllPending() {
     const pending = getPendingUpdates();
+    const preserveApprovedSummary = !!(pending?.summaryResolved && pending?.summaryApproved);
 
     // Delete any auto-created character profiles (tracked deterministically during generation)
     if (pending && pending.autoCreatedIds && pending.autoCreatedIds.length > 0) {
@@ -1020,13 +872,16 @@ function dismissAllPending() {
         }
     }
 
-    // If there's a scene associated with these pending updates, delete it
-    if (pending && pending.sceneId) {
+    // An explicitly approved summary is durable. Dismissing the remaining stat
+    // cards must not delete its closed scene or the saved summary.
+    if (pending && pending.sceneId && !preserveApprovedSummary) {
         deleteScene(pending.sceneId);
     }
 
     savePendingUpdates(null);
-    toastr?.info?.("All pending stat changes dismissed. Scene removed.");
+    toastr?.info?.(preserveApprovedSummary
+        ? "Remaining pending stat changes dismissed. Approved scene summary preserved."
+        : "All pending stat changes dismissed. Scene removed.");
 
     const $pane = getPane("home");
     refreshPending($pane);
@@ -1063,11 +918,7 @@ function dismissCharacterUpdate(charUpdate) {
         (u) => u.characterId !== charUpdate.characterId
     );
 
-    if (pending.characterUpdates.length === 0) {
-        savePendingUpdates(null);
-    } else {
-        savePendingUpdates(pending);
-    }
+    settlePendingAfterDecision(pending);
 
     toastr?.info?.(`${charUpdate.characterName || "Character"} stats dismissed.`);
 
@@ -1089,10 +940,12 @@ function dismissCharacterUpdate(charUpdate) {
  * @param {string} guidance
  */
 async function regenerateSceneSummary(sceneId, guidance) {
+    const rstScope9 = captureChatScope();
+
     showPanelLoading("Regenerating scene summary...");
     try {
         toastr?.info?.("Regenerating scene summary...");
-        const result = await generateStatUpdate(sceneId, guidance);
+        const result = await rstScope9.wait(() => (generateStatUpdate(sceneId, guidance)));
 
         const pending = getPendingUpdates();
         if (pending) {
@@ -1118,10 +971,12 @@ async function regenerateSceneSummary(sceneId, guidance) {
  * @param {string} guidance
  */
 async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
+    const rstScope10 = captureChatScope();
+
     showPanelLoading("Regenerating stat updates...");
     try {
         toastr?.info?.("Regenerating stat updates...");
-        const result = await generateStatUpdate(sceneId, guidance);
+        const result = await rstScope10.wait(() => (generateStatUpdate(sceneId, guidance)));
 
         const pending = getPendingUpdates();
         if (pending && result.characterUpdates) {
@@ -1176,6 +1031,8 @@ async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
  * @param {string} sceneId - The scene ID
  */
 async function showEditStatsModal(charUpdate, sceneId) {
+    const rstScope11 = captureChatScope();
+
     dlog("[RST] Opening edit modal for:", charUpdate.characterName, charUpdate);
     // Load character profile for editable fields
     const profile = getCharacterProfile(charUpdate.characterId) || {};
@@ -1192,7 +1049,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
 
         <div style="margin-bottom:8px">
             <div style="font-size:11px;color:var(--rst-text-muted);margin-bottom:3px">Name</div>
-            <input type="text" id="rst-edit-name" value="${currentName.replace(/"/g, '"')}"
+            <input type="text" id="rst-edit-name" value="${escapeHtml(currentName)}"
                 style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text)">
         </div>
 
@@ -1202,7 +1059,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
                 <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-edit-description" title="Expand the editor"></i>
             </div>
             <textarea id="rst-edit-description" rows="2"
-                style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${currentDesc.replace(/"/g, '"')}</textarea>
+                style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${escapeHtml(currentDesc)}</textarea>
         </div>
 
         <div style="margin-bottom:8px">
@@ -1211,7 +1068,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
                 <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-edit-notes" title="Expand the editor"></i>
             </div>
             <textarea id="rst-edit-notes" rows="2"
-                style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${currentNotes.replace(/"/g, '"')}</textarea>
+                style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${escapeHtml(currentNotes)}</textarea>
         </div>
     </div>`;
 
@@ -1254,7 +1111,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
                 <div style="margin-bottom:3px">
                     <label style="font-size:11px;color:var(--rst-text-muted);width:70px;display:inline-block">${statTitle}</label>
                     <input type="text" class="rst-edit-commentary" data-cat="${cat}" data-stat="${stat}"
-                        value="${commentText}"
+                        value="${escapeHtml(commentText)}"
                         style="width:calc(100% - 80px);padding:3px 6px;font-size:11px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text)">
                 </div>`;
         }
@@ -1266,7 +1123,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
     const editedTitle = charUpdate.dynamicTitleAfter || "";
     html += `<div style="margin-bottom:10px">
         <div style="font-weight:500;font-size:13px;margin-bottom:4px;color:var(--rst-text)">Dynamic Title</div>
-        <input type="text" id="rst-edit-title" value="${editedTitle}"
+        <input type="text" id="rst-edit-title" value="${escapeHtml(editedTitle)}"
             style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text)">
     </div>`;
 
@@ -1278,7 +1135,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
             <i class="editor_maximize fa-solid fa-maximize right_menu_button" data-for="rst-edit-narrative" title="Expand the editor"></i>
         </div>
         <textarea id="rst-edit-narrative" rows="3"
-            style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${editedNarrative}</textarea>
+            style="width:100%;padding:5px 8px;font-size:12px;border:0.5px solid var(--rst-border);border-radius:6px;background:var(--rst-bg);color:var(--rst-text);resize:vertical">${escapeHtml(editedNarrative)}</textarea>
     </div>`;
 
     html += `</div>`; // End scroll container
@@ -1295,10 +1152,14 @@ async function showEditStatsModal(charUpdate, sceneId) {
                     text: "Save changes",
                     result: POPUP_RESULT.AFFIRMATIVE,
                     action: () => {
+    if (!rstScope11.isCurrent()) return;
+
                         dlog("[RST] Save changes clicked for:", charUpdate.characterName);
                         // Read all edited values from the DOM while it's still present
                         const newStats = JSON.parse(JSON.stringify(charUpdate.statsAfter || {}));
                         $(popup.dlg).find(".rst-edit-stat").each(function () {
+    if (!rstScope11.isCurrent()) return;
+
                             const cat = $(this).data("cat");
                             const stat = $(this).data("stat");
                             const val = parseInt($(this).val(), 10);
@@ -1311,6 +1172,8 @@ async function showEditStatsModal(charUpdate, sceneId) {
 
                         const newCommentary = JSON.parse(JSON.stringify(charUpdate.commentary || {}));
                         $(popup.dlg).find(".rst-edit-commentary").each(function () {
+    if (!rstScope11.isCurrent()) return;
+
                             const cat = $(this).data("cat");
                             const stat = $(this).data("stat");
                             if (!newCommentary[cat]) newCommentary[cat] = {};
@@ -1369,6 +1232,8 @@ async function showEditStatsModal(charUpdate, sceneId) {
                 {
                     text: "Reset to LLM values",
                     action: () => {
+    if (!rstScope11.isCurrent()) return;
+
                         // Reset profile fields
                         $(popup.dlg).find("#rst-edit-name").val(profile.name || charUpdate.characterName || "");
                         $(popup.dlg).find("#rst-edit-description").val(profile.description || "");
@@ -1376,6 +1241,8 @@ async function showEditStatsModal(charUpdate, sceneId) {
                         // Reset stat fields
                         const originalAfter = charUpdate.statsAfter || {};
                         $(popup.dlg).find(".rst-edit-stat").each(function () {
+    if (!rstScope11.isCurrent()) return;
+
                             const cat = $(this).data("cat");
                             const stat = $(this).data("stat");
                             $(this).val(originalAfter[cat]?.[stat] ?? 0);
@@ -1384,6 +1251,8 @@ async function showEditStatsModal(charUpdate, sceneId) {
                         $(popup.dlg).find("#rst-edit-title").val(charUpdate.dynamicTitleAfter || "");
                         $(popup.dlg).find("#rst-edit-narrative").val(charUpdate.narrativeSummary || "");
                         $(popup.dlg).find(".rst-edit-commentary").each(function () {
+    if (!rstScope11.isCurrent()) return;
+
                             const cat = $(this).data("cat");
                             const stat = $(this).data("stat");
                             $(this).val(charUpdate.commentary?.[cat]?.[stat] || "");
@@ -1395,14 +1264,14 @@ async function showEditStatsModal(charUpdate, sceneId) {
         });
 
         // Show popup — all saving is handled inside the "Save changes" action callback
-        await popup.show();
+        await rstScope11.wait(() => (popup.show()));
     } catch (err) {
         console.error("[RST] Failed to open edit modal:", err);
 
         // Fallback: use ST Popup with custom button for JSON editing
         try {
             const fallbackHtml = `
-                <h3>Edit stats for ${charUpdate.characterName}</h3>
+                <h3>Edit stats for ${escapeHtml(charUpdate.characterName)}</h3>
                 <p style="font-size:12px;color:var(--rst-text-muted);margin-bottom:8px">
                     Paste the modified JSON stats object below:
                 </p>
@@ -1415,6 +1284,8 @@ async function showEditStatsModal(charUpdate, sceneId) {
                         text: "Save",
                         result: POPUP_RESULT.AFFIRMATIVE,
                         action: () => {
+    if (!rstScope11.isCurrent()) return;
+
                             dlog("[RST] Fallback save triggered for:", charUpdate.characterName);
                             const newVal = $(fallbackPopup.dlg).find("#rst-fallback-edit").val();
                             try {
@@ -1441,7 +1312,7 @@ async function showEditStatsModal(charUpdate, sceneId) {
             });
 
             // Show popup — saving handled inside action callback
-            await fallbackPopup.show();
+            await rstScope11.wait(() => (fallbackPopup.show()));
         } catch (fallbackErr) {
             console.error("[RST] Fallback edit modal also failed:", fallbackErr);
             toastr?.error?.("Could not open edit modal. Please try again.");

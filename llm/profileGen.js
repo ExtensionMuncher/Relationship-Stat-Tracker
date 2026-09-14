@@ -1,3 +1,4 @@
+import { captureChatScope } from "../lib/chatScope.js";
 /**
  * profileGen.js — Main LLM: character profile auto-generation
  * Generates character descriptions, notes, and initial stats from scene context
@@ -10,6 +11,7 @@ import { getSettings } from "../data/storage.js";
 import { getAllSceneSummaries } from "../data/scenes.js";
 import { STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { dlog } from "../lib/debug.js";
+import { narrativeMessages } from "../lib/chatMessages.js";
 
 // ─── Profile Generation ───────────────────────────────────
 
@@ -21,6 +23,8 @@ import { dlog } from "../lib/debug.js";
  * @returns {Promise<object>} Generated profile data
  */
 export async function generateProfile(characterName, prompt = "", fromScene = false) {
+    const rstScope1 = captureChatScope();
+
     const settings = getSettings();
     const profileName = settings.connections.autoGenLLM;
 
@@ -41,13 +45,13 @@ export async function generateProfile(characterName, prompt = "", fromScene = fa
     try {
         toastr?.info?.("Generating character profile...");
 
-        const result = await makeRequest(
+        const result = await rstScope1.wait(() => (makeRequest(
             profileName,
             systemPrompt,
             requestPrompt,
             2000,
             0.3,  // Low temperature for reliable JSON-structured output
-        );
+        )));
 
         dlog("[RST] Profile gen raw response (first 500 chars):", result?.slice(0, 500));
         dlog("[RST] Profile gen raw response (last 200 chars):", result?.slice(-200));
@@ -63,6 +67,8 @@ export async function generateProfile(characterName, prompt = "", fromScene = fa
             source: "auto_generated",
         };
     } catch (err) {
+        rstScope1.assertCurrent();
+
         console.error("[RST] Profile generation failed:", err);
         toastr?.error?.("Character profile generation failed: " + (err.message || "Unknown error"));
         throw err;
@@ -373,7 +379,7 @@ function extractProfileFields(parsed) {
  */
 function getRecentMessages(count) {
     if (!chat || !Array.isArray(chat)) return [];
-    return chat.slice(-count);
+    return narrativeMessages(chat).slice(-count);
 }
 
 /**
