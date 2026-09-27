@@ -27,13 +27,15 @@ import {
     setMessageCounter,
     syncMessageCounterToLiveCount,
     setSidecarRetryDue,
+    getSidecarReconciliationVersion,
+    setSidecarReconciliationVersion,
     getSidecarPauseCadence,
     saveSidecarPauseCadence,
     clearSidecarPauseCadence,
     getPendingUpdates,
     savePendingUpdates,
 } from "./data/storage.js";
-import { createCharacter, findCharacterByName, findCharacterByFuzzyName } from "./data/characters.js";
+import { findCharacterByName, findCharacterByFuzzyName, resolveCharacterIdentity } from "./data/characters.js";
 import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary, updateSceneTitle } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
 import { generateStatUpdate, isStatUpdateRunning } from "./llm/statUpdate.js";
@@ -273,6 +275,7 @@ function resetRuntimeMessageState(reason = "chat changed") {
         // a stale pre-edit result must never commit into the edited chat.
         _sidecarGeneration++;
         setSidecarRetryDue(false);
+        setSidecarReconciliationVersion(0);
     }
     _lastObservedChatLength = getLiveMessageCount();
     const sync = syncMessageCounterToLiveCount(_lastObservedChatLength);
@@ -473,9 +476,11 @@ async function onMessageReceived(mesId, fromAssistant = false) {
             // Pass the exact unprocessed span so no boundary transition is lost,
             // including when cadence becomes due on an assistant response.
             const scanWindow = Math.max(Number(settings.messagesToScan) || 10, messagesSinceScan);
+            const boundaryCatchup = getSidecarReconciliationVersion() < 1;
             const result = await detectCharacters({
                 messageCount: scanWindow,
                 transitionMessageCount: messagesSinceScan,
+                boundaryCatchup,
             });
 
             if (!requestIsCurrent()) {
@@ -530,19 +535,24 @@ async function onMessageReceived(mesId, fromAssistant = false) {
             }
             for (const unknownName of filteredUnknown) {
                 if (!requestIsCurrent()) return;
-                const existing = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
+                const identity = resolveCharacterIdentity(unknownName);
+                const existing = identity.status === "match" ? identity.character : null;
                 if (existing && !detectedIds.has(existing.id)) {
                     detectedIds.add(existing.id);
                     detectedModes[existing.id] = normalizePresenceMode(resultModes[unknownName]);
+                } else if (identity.status === "ambiguous") {
+                    dlog(`[RST/Identity] Sidecar name "${unknownName}" is ambiguous; automatic creation/popup blocked.`);
                 }
             }
 
             // Handle truly unknown characters — with rejection tracking to prevent repeat popups.
             let newDetected = [...detectedIds];
             for (const unknownName of filteredUnknown) {
-                // Skip names that already matched via fuzzy matching above
-                const alreadyMatched = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
-                if (alreadyMatched) continue;
+                // Re-resolve through the canonical identity function immediately
+                // before any popup. Ambiguous known identities fail closed rather
+                // than being offered as a third profile.
+                const identity = resolveCharacterIdentity(unknownName);
+                if (identity.status === "match" || identity.status === "ambiguous") continue;
 
                 // Missing legacy values mean enabled, matching the Settings UI and
                 // the default setting. Only an explicit false disables prompts.
@@ -608,6 +618,7 @@ async function onMessageReceived(mesId, fromAssistant = false) {
             // its owning chat. Failed or stale requests remain due for retry.
             setMessageCounter(liveCount);
             setSidecarRetryDue(false);
+            setSidecarReconciliationVersion(1);
 
             // Refresh both Home and Library tabs if visible so present-indicator UI stays in sync
             const $homePane = getPane("home");

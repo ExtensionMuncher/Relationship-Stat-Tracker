@@ -12,7 +12,7 @@ import { getContext } from "../../../../extensions.js";
 import { makeRequest, reportProgress, updateRateLimiterSettings } from "./connections.js";
 import { getSettings, getNameBlacklist, isNameBlacklisted } from "../data/storage.js";
 import { getScenes, saveScenes } from "../data/storage.js";
-import { findCharacterByName, findCharacterByFuzzyName, createCharacter, updateCharacterStats, getCharacterProfile, addUpdateLogEntry, updateCharacterProfile, getAllCharacters, getCharacterNameVariants, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
+import { findCharacterByName, findCharacterByFuzzyName, resolveOrCreateAutomaticCharacter, updateCharacterStats, getCharacterProfile, addUpdateLogEntry, updateCharacterProfile, getAllCharacters, getCharacterNameVariants, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
 import { initSceneCounter, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
 import { showPanelLoading, hidePanelLoading } from "../ui/panel.js";
 import { dlog } from "../lib/debug.js";
@@ -149,15 +149,15 @@ export function buildHistoricalScanChunks(options = {}) {
 /**
  * Normalize a name for comparison by stripping parenthetical annotations,
  * normalizing diacritics (ō -> o, ū -> u, etc.), and lowercasing.
- * This allows LLM-returned names with punctuation, ordering, or parenthetical annotations
- * to match equivalent chat speaker names.
+ * This allows LLM-returned names like "Alex Morgan" or "Jordan Lee (referenced)"
+ * to match chat speaker names like "Alex Morgan" or "Jordan Lee".
  * @param {string} name
  * @returns {string} Normalized name, or empty string if name is invalid.
  */
 function normalizeNameForComparison(name) {
     if (!name) return "";
     let cleaned = name
-        // Strip parenthetical annotations such as "(referenced)" or role labels.
+        // Strip parenthetical annotations: "(referenced)", "(Jordan)", etc.
         .replace(/\s*\([^)]*\)\s*/g, "")
         .trim();
     if (!cleaned) return "";
@@ -367,13 +367,14 @@ export async function runBatchScan() {
     dlog("[RST-DEBUG] Phase 2: Character names to create profiles for:", [...allCharNames]);
 
     for (const name of allCharNames) {
-        const existing = findCharacterByFuzzyName(name) || findCharacterByName(name);
-        if (!existing) {
-            const newProfile = createCharacter(name, { source: "auto_generated" });
+        const resolution = resolveOrCreateAutomaticCharacter(name);
+        if (resolution.created) {
             profilesCreated.push(name);
-            dlog(`[RST-DEBUG] Created character profile: "${name}" -> id: ${newProfile?.id}`);
+            dlog(`[RST-DEBUG] Created character profile: "${name}" -> id: ${resolution.profile?.id}`);
+        } else if (resolution.profile) {
+            dlog(`[RST-DEBUG] Character already exists: "${name}" -> id: ${resolution.profile.id} (${resolution.method || "canonical"})`);
         } else {
-            dlog(`[RST-DEBUG] Character already exists: "${name}" -> id: ${existing.id}`);
+            dlog(`[RST-DEBUG] Character creation blocked for "${name}": ${resolution.status}`);
         }
     }
     dlog("[RST-DEBUG] Profiles created:", profilesCreated);

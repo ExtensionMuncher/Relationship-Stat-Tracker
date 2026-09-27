@@ -45,7 +45,7 @@ const DESCRIPTIVE_ALIAS_WORDS = new Set([
 
 /**
  * Reconcile current character presence from recent messages.
- * @param {number|{messageCount?:number,transitionMessageCount?:number}|null} [options=null]
+ * @param {number|{messageCount?:number,transitionMessageCount?:number,boundaryCatchup?:boolean}|null} [options=null]
  * @returns {Promise<{detected:string[], unknown:string[], modes:Object, valid:boolean, reason?:string}>}
  */
 export async function detectCharacters(options = null) {
@@ -62,6 +62,7 @@ export async function detectCharacters(options = null) {
     const legacyCount = typeof options === "number" ? options : null;
     const requestedMessageCount = options && typeof options === "object" ? options.messageCount : null;
     const requestedTransitionCount = options && typeof options === "object" ? options.transitionMessageCount : null;
+    const boundaryCatchup = options && typeof options === "object" && options.boundaryCatchup === true;
     const count = Math.max(1, Number(legacyCount ?? requestedMessageCount ?? settings.messagesToScan) || 10);
     const transitionMessageCount = Math.max(
         1,
@@ -79,6 +80,7 @@ export async function detectCharacters(options = null) {
         allCharacters,
         personaName,
         transitionMessageCount,
+        boundaryCatchup,
     );
     const safeCurrentNames = candidateState.currentProfiles.map((profile) => profile.name);
     const safeCurrentModes = Object.fromEntries(
@@ -383,7 +385,7 @@ function buildSidecarRequestPrompt(messages, candidateState, personaName) {
 
 // ─── Candidate Construction ───────────────────────────────
 
-function buildCandidateState(messages, allCharacters, personaName, transitionMessageCount = 3) {
+function buildCandidateState(messages, allCharacters, personaName, transitionMessageCount = 3, boundaryCatchup = false) {
     const currentIds = new Set(getPresentCharacters());
     const storedModes = getPresenceModes();
     let currentProfiles = allCharacters.filter((profile) => currentIds.has(profile.id));
@@ -408,6 +410,7 @@ function buildCandidateState(messages, allCharacters, personaName, transitionMes
     const candidatesById = new Map();
     const embeddedDocumentIndices = new Set();
     const transitionStartIndex = Math.max(0, messages.length - Math.max(1, transitionMessageCount));
+    const boundarySearchStartIndex = boundaryCatchup ? 0 : transitionStartIndex;
 
     function ensureCandidate(profile) {
         if (!candidatesById.has(profile.id)) {
@@ -489,6 +492,7 @@ function buildCandidateState(messages, allCharacters, personaName, transitionMes
         embeddedDocumentIndices,
         identityVariants,
         transitionStartIndex,
+        boundarySearchStartIndex,
         personaName,
     };
 }
@@ -655,12 +659,32 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
     }
 
     const reset = normalizeSceneReset(decision.sceneReset, messages.length);
-    const resetIndex = reset.active
+    const modelResetIndex = reset.active
         ? reset.evidence.find((index) => index >= candidateState.transitionStartIndex && isStrongSceneBoundary(messages[index], messages[index - 1]))
         : undefined;
 
-    if (reset.active && resetIndex === undefined) {
+    // A scene boundary is observable evidence, not merely an LLM suggestion.
+    // Previously we detected/validated strong boundaries but only acted on one
+    // when the model also remembered to set sceneReset.active. That allowed a
+    // valid empty transition response to consume the cadence checkpoint while
+    // preserving the entire old physical cast indefinitely. Reconcile against
+    // the latest verified boundary in the newly scanned interval even when the
+    // model omits the sceneReset flag.
+    let deterministicResetIndex;
+    for (let index = candidateState.boundarySearchStartIndex; index < messages.length; index++) {
+        if (isStrongSceneBoundary(messages[index], messages[index - 1])) {
+            deterministicResetIndex = index;
+        }
+    }
+    const resetIndex = [modelResetIndex, deterministicResetIndex]
+        .filter((index) => index !== undefined)
+        .reduce((latest, index) => latest === undefined ? index : Math.max(latest, index), undefined);
+
+    if (reset.active && modelResetIndex === undefined) {
         dlog("[RST] Ignoring unsupported sceneReset; cited messages are not top-level scene boundaries.");
+    }
+    if (deterministicResetIndex !== undefined && modelResetIndex === undefined) {
+        dlog(`[RST] Applying deterministic scene reset at M${deterministicResetIndex}; model sceneReset flag was absent or unsupported.`);
     }
 
     if (resetIndex !== undefined) {
@@ -672,6 +696,24 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
             if (!isRemoteMode(mode) || mode === "parallel") {
                 selectedIds.delete(profile.id);
                 delete selectedModes[profile.id];
+            }
+        }
+
+        // A current character can legitimately continue across the boundary.
+        // Re-ground scene-limited current entries from explicit active evidence
+        // after the boundary so the deterministic reset swaps only the stale
+        // portion of the cast. This also makes the one-time upgrade catch-up
+        // safe when the boundary predates the ordinary transition interval.
+        for (const candidate of candidateState.candidates) {
+            if (!candidate.wasPresent || selectedIds.has(candidate.profile.id)) continue;
+            for (const index of [...candidate.matchEvidence].sort((a, b) => a - b)) {
+                if (index < resetIndex || candidateState.embeddedDocumentIndices.has(index)) continue;
+                const mode = findCandidateActiveMode(messages[index], candidate, candidateState.identityVariants, candidateState.personaName);
+                if (mode === "unknown") continue;
+                if (hasLaterEndingEvidence(messages, index, candidate, mode, candidateState.identityVariants, candidateState.personaName)) continue;
+                selectedIds.add(candidate.profile.id);
+                selectedModes[candidate.profile.id] = mode;
+                break;
             }
         }
     }
@@ -962,7 +1004,7 @@ function personaIdentityVariants(personaName) {
     const words = normalized.split(/\s+/).filter(Boolean);
     const variants = new Set([normalized]);
     if (words.length > 1) {
-        // Persona names may appear in either full-name ordering; preserve useful token variants.
+        // Both orders occur in persona names (Alex Morgan / Morgan Alex).
         words.filter(word => word.length >= 3).forEach(word => variants.add(word));
     }
     return [...variants];
@@ -1347,6 +1389,9 @@ function isStrongSceneBoundary(message, previousMessage) {
     const first = normalizeForMatch(raw.slice(0, 420));
 
     if (/^---+\s*(?!#)/.test(raw)) return true;
+    // Common long-form RP scene headers do not always include a horizontal
+    // rule. Treat a leading bold location/time card as a top-level camera cut.
+    if (/^\*\*[^\n*]{2,180}(?:\s[-–—|]\s|\b(?:am|pm)\b)[^\n*]{0,120}\*\*/i.test(raw)) return true;
     return /^(?:hours?|days?|weeks?|months?) later\b/i.test(first)
         || /^(?:the )?next (?:morning|afternoon|evening|night|day)\b/i.test(first)
         || /^the following (?:morning|afternoon|evening|night|day)\b/i.test(first)
@@ -1355,7 +1400,11 @@ function isStrongSceneBoundary(message, previousMessage) {
         || /^elsewhere(?:,|\s)+(?:at|in)\b/i.test(first)
         || /^back (?:at|in)\s+[\p{L}\p{N}]/iu.test(first)
         || /^upon arriving\b/i.test(first)
-        || /^by the time\b/i.test(first);
+        || /^by the time\b/i.test(first)
+        // Travel compression at the start of a response normally advances the
+        // camera to the destination. This covers prose such as "The walk took
+        // eleven minutes" used in the supplied Main Story chat.
+        || /^(?:the )?(?:walk|drive|ride|trip|journey|flight) took\b/i.test(first);
 }
 
 // ─── Name Matching ────────────────────────────────────────

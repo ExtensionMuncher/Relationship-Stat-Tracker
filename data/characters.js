@@ -14,6 +14,7 @@ import {
     saveFolders,
 } from "./storage.js";
 import { getNameMatchKeys, getNameWordSignature, getNameTokens } from "../lib/nameIdentity.js";
+import { dlog } from "../lib/debug.js";
 
 // Re-export storage functions needed by the UI layer
 export { getFolders, saveFolders };
@@ -232,29 +233,42 @@ export function getSoftLockAvailability(profile, currentSceneCount) {
  */
 export function createCharacter(name, options = {}) {
     const id = generateCharacterId(name);
+    const automatic = options.source === "auto_generated" || options.automatic === true;
 
-    // GUARD: if a profile already exists at this deterministic ID, return it
-    // instead of overwriting. createCharacter() is called from detection/scan
-    // paths whenever the LLM names a character — without this guard, re-detecting
-    // an existing character clobbered its saved profile (aliases, stats, and
-    // update log were silently wiped). Returning the existing profile is
-    // backward-compatible: it only prevents destruction of saved data.
-    const existing = getStoredCharacter(id);
-    if (existing) {
-        return existing;
+    // The deterministic-ID guard protects exact repeat creation. Automatic
+    // discovery needs a stronger invariant: aliases, reversed names and unique
+    // shortened names must resolve to the existing canonical profile BEFORE a
+    // new ID is ever allowed to exist. Manual Library creation intentionally
+    // keeps the old warning-only behavior so the user can still create genuinely
+    // distinct same-name characters when needed.
+    const exactIdExisting = getStoredCharacter(id);
+    if (exactIdExisting) {
+        dlog(`[RST/Identity] "${name}" -> existing ${exactIdExisting.id} via deterministic id`);
+        return exactIdExisting;
     }
 
-    // Check for name collisions (same words, different order) — different ID,
-    // so not caught by the guard above. Warn but allow (user may genuinely want
-    // a distinct profile).
-    const similar = findCharacterBySimilarName(name);
-    if (similar) {
-        console.warn(`[RST] Name collision detected: "${name}" is similar to existing character "${similar.name}" (id=${similar.id})`);
-        toastr?.warning?.(
-            `A character with a similar name already exists: "${similar.name}". Consider using that profile instead of creating a duplicate.`,
-            "RST Name Collision",
-            { timeOut: 8000, closeButton: true }
-        );
+    const identity = resolveCharacterIdentity(name);
+    if (automatic) {
+        if (identity.status === "match") {
+            dlog(`[RST/Identity] "${name}" -> existing ${identity.character.id} via ${identity.method}; automatic creation blocked`);
+            return identity.character;
+        }
+        if (identity.status === "ambiguous") {
+            const ids = identity.candidates.map((candidate) => `${candidate.name} (${candidate.id})`).join(", ");
+            console.error(`[RST/Identity] Ambiguous automatic identity "${name}" matched multiple profiles: ${ids}. Creation blocked.`);
+            return null;
+        }
+        dlog(`[RST/Identity] "${name}" -> no canonical match; automatic creation permitted`);
+    } else {
+        const similar = identity.status === "match" ? identity.character : findCharacterBySimilarName(name);
+        if (similar) {
+            console.warn(`[RST] Name collision detected: "${name}" is similar to existing character "${similar.name}" (id=${similar.id})`);
+            toastr?.warning?.(
+                `A character with a similar name already exists: "${similar.name}". Consider using that profile instead of creating a duplicate.`,
+                "RST Name Collision",
+                { timeOut: 8000, closeButton: true }
+            );
+        }
     }
 
     const profile = {
@@ -392,53 +406,112 @@ export function getAllCharacters() {
  * @returns {object|null}
  */
 export function findCharacterByName(name) {
-    const all = getAllCharacters();
-    return resolveUniqueCharacterIdentity(all, name, true);
+    const result = resolveCharacterIdentity(name, { allowExact: true });
+    return result.status === "match" ? result.character : null;
 }
 
 /**
  * Find a character by fuzzy name matching only (skips exact match).
  * Useful when comparing detected names against known names.
- * Uses word-set + substring matching + alias expansion.
+ * Uses reordered full names and unique complete-token shortening.
+ * Ambiguous identities always fail closed.
  * @param {string} name
  * @returns {object|null}
  */
 export function findCharacterByFuzzyName(name) {
-    const all = getAllCharacters();
-    return resolveUniqueCharacterIdentity(all, name, false);
+    const result = resolveCharacterIdentity(name, { allowExact: false });
+    return result.status === "match" ? result.character : null;
 }
 
-function resolveUniqueCharacterIdentity(all, query, allowExact) {
+/**
+ * Canonical identity resolver used by every automatic creation boundary.
+ * It preserves ambiguity instead of collapsing it to null so callers can
+ * distinguish "truly unknown" from "known-but-ambiguous" and fail closed.
+ *
+ * @param {string} query
+ * @param {{allowExact?: boolean}} [options]
+ * @returns {{status:"match"|"ambiguous"|"none", character:object|null, candidates:object[], method:string|null}}
+ */
+export function resolveCharacterIdentity(query, options = {}) {
+    const all = getAllCharacters();
+    const allowExact = options.allowExact !== false;
     const queryKeys = new Set(getNameMatchKeys(query));
-    if (queryKeys.size === 0) return null;
+    if (queryKeys.size === 0) return { status: "none", character: null, candidates: [], method: null };
+
     const querySignature = getNameWordSignature(query);
     const queryTokens = getNameTokens(query);
     const variantsFor = (character) => [character.name, ...(Array.isArray(character.nameAliases) ? character.nameAliases : [])];
-    const unique = (matches) => matches.length === 1 ? matches[0] : null;
+    const classify = (matches, method) => {
+        const uniqueById = [...new Map(matches.map((character) => [character.id, character])).values()];
+        if (uniqueById.length === 1) return { status: "match", character: uniqueById[0], candidates: uniqueById, method };
+        if (uniqueById.length > 1) return { status: "ambiguous", character: null, candidates: uniqueById, method };
+        return null;
+    };
 
     if (allowExact) {
         const exact = all.filter((character) => variantsFor(character).some((variant) =>
             getNameMatchKeys(variant).some((key) => queryKeys.has(key)),
         ));
-        if (exact.length > 0) return unique(exact);
+        const result = classify(exact, "exact_or_alias");
+        if (result) return result;
     }
 
-    const reordered = all.filter((character) => variantsFor(character).some((variant) =>
-        querySignature && getNameWordSignature(variant) === querySignature,
-    ));
-    if (reordered.length > 0) return unique(reordered);
+    // Full-name token signatures are order-insensitive, so Japanese/Western
+    // ordering differences such as Tatsuki Arisawa <-> Arisawa Tatsuki resolve
+    // to one canonical profile without creating a second deterministic ID.
+    if (queryTokens.length > 1) {
+        const reordered = all.filter((character) => variantsFor(character).some((variant) =>
+            querySignature && getNameWordSignature(variant) === querySignature,
+        ));
+        const result = classify(reordered, "word_signature");
+        if (result) return result;
+    }
 
-    // Shortened names match complete tokens only. This allows a unique surname or
-    // given-name alias while preventing substring collisions. Ambiguous shared tokens fail closed.
+    // Shortened names match complete tokens only. This keeps Morgan -> Alex
+    // Morgan while preventing Al -> Alice. Ambiguous shared tokens remain
+    // explicitly ambiguous so automatic creation is blocked rather than making
+    // a third profile.
     if (queryTokens.length === 1) {
         const token = queryTokens[0];
         const tokenMatches = all.filter((character) => variantsFor(character).some((variant) =>
             getNameTokens(variant).includes(token),
         ));
-        if (tokenMatches.length > 0) return unique(tokenMatches);
+        const result = classify(tokenMatches, "unique_token");
+        if (result) return result;
     }
 
-    return null;
+    return { status: "none", character: null, candidates: [], method: null };
+}
+
+/**
+ * Resolve an automatically detected name and create a profile only when the
+ * identity is truly absent. This is the sole supported automatic-creation
+ * boundary: callers receive whether a profile was actually created so they do
+ * not accidentally mark an existing canonical profile as temporary.
+ *
+ * @param {string} name
+ * @param {object} [options]
+ * @returns {{profile:object|null, created:boolean, status:"existing"|"created"|"ambiguous"|"invalid", method:string|null, candidates:object[]}}
+ */
+export function resolveOrCreateAutomaticCharacter(name, options = {}) {
+    const display = String(name || "").trim();
+    if (!display) return { profile: null, created: false, status: "invalid", method: null, candidates: [] };
+
+    const identity = resolveCharacterIdentity(display);
+    if (identity.status === "match") {
+        dlog(`[RST/Identity] "${display}" -> existing ${identity.character.id} via ${identity.method}`);
+        return { profile: identity.character, created: false, status: "existing", method: identity.method, candidates: identity.candidates };
+    }
+    if (identity.status === "ambiguous") {
+        const ids = identity.candidates.map((candidate) => `${candidate.name} (${candidate.id})`).join(", ");
+        console.error(`[RST/Identity] Ambiguous automatic identity "${display}" matched multiple profiles: ${ids}. Creation blocked.`);
+        return { profile: null, created: false, status: "ambiguous", method: identity.method, candidates: identity.candidates };
+    }
+
+    const profile = createCharacter(display, { ...options, source: "auto_generated", automatic: true });
+    if (!profile) return { profile: null, created: false, status: "ambiguous", method: null, candidates: [] };
+    dlog(`[RST/Identity] "${display}" -> created ${profile.id}; no canonical match existed`);
+    return { profile, created: true, status: "created", method: null, candidates: [profile] };
 }
 
 /**
@@ -460,7 +533,7 @@ export function getCharacterNameVariants(profile) {
 
 /**
  * Find a character by word-set similarity (same words, different order).
- * Detects reordered full-name collisions that resolve to the same token set.
+ * Detects collisions like "Alex Morgan" ↔ "Morgan Alex".
  * @param {string} name
  * @returns {object|null}
  */

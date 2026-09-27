@@ -179,7 +179,7 @@ Hard Locks are psychological ceilings/floors applied to individual relationship 
 
 They are intended for characters whose established personality or history makes certain relationship movement implausible without a major change. For example, a character who fundamentally distrusts others may have a Trust cap until enough contradictory evidence accumulates.
 
-Hard Locks require the character's **Personality** field to contain usable information. RST will not invent psychology-based locks for an empty personality profile.
+Hard Locks require the character's **Personality** field to contain usable information. RST will not invent psychology-based locks for an empty personality profile. This eligibility is enforced after model parsing as well as in the prompt, so a newly discovered character whose profile did not exist when generation began cannot accidentally surface a lock from the discovery scene before Personality is filled.
 
 ### Hard-Lock Pressure
 
@@ -245,6 +245,8 @@ Temporary Conditions are internal to RST's stat-update analysis and are intentio
 
 The Sidecar runs on a configurable cadence and reconciles which known characters are relevant to the current narrative window.
 
+Verified top-level scene boundaries also reconcile cast changes locally: physical, unknown, and parallel-scene presence from the prior scene is retired when the story clearly cuts to a new location/time, even if the model omits an explicit reset. Live calls and surveillance can persist across a physical camera cut until the narrative separately ends them. Long-form location/time headers and travel-compression transitions are recognized as boundary evidence.
+
 ### Cadence
 
 - **Scan frequency** controls how many narrative messages pass between presence scans.
@@ -262,6 +264,8 @@ When **New character popup** is enabled, an unknown grounded character can be of
 - Closing/dismissing the popup — does neither.
 
 The per-chat **Name blacklist** can also be edited manually. The active SillyTavern persona name is excluded from character detection automatically.
+
+Automatic discovery resolves detected names through the same canonical identity boundary before creating anything. Exact names, saved aliases, reversed full-name order, and unique complete-token shortened names reuse the existing profile. Ambiguous known identities fail closed instead of creating a duplicate. Older blank auto-generated duplicates can be cleaned up conservatively during migration when exactly one richer canonical equivalent exists; profiles with meaningful stats, history, or authored content are never auto-merged or auto-deleted.
 
 ### Missed-character catch-up
 
@@ -309,6 +313,8 @@ The Scenes tab supports:
 - Bulk selection/deletion of closed scenes
 
 Deleting an open scene does not generate a summary or relationship update. Deleting or editing messages/scenes also invalidates stale Sidecar work so old asynchronous results cannot commit against changed story evidence.
+
+During stat-update preparation, an existing profile is added to a scene roster only when the reviewed scene locally grounds active physical, remote, surveillance, messaging, or relevant parallel involvement. Broad historical rosters are rebuilt from that evidence rather than trusted blindly. Scene-roster enrichment is transactional: it commits only after every required stat response parses successfully, so malformed or truncated output cannot leave the scene polluted with characters that were never successfully reviewed.
 
 ---
 
@@ -469,6 +475,8 @@ RST is deliberately conservative about relationship state:
 - Long-running asynchronous work is scoped to the chat that started it.
 - Results produced after a chat switch or destructive message mutation are discarded rather than written into stale state.
 - Legacy internal-only evidence/diagnostic fields are scrubbed during migration and are not part of normal exports.
+- Automatic character creation reuses canonical identities and fails closed on ambiguity instead of manufacturing duplicate profiles.
+- Scene-roster enrichment commits transactionally only after the required stat responses parse successfully.
 
 These constraints are intended to make RST useful over hundreds or thousands of messages without letting incidental scene activity slowly distort the relationship model.
 

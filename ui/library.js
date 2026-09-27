@@ -12,6 +12,7 @@ import {
     getCharacterProfile,
     getInitials,
     createCharacter,
+    resolveOrCreateAutomaticCharacter,
     deleteCharacter,
     updateCharacterProfile,
     updateCharacterStats,
@@ -40,7 +41,7 @@ import {
 import { generateProfile } from "../llm/profileGen.js";
 import { formatTimeAgo } from "../data/scenes.js";
 import { deriveRelationshipTrajectory } from "../data/trajectory.js";
-import { getRelationshipConditionDefinition } from "../data/conditions.js";
+import { getRelationshipConditionDefinition, RELATIONSHIP_CONDITION_CATALOG } from "../data/conditions.js";
 import { Popup, POPUP_RESULT, POPUP_TYPE } from "../../../../../scripts/popup.js";
 import { showPanelLoading, hidePanelLoading } from "./panel.js";
 
@@ -1958,7 +1959,7 @@ async function editSoftLock(profile, cat, stat) {
             <label class="rst-lockedit-label">Cap %</label>
             <input type="number" id="rst-sl-cap" class="rst-lockedit-cap" value="${curCap}" min="-100" max="100" placeholder="e.g. 45">
             <label class="rst-lockedit-label">Condition to unlock</label>
-            <textarea id="rst-sl-cond" class="rst-lockedit-reason" rows="3" placeholder="What must happen for this stat to unlock — e.g. 'The character must receive credible evidence that challenges the belief maintaining this guard.'">${$("<div>").text(curCond).html()}</textarea>
+            <textarea id="rst-sl-cond" class="rst-lockedit-reason" rows="3" placeholder="What must happen for this stat to unlock — e.g. 'The persona must demonstrate consistent honesty before this guard can lower.'">${$("<div>").text(curCond).html()}</textarea>
             <label class="rst-lockedit-label">Progress notes</label>
             <textarea id="rst-sl-prog" class="rst-lockedit-reason" rows="3" placeholder="Running notes toward the condition (optional).">${$("<div>").text(curProg).html()}</textarea>
             ${sl.met ? `<label class="rst-scan-discard"><input type="checkbox" id="rst-sl-relock"> Re-lock this (treat condition as not yet met)</label>` : ""}
@@ -2515,10 +2516,16 @@ export async function showNewCharacterDetected(name, stillValid = null, options 
         return null;
     }
 
-    createCharacter(name);
-    toastr?.success?.(`New character profile created for ${name}.`);
-    const $pane = $("#rst-p-lib");
-    reRenderCharacterList($pane);
+    const resolution = resolveOrCreateAutomaticCharacter(name);
+    if (!resolution.profile) {
+        toastr?.warning?.(`RST could not create ${name} because the detected identity is ambiguous. Check F12 for matching profiles.`, "RST Identity");
+        return null;
+    }
+    if (resolution.created) {
+        toastr?.success?.(`New character profile created for ${name}.`);
+        const $pane = $("#rst-p-lib");
+        reRenderCharacterList($pane);
+    }
     return true;
 }
 

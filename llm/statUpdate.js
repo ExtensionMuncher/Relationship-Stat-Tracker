@@ -13,7 +13,7 @@ import { getContext } from "../../../../extensions.js";
 import { getPersonaContext } from "./connections.js";
 import { makeRequest } from "./connections.js";
 import { getSettings, isNameBlacklisted, getChatData } from "../data/storage.js";
-import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter, deleteCharacter, getSoftLockAvailability, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
+import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, resolveCharacterIdentity, resolveOrCreateAutomaticCharacter, deleteCharacter, getSoftLockAvailability, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneTitle, getClosedSceneCount, getClosedSceneCountForChar } from "../data/scenes.js";
 import { dlog } from "../lib/debug.js";
 import { deriveRelationshipTrajectory } from "../data/trajectory.js";
@@ -161,6 +161,17 @@ async function generateStatUpdateImpl(sceneId, guidance = "") {
             deleteCharacter(id);
             autoCreatedIdsForChat().delete(id);
         }
+        // Scene-roster enrichment is factual metadata, but it must remain
+        // transactional with the stat review. The old path persisted the
+        // pre-request candidate scan before the LLM response parsed, so a
+        // malformed/truncated response could fail while leaving the scene
+        // permanently polluted with reference-only library characters.
+        rstScope1.assertCurrent();
+        const reconciledSceneIds = [...new Set([
+            ...characters.map((character) => character.id),
+            ...characterUpdates.map((update) => update.characterId),
+        ].filter(Boolean))];
+        updateSceneCharacters(scene.id, reconciledSceneIds);
         return {
             sceneId,
             sceneSummary,
@@ -171,6 +182,14 @@ async function generateStatUpdateImpl(sceneId, guidance = "") {
         };
     } catch (err) {
         rstScope1.assertCurrent();
+
+        // Unknown-speaker discovery may create temporary profiles before the
+        // request starts. A failed parse owns none of them, so roll them back
+        // together with the uncommitted scene-roster proposal.
+        for (const id of [...autoCreatedIdsForChat()]) {
+            deleteCharacter(id);
+            autoCreatedIdsForChat().delete(id);
+        }
 
         console.error("[RST] Stat update generation failed:", err);
         toastr?.error?.("Stat update generation failed. Please try again.");
@@ -229,7 +248,7 @@ function buildStatUpdateSystemPrompt(settings) {
         '',
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
-        '- Never substitute a prominent NPC for {{user}}. If the scene spends many paragraphs on another NPC, relationships between two NPCs are still OUT OF SCOPE.',
+        '- Never substitute a prominent NPC for {{user}}. If the scene spends many paragraphs on another NPC, a rival, a friend, or any other NPC, relationships such as NPC-A->NPC-B, NPC-C->NPC-B, or one NPC caring for another are still OUT OF SCOPE.',
         '- relationshipEvidence is REQUIRED for every returned character. It must explicitly name {{user}} and identify current scene evidence linking this character to {{user}}. If the character only interacts with another NPC, is merely present in that NPC\'s subplot, or has never met/learned/reacted to {{user}}, use an empty string and leave all relationship state unchanged.',
         '- Per-character category visibility is authoritative. If a character is shown with only some visible/active categories, ONLY output stats/commentary/criticalStats/locks/pressure/reviews for those visible categories. Do not infer, update, propose locks for, unlock, or mention hidden categories.',
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
@@ -482,6 +501,12 @@ function normalizeResolvedConditions(profile, arr) {
 function filterCharacterDataByVisibleCategories(profile, data) {
     if (!data || typeof data !== "object") return data;
     const clone = { ...data };
+    // Lock proposals must be grounded in the saved Personality, never inferred
+    // solely from the same scene that discovers a blank character. The prompt
+    // gate cannot cover characters that do not exist until the response is
+    // parsed, so enforce eligibility again at the data boundary. A later stat
+    // update may propose locks normally once the user fills the description.
+    const lockEligible = !!String(profile?.description || "").trim();
     delete clone.evidenceRefs;
     clone.stats = filterStatObjectByVisibleCategories(profile, data.stats);
     clone.commentary = filterStatObjectByVisibleCategories(profile, data.commentary);
@@ -489,8 +514,8 @@ function filterCharacterDataByVisibleCategories(profile, data) {
     clone.proposedConditions = Array.isArray(data.proposedConditions) ? data.proposedConditions : [];
     clone.resolvedConditions = Array.isArray(data.resolvedConditions) ? data.resolvedConditions : [];
     clone.criticalStats = filterStatKeyArrayForProfile(profile, data.criticalStats);
-    clone.proposedHardLocks = filterStatEntryArrayForProfile(profile, data.proposedHardLocks);
-    clone.proposedSoftLocks = filterStatEntryArrayForProfile(profile, data.proposedSoftLocks);
+    clone.proposedHardLocks = lockEligible ? filterStatEntryArrayForProfile(profile, data.proposedHardLocks) : [];
+    clone.proposedSoftLocks = lockEligible ? filterStatEntryArrayForProfile(profile, data.proposedSoftLocks) : [];
     clone.unlockedSoftLocks = filterStatKeyArrayForProfile(profile, data.unlockedSoftLocks);
     clone.softLockProgress = filterStatEntryArrayForProfile(profile, data.softLockProgress);
     clone.hardLockPressureUpdates = filterStatEntryArrayForProfile(profile, data.hardLockPressureUpdates);
@@ -509,7 +534,7 @@ function findParsedCharacterEntryForProfile(parsedCharacters, profile, consumedK
     const variants = new Set(getCharacterNameVariants(profile).map(normalizeCharacterName));
 
     // Prefer exact/canonical/alias matches first. Compare normalized strings so
-    // an LLM-returned name still matches the same saved alias after normalization.
+    // an LLM key like "Morgan" still matches an alias saved as "morgan".
     for (const key of keys) {
         if (consumedKeys?.has(key)) continue;
         if (variants.has(normalizeCharacterName(key))) {
@@ -775,18 +800,17 @@ function appendDiscoveredCharacterUpdates(parsed, inputCharacters, updates, mess
     const included = new Set(updates.map(update => update.characterId));
     for (const [name, data] of Object.entries(parsed?.characters || {})) {
         if (!data || typeof data !== "object" || !data.stats || !isDiscoveryNameAllowed(name, messages)) continue;
-        let profile = findCharacterByName(name) || findCharacterByFuzzyName(name);
+        const identity = resolveCharacterIdentity(name);
+        let profile = identity.status === "match" ? identity.character : null;
         if (profile && included.has(profile.id)) continue;
         if (!profile) {
-            // Don't turn an ambiguous shortened known identity into a new person.
-            const words = normalizeCharacterName(name).split(" ").filter(Boolean);
-            const possible = getAllCharacters().filter(char => getCharacterNameVariants(char).some(variant => {
-                const tokens = normalizeCharacterName(variant).split(" ");
-                return words.every(word => tokens.includes(word));
-            }));
-            if (possible.length) continue;
-            profile = createCharacter(name, { source: "auto_generated" });
-            autoCreatedIdsForChat().add(profile.id);
+            const resolution = resolveOrCreateAutomaticCharacter(name);
+            profile = resolution.profile;
+            if (!profile) {
+                dlog(`[RST/Identity] Stat-update discovery skipped "${name}" because identity resolution was ${resolution.status}.`);
+                continue;
+            }
+            if (resolution.created) autoCreatedIdsForChat().add(profile.id);
         }
         let update;
         if (isNewCharacter(profile)) {
@@ -1189,11 +1213,22 @@ function getSceneCharacters(scene) {
         return isNameBlacklisted(name, ["{{user}}", "user", personaName]);
     }
 
-    // Step 1: Collect any characters already registered on the scene
+    // Step 1: Collect characters already registered on the scene. Historical
+    // builds could contaminate a roster by adding nearly the entire library
+    // from name mentions alone. Treat a broad near-library roster as suspect
+    // and rebuild it from grounded active evidence below; ordinary small rosters
+    // retain pronoun-heavy continuity.
     const charIds = scene.charactersPresent || [];
-    for (const id of charIds) {
+    const validRegisteredIds = charIds.filter((id) => {
         const profile = getCharacterProfile(id);
-        if (profile && !isExcluded(profile.name)) foundIds.add(id);
+        return profile && !isExcluded(profile.name);
+    });
+    const suspiciousRegisteredRoster = validRegisteredIds.length >= 6
+        && validRegisteredIds.length >= Math.ceil(Math.max(1, allKnownChars.length) * 0.75);
+    if (!suspiciousRegisteredRoster) {
+        for (const id of validRegisteredIds) foundIds.add(id);
+    } else {
+        dlog(`[RST] Scene roster resembles a broad library dump (${validRegisteredIds.length}/${allKnownChars.length}); rebuilding from active evidence.`);
     }
 
     // Step 2: Detect multi-character RP scenario
@@ -1216,7 +1251,7 @@ function getSceneCharacters(scene) {
         for (const msg of sceneMessages) {
             const speaker = msg.name || "";
             if (!speaker || msg.is_user || isExcluded(speaker)) continue;
-            // Use alias-aware fuzzy matching so a unique short form can match a full name
+            // Use alias-aware fuzzy matching so "Morgan" matches "Alex Morgan"
             const match = findCharacterByFuzzyName(speaker) || allKnownChars.find((c) => c.name.toLowerCase().trim() === speaker.toLowerCase().trim());
             if (match) {
                 foundIds.add(match.id);
@@ -1228,14 +1263,15 @@ function getSceneCharacters(scene) {
         dlog("[RST] Multi-character RP detected — trusting scene.charactersPresent, skipping speaker-name scan.");
     }
 
-    // Include known profiles named in the narrative, including remote/parallel
-    // participants; the updater must establish relational relevance, not merely mention.
-    const sceneText = normalizeCharacterName(sceneMessages.map(m => m.mes || "").join(" "));
+    // Include known profiles only when local evidence establishes active
+    // physical, live-remote, surveillance, message, or parallel involvement.
+    // A raw substring match used to promote references such as "Yuzu's curry"
+    // and "Asano signed me up" into the scene roster before the stat request.
     for (const profile of allKnownChars) {
-        if (getCharacterNameVariants(profile).some(name => {
-            const normalized = normalizeCharacterName(name);
-            return normalized && (` ${sceneText} `).includes(` ${normalized} `);
-        })) foundIds.add(profile.id);
+        if (isExcluded(profile.name)) continue;
+        const active = sceneMessages.some((message) => getCharacterNameVariants(profile)
+            .some((variant) => inferActivePresenceMode(message, variant, personaName) !== "unknown"));
+        if (active) foundIds.add(profile.id);
     }
     // Step 3: Build character list from the known roster
     const chars = [];
@@ -1246,12 +1282,15 @@ function getSceneCharacters(scene) {
 
     for (const name of unknownSpeakers) {
         if (!isDiscoveryNameAllowed(name, sceneMessages)) continue;
-        const profile = createCharacter(name, { source: "auto_generated" });
-        autoCreatedIdsForChat().add(profile.id);
+        const resolution = resolveOrCreateAutomaticCharacter(name);
+        const profile = resolution.profile;
+        if (!profile) {
+            dlog(`[RST/Identity] Scene-speaker discovery skipped "${name}" because identity resolution was ${resolution.status}.`);
+            continue;
+        }
+        if (resolution.created) autoCreatedIdsForChat().add(profile.id);
         if (!chars.some(char => char.id === profile.id)) chars.push(profile);
     }
-    if (chars.length) updateSceneCharacters(scene.id, [...new Set(chars.map(char => char.id))]);
-
     // Step 4: Filter out any blacklisted/excluded characters from the final list
     const filteredChars = chars.filter(c => c && !isExcluded(c.name));
     const removedCount = chars.length - filteredChars.length;
@@ -1694,7 +1733,7 @@ function buildInitialStatSystemPrompt(settings) {
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
         '- relationshipEvidence is REQUIRED. Explicitly name {{user}}. If this character only interacts with or thinks about another NPC, or has no relationship-relevant exposure to {{user}}, use an empty string and return unchanged zero stats with empty relationship prose.',
-        '- A prominent viewpoint NPC is never a substitute for {{user}}. Do not output any NPC-to-NPC relationship under a character entry.',
+        '- A prominent viewpoint NPC is never a substitute for {{user}}. Do not output NPC-A->NPC-B, NPC-C->NPC-B, NPC-D->NPC-B, or any other NPC-to-NPC relationship under a character entry.',
         '- Per-character category visibility is authoritative. If a character is shown with only some visible/active categories, ONLY output stats/commentary/criticalStats/locks/pressure/reviews for those visible categories. Do not infer, update, propose locks for, unlock, or mention hidden categories.',
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
