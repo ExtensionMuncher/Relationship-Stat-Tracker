@@ -12,7 +12,7 @@ import { getContext } from "../../../../extensions.js";
 import { Popup, POPUP_TYPE, POPUP_RESULT } from "../../../../../scripts/popup.js";
 import { scanForLocks } from "../llm/lockScan.js";
 import { scanHistoricalMilestones } from "../llm/milestoneScan.js";
-import { getAllCharacters, findCharacterByName, findCharacterByFuzzyName, resolveCharacterIdentity } from "../data/characters.js";
+import { getAllCharacters, findCharacterByName, findCharacterByFuzzyName } from "../data/characters.js";
 import { getRelationshipConditionDefinition } from "../data/conditions.js";
 import { scanHistoricalConditions } from "../llm/conditionBackfill.js";
 import { scanMissedCharacters } from "../llm/sidecar.js";
@@ -323,10 +323,7 @@ function renderDebugSettings($pane, settings) {
                 if (!name) continue;
 
                 // A previous popup in this pass may already have created an alias-equivalent profile.
-                // Ambiguous known identities also fail closed instead of offering
-                // another automatic profile.
-                const identity = resolveCharacterIdentity(name);
-                if (identity.status === "match" || identity.status === "ambiguous") continue;
+                if (findCharacterByName(name) || findCharacterByFuzzyName(name)) continue;
 
                 const decision = await showNewCharacterDetected(
                     name,

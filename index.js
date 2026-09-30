@@ -35,7 +35,7 @@ import {
     getPendingUpdates,
     savePendingUpdates,
 } from "./data/storage.js";
-import { findCharacterByName, findCharacterByFuzzyName, resolveCharacterIdentity } from "./data/characters.js";
+import { createCharacter, findCharacterByName, findCharacterByFuzzyName } from "./data/characters.js";
 import { createScene, closeScene, getOpenScene, initSceneCounter, getAllScenes, isMessageInScene, updateSceneSummary, updateSceneTitle } from "./data/scenes.js";
 import { detectCharacters } from "./llm/sidecar.js";
 import { generateStatUpdate, isStatUpdateRunning } from "./llm/statUpdate.js";
@@ -535,24 +535,19 @@ async function onMessageReceived(mesId, fromAssistant = false) {
             }
             for (const unknownName of filteredUnknown) {
                 if (!requestIsCurrent()) return;
-                const identity = resolveCharacterIdentity(unknownName);
-                const existing = identity.status === "match" ? identity.character : null;
+                const existing = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
                 if (existing && !detectedIds.has(existing.id)) {
                     detectedIds.add(existing.id);
                     detectedModes[existing.id] = normalizePresenceMode(resultModes[unknownName]);
-                } else if (identity.status === "ambiguous") {
-                    dlog(`[RST/Identity] Sidecar name "${unknownName}" is ambiguous; automatic creation/popup blocked.`);
                 }
             }
 
             // Handle truly unknown characters — with rejection tracking to prevent repeat popups.
             let newDetected = [...detectedIds];
             for (const unknownName of filteredUnknown) {
-                // Re-resolve through the canonical identity function immediately
-                // before any popup. Ambiguous known identities fail closed rather
-                // than being offered as a third profile.
-                const identity = resolveCharacterIdentity(unknownName);
-                if (identity.status === "match" || identity.status === "ambiguous") continue;
+                // Skip names that already matched via fuzzy matching above
+                const alreadyMatched = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
+                if (alreadyMatched) continue;
 
                 // Missing legacy values mean enabled, matching the Settings UI and
                 // the default setting. Only an explicit false disables prompts.

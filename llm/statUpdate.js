@@ -13,7 +13,7 @@ import { getContext } from "../../../../extensions.js";
 import { getPersonaContext } from "./connections.js";
 import { makeRequest } from "./connections.js";
 import { getSettings, isNameBlacklisted, getChatData } from "../data/storage.js";
-import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, resolveCharacterIdentity, resolveOrCreateAutomaticCharacter, deleteCharacter, getSoftLockAvailability, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
+import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter, deleteCharacter, getSoftLockAvailability, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneTitle, getClosedSceneCount, getClosedSceneCountForChar } from "../data/scenes.js";
 import { dlog } from "../lib/debug.js";
 import { deriveRelationshipTrajectory } from "../data/trajectory.js";
@@ -800,17 +800,23 @@ function appendDiscoveredCharacterUpdates(parsed, inputCharacters, updates, mess
     const included = new Set(updates.map(update => update.characterId));
     for (const [name, data] of Object.entries(parsed?.characters || {})) {
         if (!data || typeof data !== "object" || !data.stats || !isDiscoveryNameAllowed(name, messages)) continue;
-        const identity = resolveCharacterIdentity(name);
-        let profile = identity.status === "match" ? identity.character : null;
+        let profile = findCharacterByName(name) || findCharacterByFuzzyName(name);
         if (profile && included.has(profile.id)) continue;
         if (!profile) {
-            const resolution = resolveOrCreateAutomaticCharacter(name);
-            profile = resolution.profile;
+            // Don't turn an ambiguous shortened known identity into a new person.
+            const words = normalizeCharacterName(name).split(" ").filter(Boolean);
+            const possible = getAllCharacters().filter(char => getCharacterNameVariants(char).some(variant => {
+                const tokens = normalizeCharacterName(variant).split(" ");
+                return words.every(word => tokens.includes(word));
+            }));
+            if (possible.length) continue;
+            const existingIds = new Set(getAllCharacters().map((character) => character.id));
+            profile = createCharacter(name, { source: "auto_generated", automatic: true });
             if (!profile) {
-                dlog(`[RST/Identity] Stat-update discovery skipped "${name}" because identity resolution was ${resolution.status}.`);
+                dlog(`[RST/Identity] Stat-update discovery blocked ambiguous identity "${name}".`);
                 continue;
             }
-            if (resolution.created) autoCreatedIdsForChat().add(profile.id);
+            if (!existingIds.has(profile.id)) autoCreatedIdsForChat().add(profile.id);
         }
         let update;
         if (isNewCharacter(profile)) {
@@ -1265,7 +1271,7 @@ function getSceneCharacters(scene) {
 
     // Include known profiles only when local evidence establishes active
     // physical, live-remote, surveillance, message, or parallel involvement.
-    // A raw substring match used to promote references such as "Yuzu's curry"
+    // A raw substring match used to promote references such as "Morgan's curry"
     // and "Asano signed me up" into the scene roster before the stat request.
     for (const profile of allKnownChars) {
         if (isExcluded(profile.name)) continue;
@@ -1282,13 +1288,13 @@ function getSceneCharacters(scene) {
 
     for (const name of unknownSpeakers) {
         if (!isDiscoveryNameAllowed(name, sceneMessages)) continue;
-        const resolution = resolveOrCreateAutomaticCharacter(name);
-        const profile = resolution.profile;
+        const existingIds = new Set(getAllCharacters().map((character) => character.id));
+        const profile = createCharacter(name, { source: "auto_generated", automatic: true });
         if (!profile) {
-            dlog(`[RST/Identity] Scene-speaker discovery skipped "${name}" because identity resolution was ${resolution.status}.`);
+            dlog(`[RST/Identity] Scene-speaker discovery blocked ambiguous identity "${name}".`);
             continue;
         }
-        if (resolution.created) autoCreatedIdsForChat().add(profile.id);
+        if (!existingIds.has(profile.id)) autoCreatedIdsForChat().add(profile.id);
         if (!chars.some(char => char.id === profile.id)) chars.push(profile);
     }
     // Step 4: Filter out any blacklisted/excluded characters from the final list

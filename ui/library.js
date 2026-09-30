@@ -12,7 +12,6 @@ import {
     getCharacterProfile,
     getInitials,
     createCharacter,
-    resolveOrCreateAutomaticCharacter,
     deleteCharacter,
     updateCharacterProfile,
     updateCharacterStats,
@@ -2516,12 +2515,13 @@ export async function showNewCharacterDetected(name, stillValid = null, options 
         return null;
     }
 
-    const resolution = resolveOrCreateAutomaticCharacter(name);
-    if (!resolution.profile) {
-        toastr?.warning?.(`RST could not create ${name} because the detected identity is ambiguous. Check F12 for matching profiles.`, "RST Identity");
+    const existingIds = new Set(getAllCharacters().map((profile) => profile.id));
+    const profile = createCharacter(name, { source: "auto_generated", automatic: true });
+    if (!profile) {
+        toastr?.warning?.(`RST could not create ${name} because the detected identity matches multiple established profiles.`, "RST Identity");
         return null;
     }
-    if (resolution.created) {
+    if (!existingIds.has(profile.id)) {
         toastr?.success?.(`New character profile created for ${name}.`);
         const $pane = $("#rst-p-lib");
         reRenderCharacterList($pane);

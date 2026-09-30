@@ -125,7 +125,7 @@ export function getInjectionSettings() {
  * @returns {string}
  */
 export async function exportAllData() {
-    return JSON.stringify({ settings: getSettings(), characters: getCharacters(), chatData: getChatData(), version: "0.1.28", exportedAt: new Date().toISOString() }, null, 2);
+    return JSON.stringify({ settings: getSettings(), characters: getCharacters(), chatData: getChatData(), version: "0.1.29", exportedAt: new Date().toISOString() }, null, 2);
 }
 
 export async function importAllData(jsonString) {

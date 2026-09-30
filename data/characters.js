@@ -14,7 +14,6 @@ import {
     saveFolders,
 } from "./storage.js";
 import { getNameMatchKeys, getNameWordSignature, getNameTokens } from "../lib/nameIdentity.js";
-import { dlog } from "../lib/debug.js";
 
 // Re-export storage functions needed by the UI layer
 export { getFolders, saveFolders };
@@ -235,32 +234,35 @@ export function createCharacter(name, options = {}) {
     const id = generateCharacterId(name);
     const automatic = options.source === "auto_generated" || options.automatic === true;
 
-    // The deterministic-ID guard protects exact repeat creation. Automatic
-    // discovery needs a stronger invariant: aliases, reversed names and unique
-    // shortened names must resolve to the existing canonical profile BEFORE a
-    // new ID is ever allowed to exist. Manual Library creation intentionally
-    // keeps the old warning-only behavior so the user can still create genuinely
-    // distinct same-name characters when needed.
-    const exactIdExisting = getStoredCharacter(id);
-    if (exactIdExisting) {
-        dlog(`[RST/Identity] "${name}" -> existing ${exactIdExisting.id} via deterministic id`);
-        return exactIdExisting;
+    // Exact deterministic-ID guard: never overwrite an existing profile.
+    const existing = getStoredCharacter(id);
+    if (existing) {
+        identityDebug(`"${name}" -> existing ${existing.id} via deterministic id`);
+        return existing;
     }
 
-    const identity = resolveCharacterIdentity(name);
+    // Automatic discovery has a stronger invariant than manual Library creation:
+    // aliases, reversed full names and unique short-name tokens must reuse the
+    // existing canonical profile. If multiple meaningful profiles match, fail
+    // closed instead of creating a third identity. This logic intentionally lives
+    // inside the long-standing createCharacter() API so older cached callers can
+    // still receive the fix without importing a new named export.
     if (automatic) {
+        const identity = resolveAutomaticCreationIdentity(name);
         if (identity.status === "match") {
-            dlog(`[RST/Identity] "${name}" -> existing ${identity.character.id} via ${identity.method}; automatic creation blocked`);
+            identityDebug(`"${name}" -> existing ${identity.character.id} via ${identity.method}; automatic creation blocked`);
             return identity.character;
         }
         if (identity.status === "ambiguous") {
             const ids = identity.candidates.map((candidate) => `${candidate.name} (${candidate.id})`).join(", ");
-            console.error(`[RST/Identity] Ambiguous automatic identity "${name}" matched multiple profiles: ${ids}. Creation blocked.`);
+            console.error(`[RST/Identity] Ambiguous automatic identity "${name}" matched multiple established profiles: ${ids}. Creation blocked.`);
             return null;
         }
-        dlog(`[RST/Identity] "${name}" -> no canonical match; automatic creation permitted`);
+        identityDebug(`"${name}" -> no canonical match; automatic creation permitted`);
     } else {
-        const similar = identity.status === "match" ? identity.character : findCharacterBySimilarName(name);
+        // Manual creation remains permissive. Warn about collisions, but allow the
+        // user to intentionally create distinct same-name characters.
+        const similar = findCharacterBySimilarName(name);
         if (similar) {
             console.warn(`[RST] Name collision detected: "${name}" is similar to existing character "${similar.name}" (id=${similar.id})`);
             toastr?.warning?.(
@@ -298,6 +300,82 @@ export function createCharacter(name, options = {}) {
 
     saveCharacter(id, profile);
     return profile;
+}
+
+
+function identityDebug(message) {
+    try {
+        if (getSettings()?.debug) console.debug(`[RST/Identity] ${message}`);
+    } catch (_) {
+        // Identity diagnostics must never affect profile creation.
+    }
+}
+
+function profileHasMeaningfulIdentityState(profile) {
+    if (!profile || typeof profile !== "object") return false;
+    if (Array.isArray(profile.updateLog) && profile.updateLog.length) return true;
+    if (Array.isArray(profile.relationshipMilestones) && profile.relationshipMilestones.length) return true;
+    if (Array.isArray(profile.relationshipConditions) && profile.relationshipConditions.length) return true;
+    if (String(profile.description || "").trim() || String(profile.notes || "").trim()
+        || String(profile.dynamicTitle || "").trim() || String(profile.narrativeSummary || "").trim()) return true;
+    for (const category of Object.values(profile.stats || {})) {
+        if (!category || typeof category !== "object") continue;
+        if (Object.values(category).some((value) => Number(value) !== 0)) return true;
+    }
+    return false;
+}
+
+/**
+ * Resolve a name for AUTOMATIC creation only. This is deliberately private so
+ * the public module contract stays compatible with v0.1.27 and older cached
+ * callers. Blank historical auto-generated duplicates never outvote one richer
+ * canonical profile.
+ */
+function resolveAutomaticCreationIdentity(query) {
+    const all = getAllCharacters();
+    const queryKeys = new Set(getNameMatchKeys(query));
+    if (queryKeys.size === 0) return { status: "none", character: null, candidates: [], method: null };
+    const querySignature = getNameWordSignature(query);
+    const queryTokens = getNameTokens(query);
+    const variantsFor = (character) => [character.name, ...(Array.isArray(character.nameAliases) ? character.nameAliases : [])];
+
+    const classify = (matches, method) => {
+        const unique = [...new Map(matches.map((character) => [character.id, character])).values()];
+        if (unique.length === 1) return { status: "match", character: unique[0], candidates: unique, method };
+        if (unique.length > 1) {
+            const meaningful = unique.filter(profileHasMeaningfulIdentityState);
+            if (meaningful.length === 1) {
+                return { status: "match", character: meaningful[0], candidates: unique, method: `${method}_canonical_state` };
+            }
+            return { status: "ambiguous", character: null, candidates: unique, method };
+        }
+        return null;
+    };
+
+    const exact = all.filter((character) => variantsFor(character).some((variant) =>
+        getNameMatchKeys(variant).some((key) => queryKeys.has(key)),
+    ));
+    let result = classify(exact, "exact_or_alias");
+    if (result) return result;
+
+    if (queryTokens.length > 1) {
+        const reordered = all.filter((character) => variantsFor(character).some((variant) =>
+            querySignature && getNameWordSignature(variant) === querySignature,
+        ));
+        result = classify(reordered, "word_signature");
+        if (result) return result;
+    }
+
+    if (queryTokens.length === 1) {
+        const token = queryTokens[0];
+        const tokenMatches = all.filter((character) => variantsFor(character).some((variant) =>
+            getNameTokens(variant).includes(token),
+        ));
+        result = classify(tokenMatches, "unique_token");
+        if (result) return result;
+    }
+
+    return { status: "none", character: null, candidates: [], method: null };
 }
 
 /**
@@ -406,112 +484,53 @@ export function getAllCharacters() {
  * @returns {object|null}
  */
 export function findCharacterByName(name) {
-    const result = resolveCharacterIdentity(name, { allowExact: true });
-    return result.status === "match" ? result.character : null;
+    const all = getAllCharacters();
+    return resolveUniqueCharacterIdentity(all, name, true);
 }
 
 /**
  * Find a character by fuzzy name matching only (skips exact match).
  * Useful when comparing detected names against known names.
- * Uses reordered full names and unique complete-token shortening.
- * Ambiguous identities always fail closed.
+ * Uses word-set + substring matching + alias expansion.
  * @param {string} name
  * @returns {object|null}
  */
 export function findCharacterByFuzzyName(name) {
-    const result = resolveCharacterIdentity(name, { allowExact: false });
-    return result.status === "match" ? result.character : null;
+    const all = getAllCharacters();
+    return resolveUniqueCharacterIdentity(all, name, false);
 }
 
-/**
- * Canonical identity resolver used by every automatic creation boundary.
- * It preserves ambiguity instead of collapsing it to null so callers can
- * distinguish "truly unknown" from "known-but-ambiguous" and fail closed.
- *
- * @param {string} query
- * @param {{allowExact?: boolean}} [options]
- * @returns {{status:"match"|"ambiguous"|"none", character:object|null, candidates:object[], method:string|null}}
- */
-export function resolveCharacterIdentity(query, options = {}) {
-    const all = getAllCharacters();
-    const allowExact = options.allowExact !== false;
+function resolveUniqueCharacterIdentity(all, query, allowExact) {
     const queryKeys = new Set(getNameMatchKeys(query));
-    if (queryKeys.size === 0) return { status: "none", character: null, candidates: [], method: null };
-
+    if (queryKeys.size === 0) return null;
     const querySignature = getNameWordSignature(query);
     const queryTokens = getNameTokens(query);
     const variantsFor = (character) => [character.name, ...(Array.isArray(character.nameAliases) ? character.nameAliases : [])];
-    const classify = (matches, method) => {
-        const uniqueById = [...new Map(matches.map((character) => [character.id, character])).values()];
-        if (uniqueById.length === 1) return { status: "match", character: uniqueById[0], candidates: uniqueById, method };
-        if (uniqueById.length > 1) return { status: "ambiguous", character: null, candidates: uniqueById, method };
-        return null;
-    };
+    const unique = (matches) => matches.length === 1 ? matches[0] : null;
 
     if (allowExact) {
         const exact = all.filter((character) => variantsFor(character).some((variant) =>
             getNameMatchKeys(variant).some((key) => queryKeys.has(key)),
         ));
-        const result = classify(exact, "exact_or_alias");
-        if (result) return result;
+        if (exact.length > 0) return unique(exact);
     }
 
-    // Full-name token signatures are order-insensitive, so Japanese/Western
-    // ordering differences such as Tatsuki Arisawa <-> Arisawa Tatsuki resolve
-    // to one canonical profile without creating a second deterministic ID.
-    if (queryTokens.length > 1) {
-        const reordered = all.filter((character) => variantsFor(character).some((variant) =>
-            querySignature && getNameWordSignature(variant) === querySignature,
-        ));
-        const result = classify(reordered, "word_signature");
-        if (result) return result;
-    }
+    const reordered = all.filter((character) => variantsFor(character).some((variant) =>
+        querySignature && getNameWordSignature(variant) === querySignature,
+    ));
+    if (reordered.length > 0) return unique(reordered);
 
-    // Shortened names match complete tokens only. This keeps Morgan -> Alex
-    // Morgan while preventing Al -> Alice. Ambiguous shared tokens remain
-    // explicitly ambiguous so automatic creation is blocked rather than making
-    // a third profile.
+    // Shortened names match complete tokens only. This keeps Morgan → Alex
+    // Morgan while preventing Al → Alice. Ambiguous shared tokens fail closed.
     if (queryTokens.length === 1) {
         const token = queryTokens[0];
         const tokenMatches = all.filter((character) => variantsFor(character).some((variant) =>
             getNameTokens(variant).includes(token),
         ));
-        const result = classify(tokenMatches, "unique_token");
-        if (result) return result;
+        if (tokenMatches.length > 0) return unique(tokenMatches);
     }
 
-    return { status: "none", character: null, candidates: [], method: null };
-}
-
-/**
- * Resolve an automatically detected name and create a profile only when the
- * identity is truly absent. This is the sole supported automatic-creation
- * boundary: callers receive whether a profile was actually created so they do
- * not accidentally mark an existing canonical profile as temporary.
- *
- * @param {string} name
- * @param {object} [options]
- * @returns {{profile:object|null, created:boolean, status:"existing"|"created"|"ambiguous"|"invalid", method:string|null, candidates:object[]}}
- */
-export function resolveOrCreateAutomaticCharacter(name, options = {}) {
-    const display = String(name || "").trim();
-    if (!display) return { profile: null, created: false, status: "invalid", method: null, candidates: [] };
-
-    const identity = resolveCharacterIdentity(display);
-    if (identity.status === "match") {
-        dlog(`[RST/Identity] "${display}" -> existing ${identity.character.id} via ${identity.method}`);
-        return { profile: identity.character, created: false, status: "existing", method: identity.method, candidates: identity.candidates };
-    }
-    if (identity.status === "ambiguous") {
-        const ids = identity.candidates.map((candidate) => `${candidate.name} (${candidate.id})`).join(", ");
-        console.error(`[RST/Identity] Ambiguous automatic identity "${display}" matched multiple profiles: ${ids}. Creation blocked.`);
-        return { profile: null, created: false, status: "ambiguous", method: identity.method, candidates: identity.candidates };
-    }
-
-    const profile = createCharacter(display, { ...options, source: "auto_generated", automatic: true });
-    if (!profile) return { profile: null, created: false, status: "ambiguous", method: null, candidates: [] };
-    dlog(`[RST/Identity] "${display}" -> created ${profile.id}; no canonical match existed`);
-    return { profile, created: true, status: "created", method: null, candidates: [profile] };
+    return null;
 }
 
 /**
