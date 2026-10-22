@@ -351,7 +351,7 @@ Scans historical relationship context for conditions that should still matter or
 
 ### Threshold Lock Backfill
 
-Uses chat history together with current stats, milestones, conditions, summaries, personality, and existing lock state to propose missing Hard/Soft Locks. Existing occupied lock slots are preserved.
+Uses chat history together with current stats, trajectory, milestones, conditions, summaries, personality, and existing lock state to propose missing Hard/Soft Locks. Existing occupied lock slots are preserved.
 
 ### Missed Character Scan
 
