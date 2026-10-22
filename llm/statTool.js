@@ -30,7 +30,6 @@ import {
     getAllCharacters,
 } from "../data/characters.js";
 import { buildCharacterBlock } from "../inject/promptInjector.js";
-import { deriveRelationshipTrajectory } from "../data/trajectory.js";
 import { getRelationshipConditionDefinition } from "../data/conditions.js";
 
 const TOOL_NAME = "lookup_relationship_stats";
@@ -51,7 +50,7 @@ export function registerStatLookupTool() {
     ToolManager.registerFunctionTool({
         name: TOOL_NAME,
         displayName: "Look Up Relationship Stats",
-        description: "Use when an NPC’s response depends on relationship standing, trajectory, temporary conditions, milestones, trust, locks, or progression with the persona or another character.",
+        description: "Use when an NPC’s response depends on current relationship stats or narrative relationship context with the persona or another character.",
         stealth: false,
         parameters: {
             type: "object",
@@ -119,9 +118,5 @@ async function lookupStats(characterName) {
         return `${profile.name} exists in the library but has no stat data yet.`;
     }
 
-    const extras = [];
-    const trajectory = deriveRelationshipTrajectory(profile);
-    extras.push(`Trajectory: ${trajectory.label}`);
-
-    return `${block}\n\n${extras.join("\n")}`;
+    return block;
 }

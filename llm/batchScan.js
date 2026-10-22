@@ -1077,7 +1077,7 @@ RESPONSE FORMAT — return ONLY valid JSON:
         "sexual": { "trust": "reason", "openness": "reason", "support": "reason", "affection": "reason" }
       },
       "dynamicTitle": "The [Adjective] [Noun]",
-      "narrativeSummary": "2-3 sentence relationship trajectory assessment"
+      "narrativeSummary": "2-3 sentence current relationship-state assessment"
     }
   }
 }`;

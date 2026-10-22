@@ -260,7 +260,7 @@ function renderDebugSettings($pane, settings) {
         <div class="rst-setting-row" style="border-bottom:none">
             <div>
                 <div class="rst-setting-label">Scan for Threshold Locks</div>
-                <div class="rst-setting-sub">Read the full visible chat in chunks, then combine that history with Personality, Notes, current stats, trajectory, milestones, conditions, summaries, and existing locks. Existing lock slots are preserved; this pass only proposes missing locks. You review everything before apply.</div>
+                <div class="rst-setting-sub">Read the full visible chat in chunks, then combine that history with Personality, Notes, current stats, milestones, conditions, summaries, and existing locks. Existing lock slots are preserved; this pass only proposes missing locks. You review everything before apply.</div>
             </div>
             <div style="display:flex;gap:6px;flex-shrink:0">
                 <button id="rst-review-scan-btn" class="rst-btn" style="display:${getPendingLockScan() ? 'inline-flex' : 'none'}"><i class="fa-solid fa-list-check"></i> Review</button>

@@ -5,14 +5,13 @@ import { captureChatScope } from "../lib/chatScope.js";
  * Uses the same visible-message/chunk indexing as Batch Scan. Raw history is
  * read in chunks first to extract compact lock-relevant signals, then each
  * character is evaluated with Personality, Notes, current relationship state,
- * trajectory, milestones, conditions, summaries, existing locks, and those
+ * milestones, conditions, summaries, existing locks, and those
  * historical signals. Existing lock slots are never silently overwritten.
  */
 
 import { getSettings } from "../data/storage.js";
 import { getAllCharacters, STAT_CATEGORIES, STAT_NAMES, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
 import { getAllSceneSummaries } from "../data/scenes.js";
-import { deriveRelationshipTrajectory } from "../data/trajectory.js";
 import { makeRequest, getPersonaContext, updateRateLimiterSettings } from "./connections.js";
 import { buildHistoricalScanChunks } from "./batchScan.js";
 import { dlog } from "../lib/debug.js";
@@ -181,7 +180,6 @@ async function scanOneCharacter(char, pastSummaries, historicalSignals, profileN
 
     const visibleCategories = getVisibleStatCategories(char);
     const persona = getPersonaContext();
-    const trajectory = deriveRelationshipTrajectory(char);
     const parts = [
         `CHARACTER: ${char.name}`,
         `VISIBLE/ACTIVE CATEGORIES: ${visibleCategories.join(", ") || "NONE"}`,
@@ -194,7 +192,6 @@ async function scanOneCharacter(char, pastSummaries, historicalSignals, profileN
 
     if (char.dynamicTitle?.trim()) parts.push(`\nCURRENT DYNAMIC: ${char.dynamicTitle}`);
     if (char.narrativeSummary?.trim()) parts.push(`CURRENT NARRATIVE: ${char.narrativeSummary}`);
-    parts.push(`CURRENT TRAJECTORY: ${trajectory.label} — ${trajectory.explanation}`);
 
     parts.push("\nCURRENT STATS:");
     for (const cat of visibleCategories) {

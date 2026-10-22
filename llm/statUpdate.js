@@ -16,7 +16,6 @@ import { getSettings, isNameBlacklisted, getChatData } from "../data/storage.js"
 import { getCharacterProfile, getAllCharacters, findCharacterByName, findCharacterByFuzzyName, getCharacterNameVariants, cloneStats, STAT_CATEGORIES, STAT_NAMES, createCharacter, deleteCharacter, getSoftLockAvailability, getVisibleStatCategories, isStatCategoryVisible } from "../data/characters.js";
 import { getSceneById, getAllSceneSummaries, updateSceneCharacters, updateSceneTitle, getClosedSceneCount, getClosedSceneCountForChar } from "../data/scenes.js";
 import { dlog } from "../lib/debug.js";
-import { deriveRelationshipTrajectory } from "../data/trajectory.js";
 import { applyRelationshipInertia, assertRelationshipInertiaProcessed } from "../data/inertia.js";
 import { getRelationshipConditionCatalogForPrompt, getRelationshipConditionDefinition, MAX_ACTIVE_RELATIONSHIP_CONDITIONS, MAX_NEW_CONDITIONS_PER_UPDATE } from "../data/conditions.js";
 import { isNarrativeMessage } from "../lib/chatMessages.js";
@@ -306,8 +305,6 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
         parts.push(`\n${char.name}${aliasStr}:`);
         parts.push(`  Current dynamic title: "${char.dynamicTitle || "None"}"`);
         parts.push(`  Current narrative: "${char.narrativeSummary || "None"}"`);
-        const trajectory = deriveRelationshipTrajectory(char);
-        parts.push(`  Relationship trajectory: ${trajectory.label} (${trajectory.explanation})`);
         const recentMilestones = Array.isArray(char.relationshipMilestones) ? char.relationshipMilestones.slice(-3) : [];
         if (recentMilestones.length) {
             parts.push(`  Recent relationship milestones (historical anchors; do not repeat unless a NEW turning point occurs):`);

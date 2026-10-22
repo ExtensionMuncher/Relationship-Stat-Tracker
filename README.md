@@ -265,7 +265,7 @@ When **New character popup** is enabled, an unknown grounded character can be of
 
 The per-chat **Name blacklist** can also be edited manually. The active SillyTavern persona name is excluded from character detection automatically.
 
-Automatic discovery resolves detected names through the same canonical identity boundary before creating anything. Exact names, saved aliases, reversed full-name order, and unique complete-token shortened names reuse the existing profile. Ambiguous known identities fail closed instead of creating a duplicate. Older blank auto-generated duplicates can be cleaned up conservatively during migration when exactly one richer canonical equivalent exists; profiles with meaningful stats, history, or authored content are never auto-merged or auto-deleted.
+Automatic discovery resolves detected names through the existing `createCharacter()` API before creating anything. Exact names, saved aliases, reversed full-name order, and unique complete-token shortened names reuse the existing canonical profile. If one established profile and one or more blank historical auto-generated duplicates match, the established profile wins for future automatic discovery. Multiple meaningful candidates fail closed instead of creating a third profile. Existing duplicate-like profiles are preserved for manual review rather than being deleted automatically during extension startup.
 
 ### Missed-character catch-up
 
@@ -351,7 +351,7 @@ Scans historical relationship context for conditions that should still matter or
 
 ### Threshold Lock Backfill
 
-Uses chat history together with current stats, trajectory, milestones, conditions, summaries, personality, and existing lock state to propose missing Hard/Soft Locks. Existing occupied lock slots are preserved.
+Uses chat history together with current stats, milestones, conditions, summaries, personality, and existing lock state to propose missing Hard/Soft Locks. Existing occupied lock slots are preserved.
 
 ### Missed Character Scan
 
@@ -476,6 +476,8 @@ RST is deliberately conservative about relationship state:
 - Results produced after a chat switch or destructive message mutation are discarded rather than written into stale state.
 - Legacy internal-only evidence/diagnostic fields are scrubbed during migration and are not part of normal exports.
 - Automatic character creation reuses canonical identities and fails closed on ambiguity instead of manufacturing duplicate profiles.
+- Canonical identity protection stays behind RST's long-standing character-creation API, avoiding live-module contract changes that can break cached/mixed extension module graphs during updates.
+- Existing historical duplicate profiles are never deleted automatically at startup; ambiguous or meaningful duplicates remain available for manual review.
 - Scene-roster enrichment commits transactionally only after the required stat responses parse successfully.
 
 These constraints are intended to make RST useful over hundreds or thousands of messages without letting incidental scene activity slowly distort the relationship model.
