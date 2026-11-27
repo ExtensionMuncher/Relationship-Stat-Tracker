@@ -1375,7 +1375,7 @@ function renderDetectionSettings($pane, settings) {
     `);
     $card.append(`
         <div class="rst-setting-row">
-            <div><div class="rst-setting-label">New character popup</div><div class="rst-setting-sub">Prompt before creating an unknown character. When off, unknown names are ignored; existing profiles are still tracked.</div></div>
+            <div><div class="rst-setting-label">Live new character popup</div><div class="rst-setting-sub">Prompt when the sidecar detects an unknown live character. Stat-review profile proposals use the Home review section instead.</div></div>
             <label class="rst-toggle"><input type="checkbox" id="rst-new-char-popup" ${settings.newCharPopup !== false ? "checked" : ""}><span class="rst-slider"></span></label>
         </div>
     `);

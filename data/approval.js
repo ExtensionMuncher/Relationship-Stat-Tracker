@@ -34,9 +34,10 @@ export function isMeaningfulCharacterUpdate(update, profile = null) {
     const afterTitle = update.dynamicTitleAfter ?? beforeTitle;
     if (String(afterTitle) !== String(beforeTitle)) return true;
 
-    const beforeSummary = update.stateBefore?.narrativeSummary ?? profile?.narrativeSummary ?? "";
-    const afterSummary = update.narrativeSummary ?? beforeSummary;
-    return String(afterSummary) !== String(beforeSummary);
+    // A rewritten narrative summary is descriptive metadata, not relationship
+    // state by itself. It may be committed alongside a real stat/title/system
+    // mutation, but it must never manufacture a pending relationship update.
+    return false;
 }
 
 export function commitCharacterUpdate(charUpdate, sceneId) {

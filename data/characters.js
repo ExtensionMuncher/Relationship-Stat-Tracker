@@ -325,6 +325,47 @@ function profileHasMeaningfulIdentityState(profile) {
     return false;
 }
 
+// Automatic discovery often sees a more decorated or more complete rendering
+// of a name than the profile was originally saved under (for example an
+// existing `Alex` profile later appearing as `Alex Morgan`, or `Morgan-sensei`).
+// Treat only edge-position honorific/title tokens as decoration so matching is
+// conservative and never strips arbitrary middle-name words.
+const IDENTITY_PREFIX_DECORATORS = new Set([
+    "sensei", "senpai", "sempai", "hakase",
+    "mr", "mrs", "ms", "miss", "dr", "prof", "professor",
+    "lord", "lady", "sir", "dame", "oyabun",
+    "captain", "commander", "chief", "lieutenant",
+    "taicho", "taichou", "fukutaicho", "fukutaichou",
+]);
+const IDENTITY_SUFFIX_DECORATORS = new Set([
+    "san", "sama", "kun", "chan", "dono",
+    "sensei", "senpai", "sempai", "kohai", "kouhai", "hakase",
+    "taicho", "taichou", "fukutaicho", "fukutaichou",
+]);
+
+function getIdentityTokenInfo(name) {
+    const tokens = getNameTokens(name);
+    if (tokens.length <= 1) return { tokens, coreTokens: tokens, hadDecorator: false };
+
+    let start = 0;
+    let end = tokens.length;
+    let hadDecorator = false;
+    while (start < end - 1 && IDENTITY_PREFIX_DECORATORS.has(tokens[start])) {
+        start += 1;
+        hadDecorator = true;
+    }
+    while (end - start > 1 && IDENTITY_SUFFIX_DECORATORS.has(tokens[end - 1])) {
+        end -= 1;
+        hadDecorator = true;
+    }
+    const coreTokens = tokens.slice(start, end);
+    return { tokens, coreTokens: coreTokens.length ? coreTokens : tokens, hadDecorator };
+}
+
+function tokenSignature(tokens) {
+    return [...tokens].sort().join(" ");
+}
+
 /**
  * Resolve a name for AUTOMATIC creation only. This is deliberately private so
  * the public module contract stays compatible with v0.1.27 and older cached
@@ -337,13 +378,14 @@ function resolveAutomaticCreationIdentity(query) {
     if (queryKeys.size === 0) return { status: "none", character: null, candidates: [], method: null };
     const querySignature = getNameWordSignature(query);
     const queryTokens = getNameTokens(query);
+    const queryIdentity = getIdentityTokenInfo(query);
     const variantsFor = (character) => [character.name, ...(Array.isArray(character.nameAliases) ? character.nameAliases : [])];
 
-    const classify = (matches, method) => {
+    const classify = (matches, method, allowCanonicalTieBreak = true) => {
         const unique = [...new Map(matches.map((character) => [character.id, character])).values()];
         if (unique.length === 1) return { status: "match", character: unique[0], candidates: unique, method };
         if (unique.length > 1) {
-            const meaningful = unique.filter(profileHasMeaningfulIdentityState);
+            const meaningful = allowCanonicalTieBreak ? unique.filter(profileHasMeaningfulIdentityState) : [];
             if (meaningful.length === 1) {
                 return { status: "match", character: meaningful[0], candidates: unique, method: `${method}_canonical_state` };
             }
@@ -363,6 +405,31 @@ function resolveAutomaticCreationIdentity(query) {
             querySignature && getNameWordSignature(variant) === querySignature,
         ));
         result = classify(reordered, "word_signature");
+        if (result) return result;
+
+        // Symmetric short/full-name guard: an established profile saved only as
+        // `Alex` must not spawn a second profile when the model later emits
+        // `Alex Morgan`. This weaker match never uses the canonical-state tie
+        // breaker; multiple possible short identities fail closed.
+        const expandedShort = all.filter((character) => variantsFor(character).some((variant) => {
+            const variantTokens = getNameTokens(variant);
+            return variantTokens.length === 1 && queryTokens.includes(variantTokens[0]);
+        }));
+        result = classify(expandedShort, "short_profile_expansion", false);
+        if (result) return result;
+    }
+
+    // Honorific/title decoration is another common rediscovery shape. Only run
+    // this pass when the QUERY actually contained a recognized edge decorator,
+    // so ordinary multi-word names are not over-collapsed.
+    if (queryIdentity.hadDecorator && queryIdentity.coreTokens.length) {
+        const coreSignature = tokenSignature(queryIdentity.coreTokens);
+        const decoratedMatches = all.filter((character) => variantsFor(character).some((variant) => {
+            const variantCore = getIdentityTokenInfo(variant).coreTokens;
+            if (queryIdentity.coreTokens.length === 1) return variantCore.includes(queryIdentity.coreTokens[0]);
+            return variantCore.length === queryIdentity.coreTokens.length && tokenSignature(variantCore) === coreSignature;
+        }));
+        result = classify(decoratedMatches, "decorated_identity", false);
         if (result) return result;
     }
 
@@ -505,8 +572,12 @@ function resolveUniqueCharacterIdentity(all, query, allowExact) {
     if (queryKeys.size === 0) return null;
     const querySignature = getNameWordSignature(query);
     const queryTokens = getNameTokens(query);
+    const queryIdentity = getIdentityTokenInfo(query);
     const variantsFor = (character) => [character.name, ...(Array.isArray(character.nameAliases) ? character.nameAliases : [])];
-    const unique = (matches) => matches.length === 1 ? matches[0] : null;
+    const unique = (matches) => {
+        const values = [...new Map(matches.map((character) => [character.id, character])).values()];
+        return values.length === 1 ? values[0] : null;
+    };
 
     if (allowExact) {
         const exact = all.filter((character) => variantsFor(character).some((variant) =>
@@ -519,6 +590,24 @@ function resolveUniqueCharacterIdentity(all, query, allowExact) {
         querySignature && getNameWordSignature(variant) === querySignature,
     ));
     if (reordered.length > 0) return unique(reordered);
+
+    if (queryTokens.length > 1) {
+        const expandedShort = all.filter((character) => variantsFor(character).some((variant) => {
+            const variantTokens = getNameTokens(variant);
+            return variantTokens.length === 1 && queryTokens.includes(variantTokens[0]);
+        }));
+        if (expandedShort.length > 0) return unique(expandedShort);
+    }
+
+    if (queryIdentity.hadDecorator && queryIdentity.coreTokens.length) {
+        const coreSignature = tokenSignature(queryIdentity.coreTokens);
+        const decoratedMatches = all.filter((character) => variantsFor(character).some((variant) => {
+            const variantCore = getIdentityTokenInfo(variant).coreTokens;
+            if (queryIdentity.coreTokens.length === 1) return variantCore.includes(queryIdentity.coreTokens[0]);
+            return variantCore.length === queryIdentity.coreTokens.length && tokenSignature(variantCore) === coreSignature;
+        }));
+        if (decoratedMatches.length > 0) return unique(decoratedMatches);
+    }
 
     // Shortened names match complete tokens only. This keeps Morgan → Alex
     // Morgan while preventing Al → Alice. Ambiguous shared tokens fail closed.

@@ -6,9 +6,9 @@ import { captureChatScope } from "../lib/chatScope.js";
 
 import { commitCharacterUpdate, isMeaningfulCharacterUpdate } from "../data/approval.js";
 import { updateInjection } from "../inject/promptInjector.js";
-import { getPendingUpdates, savePendingUpdates, getPresentCharacters, savePresentCharacters, getSettings, getMessageCounter, getSidecarPauseCadence, getSidecarRetryDue, deleteCharacterData } from "../data/storage.js";
-import { getCharacterProfile, getInitials, getAllCharacters, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES } from "../data/characters.js";
-import { getOpenScene, getSceneById, deleteScene, updateSceneSummary, updateSceneTitle } from "../data/scenes.js";
+import { getPendingUpdates, savePendingUpdates, getPresentCharacters, savePresentCharacters, getSettings, getMessageCounter, getSidecarPauseCadence, getSidecarRetryDue, deleteCharacterData, addNamesToBlacklist, isNameBlacklisted } from "../data/storage.js";
+import { getCharacterProfile, getInitials, getAllCharacters, updateCharacterProfile, STAT_CATEGORIES, STAT_NAMES, createCharacter, findCharacterByName, findCharacterByFuzzyName } from "../data/characters.js";
+import { getOpenScene, getSceneById, deleteScene, updateSceneSummary, updateSceneTitle, updateSceneCharacters } from "../data/scenes.js";
 import { generateStatUpdate } from "../llm/statUpdate.js";
 import { renderScenesTab } from "./scenes.js";
 import { renderLibraryTab } from "./library.js";
@@ -195,6 +195,33 @@ function pendingUpdateScore(update) {
     return score;
 }
 
+function sanitizePendingCriticalStats(update) {
+    if (!update || !Array.isArray(update.criticalStats) || update.criticalStats.length === 0) return false;
+    const range = getSettings().statChangeRange || { min: -5, max: 5 };
+    const minDelta = Number.isFinite(Number(range.min)) ? Number(range.min) : -5;
+    const maxDelta = Number.isFinite(Number(range.max)) ? Number(range.max) : 5;
+    const raised = new Set((Array.isArray(update.raisedCaps) ? update.raisedCaps : [])
+        .map((item) => String(item?.stat || "").toLowerCase().trim())
+        .filter(Boolean));
+    const beforeStats = update.statsBefore || update.stateBefore?.stats || {};
+    const kept = [];
+
+    for (const raw of update.criticalStats) {
+        const [cat, stat, extra] = String(raw || "").toLowerCase().trim().split(".");
+        if (extra || !STAT_CATEGORIES.includes(cat) || !STAT_NAMES.includes(stat)) continue;
+        const before = Number(beforeStats?.[cat]?.[stat]);
+        const after = Number(update.statsAfter?.[cat]?.[stat]);
+        if (!Number.isFinite(before) || !Number.isFinite(after)) continue;
+        const delta = after - before;
+        if (delta < minDelta || delta > maxDelta || raised.has(`${cat}.${stat}`)) kept.push(`${cat}.${stat}`);
+    }
+
+    const changed = kept.length !== update.criticalStats.length
+        || kept.some((value, index) => value !== String(update.criticalStats[index] || "").toLowerCase().trim());
+    if (changed) update.criticalStats = kept;
+    return changed;
+}
+
 function normalizePendingCharacterUpdates(pending) {
     if (!pending || !Array.isArray(pending.characterUpdates)) return pending;
 
@@ -204,6 +231,7 @@ function normalizePendingCharacterUpdates(pending) {
 
     for (const update of pending.characterUpdates) {
         const profile = update?.characterId ? getCharacterProfile(update.characterId) : null;
+        if (sanitizePendingCriticalStats(update)) changed = true;
         if (!update || !update.characterId || !isMeaningfulCharacterUpdate(update, profile)) {
             changed = true;
             if (update?.characterId && (pending.autoCreatedIds || []).includes(update.characterId)) {
@@ -240,6 +268,7 @@ function normalizePendingCharacterUpdates(pending) {
  */
 function renderPendingSection($pane, pending) {
     pending = normalizePendingCharacterUpdates(pending);
+    pending = normalizePendingDetectedProfiles(pending);
     const scene = getSceneById(pending.sceneId);
     const sceneLabel = scene ? `Scene ${scene.id.replace("scene_", "")} just closed` : "Scene closed";
 
@@ -271,6 +300,11 @@ function renderPendingSection($pane, pending) {
         }
     }
 
+    // Profile-only discoveries are deliberately independent of relationship
+    // updates. They are blank Library entries only; no stats are generated or
+    // approved unless the ordinary relationship path independently proposed one.
+    renderNewCharactersDetected($section, pending);
+
     // Approve All / Dismiss All buttons
     const $globalBtns = $(`
         <div class="rst-btn-row" style="margin-bottom:16px">
@@ -285,8 +319,8 @@ function renderPendingSection($pane, pending) {
         await rstScope1.wait(() => (approveAllPending(pending)));
     });
 
-    $globalBtns.find("#rst-dismiss-all").on("click", () => {
-        dismissAllPending();
+    $globalBtns.find("#rst-dismiss-all").on("click", async () => {
+        await dismissAllPending();
     });
 
     $section.append($globalBtns);
@@ -365,9 +399,9 @@ function renderCharacterPending($container, charUpdate, sceneId) {
     const $header = $(`
         <div class="rst-char-pending-hdr">
             <div class="rst-av" style="width:28px;height:28px;font-size:11px">${escapeHtml(initials)}</div>
-            <span style="font-weight:500">${escapeHtml(displayName)}</span>
-            <span style="margin-left:auto;font-size:11px;color:var(--rst-text-muted)">${changeCount} stat changes</span>
-            <span style="font-size:11px;color:var(--rst-text-muted);margin-left:8px">▾</span>
+            <span class="rst-char-pending-name">${escapeHtml(displayName)}</span>
+            <span class="rst-char-pending-count">${changeCount} stat changes</span>
+            <span class="rst-char-pending-chevron">▾</span>
         </div>
     `);
 
@@ -550,7 +584,7 @@ function renderStatCategory(cat, charUpdate, sceneId) {
 
         const statKey = cat + "." + stat;
         const isCritical = Array.isArray(charUpdate.criticalStats) && charUpdate.criticalStats.includes(statKey);
-        const critBadge = isCritical ? ' <span class="rst-crit-badge"><i class="fa-solid fa-bolt"></i> critical</span>' : '';
+        const critBadge = isCritical ? ' <span class="rst-crit-badge" title="Mechanically critical: exceeded the ordinary per-scene range or broke a hard-lock cap"><i class="fa-solid fa-bolt"></i> critical</span>' : '';
         $cat.append(`
             <div class="rst-sr">
                 <span class="rst-sn">${stat.charAt(0).toUpperCase() + stat.slice(1)}${critBadge}</span>
@@ -757,6 +791,128 @@ function renderPresentCharacters($pane) {
     $pane.append($section);
 }
 
+
+function normalizeDetectedProfileName(value) {
+    return String(value || "").normalize("NFKC").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function normalizePendingDetectedProfiles(pending) {
+    if (!pending) return pending;
+    const raw = Array.isArray(pending.newCharactersDetected) ? pending.newCharactersDetected : [];
+    const seen = new Set();
+    const kept = [];
+    let changed = !Array.isArray(pending.newCharactersDetected);
+
+    for (const item of raw) {
+        const name = String(item?.name || item || "").trim().slice(0, 100);
+        const key = normalizeDetectedProfileName(name);
+        if (!key || seen.has(key)) { changed = true; continue; }
+        if (isNameBlacklisted(name)) { changed = true; continue; }
+        if (findCharacterByName(name) || findCharacterByFuzzyName(name)) { changed = true; continue; }
+        seen.add(key);
+        kept.push({ name, mode: String(item?.mode || "unknown"), source: "stat_scan" });
+    }
+
+    if (changed || kept.length !== raw.length) {
+        pending.newCharactersDetected = kept;
+        settlePendingAfterDecision(pending);
+    }
+    return pending;
+}
+
+function removeDetectedProfileProposal(pending, proposal) {
+    if (!pending) return;
+    const target = normalizeDetectedProfileName(proposal?.name || proposal);
+    pending.newCharactersDetected = (Array.isArray(pending.newCharactersDetected) ? pending.newCharactersDetected : [])
+        .filter((item) => normalizeDetectedProfileName(item?.name || item) !== target);
+}
+
+function appendCharacterToScene(sceneId, characterId) {
+    if (!sceneId || !characterId) return;
+    const scene = getSceneById(sceneId);
+    if (!scene) return;
+    const ids = [...new Set([...(Array.isArray(scene.charactersPresent) ? scene.charactersPresent : []), characterId])];
+    updateSceneCharacters(sceneId, ids);
+}
+
+function approveDetectedCharacterProfile(proposal, pending) {
+    if (!pending || getPendingUpdates() !== pending) return false;
+    const name = String(proposal?.name || "").trim();
+    if (!name) return false;
+
+    const existingIds = new Set(getAllCharacters().map((character) => character.id));
+    let profile = findCharacterByName(name) || findCharacterByFuzzyName(name);
+    if (!profile) profile = createCharacter(name, { source: "auto_generated", automatic: true });
+    if (!profile) {
+        toastr?.warning?.(`RST could not create ${name} because the detected identity is ambiguous.`, "RST Identity");
+        return false;
+    }
+    const reusedExisting = existingIds.has(profile.id);
+
+    appendCharacterToScene(pending.sceneId, profile.id);
+    removeDetectedProfileProposal(pending, proposal);
+    settlePendingAfterDecision(pending);
+    toastr?.success?.(reusedExisting
+        ? `${profile.name} already has a profile; linked it to this scene instead.`
+        : `Character profile created for ${profile.name}.`);
+    renderLibraryTab(getPane("lib"));
+    refreshPending(getPane("home"));
+    return true;
+}
+
+async function denyDetectedCharacterProfile(proposal, pending) {
+    if (!pending || getPendingUpdates() !== pending) return false;
+    const name = String(proposal?.name || "").trim();
+    if (!name) return false;
+
+    const persisted = await Promise.resolve(addNamesToBlacklist(name, true));
+    if (persisted === false) {
+        toastr?.warning?.(`Could not save ${name} to the name blacklist. The proposal was left pending.`);
+        return false;
+    }
+
+    removeDetectedProfileProposal(pending, proposal);
+    settlePendingAfterDecision(pending);
+    toastr?.info?.(`${name} ignored and added to the name blacklist.`);
+    refreshPending(getPane("home"));
+    return true;
+}
+
+function renderNewCharactersDetected($container, pending) {
+    const proposals = Array.isArray(pending?.newCharactersDetected) ? pending.newCharactersDetected : [];
+    if (!proposals.length) return;
+
+    $container.append(`
+        <div class="rst-lbl rst-new-detected-label">
+            New characters detected
+            <span class="rst-badge-pending" style="text-transform:none;letter-spacing:0;font-weight:400;margin-left:6px">${proposals.length}</span>
+        </div>
+        <div style="font-size:11px;color:var(--rst-text-muted);line-height:1.45;margin:-2px 0 8px">
+            Profile proposals only. Approving creates a blank Character Library profile; no relationship stats are generated here.
+        </div>
+    `);
+
+    for (const proposal of proposals) {
+        const name = String(proposal?.name || "").trim();
+        const mode = String(proposal?.mode || "unknown");
+        const $card = $(`
+            <div class="rst-pending-card rst-new-character-proposal" data-rst-detected-name="${escapeHtml(name)}">
+                <div class="rst-new-character-proposal-main">
+                    <div class="rst-new-character-proposal-name">${escapeHtml(name)}</div>
+                    <div class="rst-new-character-proposal-meta">Detected in scene${mode !== "unknown" ? ` · ${escapeHtml(mode)}` : ""}</div>
+                </div>
+                <div class="rst-btn-row rst-new-character-proposal-actions">
+                    <button class="rst-btn-approve rst-approve-new-character">Approve profile</button>
+                    <button class="rst-btn-danger rst-deny-new-character">Deny</button>
+                </div>
+            </div>
+        `);
+        $card.find(".rst-approve-new-character").on("click", () => approveDetectedCharacterProfile(proposal, pending));
+        $card.find(".rst-deny-new-character").on("click", async () => { await denyDetectedCharacterProfile(proposal, pending); });
+        $container.append($card);
+    }
+}
+
 // ─── No Pending State ─────────────────────────────────────
 
 /**
@@ -781,7 +937,8 @@ function renderNoPending($pane) {
 function settlePendingAfterDecision(pending) {
     if (!pending) return;
     const hasCharacters = Array.isArray(pending.characterUpdates) && pending.characterUpdates.length > 0;
-    if (!hasCharacters && pending.summaryResolved) savePendingUpdates(null);
+    const hasDetectedProfiles = Array.isArray(pending.newCharactersDetected) && pending.newCharactersDetected.length > 0;
+    if (!hasCharacters && !hasDetectedProfiles && pending.summaryResolved) savePendingUpdates(null);
     else savePendingUpdates(pending);
 }
 
@@ -849,21 +1006,38 @@ function approveCharacterUpdate(charUpdate, sceneId) {
  * @param {object} pending
  */
 function approveAllPending(pending) {
-    if (!pending?.characterUpdates || getPendingUpdates() !== pending) return;
+    if (!pending || getPendingUpdates() !== pending) return;
     if (!pending.summaryResolved) approveSceneSummary(pending, pending.sceneSummary || "");
     normalizePendingCharacterUpdates(pending);
-    for (const charUpdate of [...pending.characterUpdates].filter((update) => isMeaningfulCharacterUpdate(update, getCharacterProfile(update.characterId)))) {
+    normalizePendingDetectedProfiles(pending);
+    for (const charUpdate of [...(pending.characterUpdates || [])].filter((update) => isMeaningfulCharacterUpdate(update, getCharacterProfile(update.characterId)))) {
         if (!approveCharacterUpdate(charUpdate, pending.sceneId)) return;
     }
-    toastr?.success?.("All stat changes approved and saved.");
+    for (const proposal of [...(pending.newCharactersDetected || [])]) {
+        if (!approveDetectedCharacterProfile(proposal, pending)) return;
+    }
+    toastr?.success?.("All pending relationship changes and character profiles approved.");
 }
 
 /**
  * Dismiss all pending updates.
  */
-function dismissAllPending() {
+async function dismissAllPending() {
     const pending = getPendingUpdates();
     const preserveApprovedSummary = !!(pending?.summaryResolved && pending?.summaryApproved);
+
+    // Dismissing a profile proposal is an explicit rejection, matching the live
+    // sidecar popup: persist the names so they are not proposed every scan.
+    const rejectedNames = (Array.isArray(pending?.newCharactersDetected) ? pending.newCharactersDetected : [])
+        .map((item) => String(item?.name || item || "").trim())
+        .filter(Boolean);
+    if (rejectedNames.length) {
+        const persisted = await Promise.resolve(addNamesToBlacklist(rejectedNames, true));
+        if (persisted === false) {
+            toastr?.warning?.("Could not save rejected character names to the blacklist. Pending review was not dismissed.");
+            return;
+        }
+    }
 
     // Delete any auto-created character profiles (tracked deterministically during generation)
     if (pending && pending.autoCreatedIds && pending.autoCreatedIds.length > 0) {
@@ -880,8 +1054,8 @@ function dismissAllPending() {
 
     savePendingUpdates(null);
     toastr?.info?.(preserveApprovedSummary
-        ? "Remaining pending stat changes dismissed. Approved scene summary preserved."
-        : "All pending stat changes dismissed. Scene removed.");
+        ? "Remaining pending changes dismissed. Rejected character names were blacklisted; approved scene summary preserved."
+        : "All pending changes dismissed. Rejected character names were blacklisted and the scene was removed.");
 
     const $pane = getPane("home");
     refreshPending($pane);
@@ -993,6 +1167,18 @@ async function regenerateCharacterUpdate(sceneId, characterId, guidance) {
             for (const discovered of result.characterUpdates) {
                 if (discovered.source?.startsWith("llm_discovered") && !pendingIds.has(discovered.characterId)) {
                     pending.characterUpdates.push(discovered);
+                }
+            }
+
+            // Merge profile-only discoveries without turning them into stat cards.
+            if (Array.isArray(result.newCharactersDetected) && result.newCharactersDetected.length > 0) {
+                const existing = new Set((pending.newCharactersDetected || []).map((item) => normalizeDetectedProfileName(item?.name || item)));
+                pending.newCharactersDetected = Array.isArray(pending.newCharactersDetected) ? pending.newCharactersDetected : [];
+                for (const proposal of result.newCharactersDetected) {
+                    const key = normalizeDetectedProfileName(proposal?.name || proposal);
+                    if (!key || existing.has(key)) continue;
+                    pending.newCharactersDetected.push(proposal);
+                    existing.add(key);
                 }
             }
 

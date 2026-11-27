@@ -46,7 +46,7 @@ const DESCRIPTIVE_ALIAS_WORDS = new Set([
 /**
  * Reconcile current character presence from recent messages.
  * @param {number|{messageCount?:number,transitionMessageCount?:number,boundaryCatchup?:boolean}|null} [options=null]
- * @returns {Promise<{detected:string[], unknown:string[], modes:Object, valid:boolean, reason?:string}>}
+ * @returns {Promise<{detected:string[], unknown:string[], currentUnknown?:string[], modes:Object, valid:boolean, reason?:string}>}
  */
 export async function detectCharacters(options = null) {
     const settings = getSettings();
@@ -55,7 +55,7 @@ export async function detectCharacters(options = null) {
     const currentModes = getCurrentCanonicalModes(allCharacters);
 
     if (!settings.enabled) {
-        return { detected: currentNames, unknown: [], modes: currentModes, valid: false, reason: "disabled" };
+        return { detected: currentNames, unknown: [], currentUnknown: [], modes: currentModes, valid: false, reason: "disabled" };
     }
 
     const profileName = settings.connections?.sidecarLLM;
@@ -72,7 +72,7 @@ export async function detectCharacters(options = null) {
     const personaName = getContext().name1 || "";
 
     if (messages.length === 0) {
-        return { detected: currentNames, unknown: [], modes: currentModes, valid: false, reason: "no_messages" };
+        return { detected: currentNames, unknown: [], currentUnknown: [], modes: currentModes, valid: false, reason: "no_messages" };
     }
 
     const candidateState = buildCandidateState(
@@ -115,13 +115,13 @@ export async function detectCharacters(options = null) {
         );
 
         if (!result) {
-            return { detected: safeCurrentNames, unknown: [], modes: safeCurrentModes, valid: false, reason: "empty_response" };
+            return { detected: safeCurrentNames, unknown: [], currentUnknown: [], modes: safeCurrentModes, valid: false, reason: "empty_response" };
         }
 
         const decision = parsePresenceDecision(result);
         if (!decision) {
             console.warn("[RST] Presence detection returned no valid JSON object; preserving current presence.");
-            return { detected: safeCurrentNames, unknown: [], modes: safeCurrentModes, valid: false, reason: "invalid_json" };
+            return { detected: safeCurrentNames, unknown: [], currentUnknown: [], modes: safeCurrentModes, valid: false, reason: "invalid_json" };
         }
 
         const reconciled = reconcilePresenceDecision(decision, messages, candidateState, personaName);
@@ -130,19 +130,20 @@ export async function detectCharacters(options = null) {
         }
         if (!reconciled.valid) {
             console.warn(`[RST] Presence response failed validation (${reconciled.reason}); preserving current presence.`);
-            return { detected: safeCurrentNames, unknown: [], modes: safeCurrentModes, valid: false, reason: reconciled.reason, diagnostics: reconciled.diagnostics };
+            return { detected: safeCurrentNames, unknown: [], currentUnknown: [], modes: safeCurrentModes, valid: false, reason: reconciled.reason, diagnostics: reconciled.diagnostics };
         }
 
         dlog(
             "[RST] Presence reconciliation accepted — detected:", JSON.stringify(reconciled.detected),
             "unknown:", JSON.stringify(reconciled.unknown),
+            "currentUnknown:", JSON.stringify(reconciled.currentUnknown || []),
             "modes:", JSON.stringify(reconciled.modes),
         );
         return reconciled;
     } catch (err) {
         console.error("[RST] Sidecar detection failed:", err);
         toastr?.error?.("Sidecar character detection failed. Check your connection settings.");
-        return { detected: safeCurrentNames, unknown: [], modes: safeCurrentModes, valid: false, reason: "request_error" };
+        return { detected: safeCurrentNames, unknown: [], currentUnknown: [], modes: safeCurrentModes, valid: false, reason: "request_error" };
     }
 }
 
@@ -285,7 +286,7 @@ async function detectUnknownCharactersInChunk(messages, profileName, personaName
         let mode = "unknown";
         for (const evidenceIndex of normalized.evidence) {
             if (embeddedDocumentIndices.has(evidenceIndex)) continue;
-            const inferred = findUnknownActiveMode(messages[evidenceIndex], normalized.name, personaName);
+            const inferred = findUnknownDiscoveryMode(messages[evidenceIndex], normalized.name, normalized.mode, personaName);
             if (inferred === "unknown") continue;
             mode = inferred;
             break;
@@ -309,8 +310,9 @@ function isKnownCharacterIdentity(name) {
 
 function buildSidecarSystemPrompt() {
     return [
-        "You reconcile which non-player characters are actively involved in the CURRENT scene.",
-        "Do not list everyone mentioned. Report only explicit presence transitions.",
+        "You reconcile which established non-player characters are actively involved in the CURRENT scene, and you discover newly introduced named characters.",
+        "Do not list everyone mentioned. Known-character present/departed entries are explicit presence transitions only.",
+        "NEW-CHARACTER DISCOVERY IS A REQUIRED SECOND PASS: if a proper-named NPC with no eligible known-character ID is actively depicted in any NEW message, return that name in unknown even when the NPC never interacts with the player, appears only in an NPC-focused scene, or the camera moves again later in the same message.",
         "Output ONLY one valid JSON object. No markdown, reasoning, analysis, or commentary.",
     ].join("\n");
 }
@@ -361,6 +363,7 @@ function buildSidecarRequestPrompt(messages, candidateState, personaName) {
         "",
         "RULES:",
         `- This is a transition report. Only M${candidateState.transitionStartIndex} through M${messages.length - 1} are NEW since the prior scan. Report additions from those NEW messages only. Older messages are context only.`,
+        "- REQUIRED UNKNOWN PASS: inspect every NEW message for actively depicted proper-named NPCs that do not have an eligible known-character ID. Return every supported newcomer in unknown. Do not omit a newcomer merely because the player is elsewhere, the scene is NPC-only, or a later camera block follows someone else.",
         "- Omit unchanged current characters from both present and departed, except a CURRENT:unknown candidate may be restated in present to classify its mode.",
         "- Add a non-current candidate only when a cited message explicitly shows active physical, live-remote, or parallel narrative involvement NOW.",
         "- A parallel scene counts even when the character is physically distant, provided the narration actually follows that character and shows them actively processing or acting on current player-related developments.",
@@ -370,7 +373,7 @@ function buildSidecarRequestPrompt(messages, candidateState, personaName) {
         "- Do not use the ASSISTANT message label as character evidence; SillyTavern may label narration with the card name even when that character is absent.",
         "- sceneReset may be true only for an actual top-level time/location/camera transition. A genuine cut to or away from a parallel POV is a scene transition. Markdown inside a book, post, message, report, or other in-world document is not a scene reset.",
         "- Use only candidate IDs listed below. Never output another known library character.",
-        "- Unknown names must be proper names written verbatim in the cited message and actively involved now.",
+        "- Unknown names must be proper names written verbatim in the cited NEW message and actively depicted there. For discovery, active depiction is enough even if that character is not still in the final/current camera by the end of the message.",
         "- Evidence numbers are zero-based M indices.",
         "- Empty arrays are valid and preferred over guessing.",
         ignoredNames.length ? `- Never return ignored/player names: ${ignoredNames.join(", ")}` : "",
@@ -797,32 +800,80 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
         detectedProfiles.map((candidate) => [candidate.profile.name, normalizeMode(selectedModes[candidate.profile.id])]),
     );
 
+    // `unknown` is the newcomer-discovery stream. It is intentionally broader
+    // than current presence: a newly introduced NPC should still reach the
+    // profile-confirmation workflow even if the same assistant message later
+    // cuts away from that NPC. `currentUnknown` is the subset still grounded in
+    // the final/current camera and is the only subset eligible to become present
+    // immediately after profile creation.
     const unknown = [];
+    const currentUnknown = [];
     const unknownKeys = new Set();
+    const currentUnknownKeys = new Set();
     for (const item of decision.unknown) {
         const normalized = normalizeUnknownDecisionItem(item, messages.length);
-        if (!normalized) continue;
-        if (isNameBlacklisted(normalized.name, [personaName, "{{user}}", "user"])) continue;
-        if (!looksLikeProperName(normalized.name)) continue;
+        if (!normalized) {
+            rejected.push({ id: null, character: null, reason: "invalid_unknown_item", evidence: item?.evidence || [] });
+            continue;
+        }
+        if (isNameBlacklisted(normalized.name, [personaName, "{{user}}", "user"])) {
+            rejected.push({ id: null, character: normalized.name, reason: "unknown_blacklisted_or_player", evidence: normalized.evidence });
+            continue;
+        }
+        if (!looksLikeProperName(normalized.name)) {
+            rejected.push({ id: null, character: normalized.name, reason: "unknown_not_proper_name", evidence: normalized.evidence });
+            continue;
+        }
 
         let supportedEvidence;
         let inferredMode = "unknown";
         for (const index of normalized.evidence) {
             if (index < candidateState.transitionStartIndex) continue;
             if (candidateState.embeddedDocumentIndices.has(index)) continue;
-            const mode = findUnknownActiveMode(messages[index], normalized.name, candidateState.personaName);
+            const mode = findUnknownDiscoveryMode(
+                messages[index],
+                normalized.name,
+                normalized.mode,
+                candidateState.personaName,
+            );
             if (mode === "unknown") continue;
             supportedEvidence = index;
             inferredMode = mode;
             break;
         }
-        if (supportedEvidence === undefined) continue;
+        if (supportedEvidence === undefined) {
+            rejected.push({
+                id: null,
+                character: normalized.name,
+                reason: "unknown_active_evidence_not_confirmed",
+                evidence: normalized.evidence,
+            });
+            continue;
+        }
 
         const identityKeys = getNameMatchKeys(normalized.name);
         if (!identityKeys.some((key) => unknownKeys.has(key))) {
             unknown.push(normalized.name.trim());
             identityKeys.forEach((key) => unknownKeys.add(key));
             modes[normalized.name.trim()] = inferredMode;
+        }
+
+        // Presence is stricter than discovery. Re-evaluate the cited evidence
+        // against the final/current-camera rules before allowing an approved
+        // newcomer to join the live present roster.
+        let currentMode = "unknown";
+        for (const index of normalized.evidence) {
+            if (index < candidateState.transitionStartIndex) continue;
+            if (candidateState.embeddedDocumentIndices.has(index)) continue;
+            const mode = findUnknownActiveMode(messages[index], normalized.name, candidateState.personaName);
+            if (mode === "unknown") continue;
+            currentMode = mode;
+            break;
+        }
+        if (currentMode !== "unknown" && !identityKeys.some((key) => currentUnknownKeys.has(key))) {
+            currentUnknown.push(normalized.name.trim());
+            identityKeys.forEach((key) => currentUnknownKeys.add(key));
+            modes[normalized.name.trim()] = currentMode;
         }
     }
 
@@ -832,16 +883,25 @@ function reconcilePresenceDecision(decision, messages, candidateState, personaNa
     const nonCurrentCandidates = candidateState.candidates.filter((candidate) => !candidate.wasPresent);
     const addedCount = detectedProfiles.filter((candidate) => !candidate.wasPresent).length;
     if (nonCurrentCandidates.length >= 5 && addedCount >= Math.ceil(nonCurrentCandidates.length * 0.8)) {
-        return { detected: [], unknown: [], modes: {}, valid: false, reason: "suspicious_bulk_addition" };
+        // A broad addition with no verified camera/location reset is still
+        // suspicious and fails closed. After a deterministic top-level reset,
+        // however, every accepted character has already passed per-character
+        // active-evidence validation *after* that boundary. Rejecting that cast
+        // would preserve the stale previous scene simply because the new scene
+        // happens to contain many people (e.g. a conference/party entrance).
+        if (resetIndex === undefined) {
+            return { detected: [], unknown: [], currentUnknown: [], modes: {}, valid: false, reason: "suspicious_bulk_addition" };
+        }
+        dlog(`[RST] Accepting large grounded cast after verified scene reset at M${resetIndex} (${addedCount}/${nonCurrentCandidates.length} additions).`);
     }
 
     // A model claiming presence while all its evidence is rejected is not a
     // confirmed empty scene. Keep the checkpoint due for a later retry.
     if (decision.present.length && rejected.length === decision.present.length && resetIndex === undefined && !acceptedDepartures) {
-        return { detected: [], unknown: [], modes: {}, valid: false,
+        return { detected: [], unknown: [], currentUnknown: [], modes: {}, valid: false,
             reason: "all_present_claims_rejected", diagnostics: { rejected } };
     }
-    return { detected, unknown, modes, valid: true, diagnostics: { rejected } };
+    return { detected, unknown, currentUnknown, modes, valid: true, diagnostics: { rejected } };
 }
 
 function normalizeSceneReset(value, messageCount) {
@@ -864,7 +924,11 @@ function normalizeUnknownDecisionItem(item, messageCount) {
     if (!item || typeof item !== "object") return null;
     const name = String(item.name || "").trim();
     if (!name) return null;
-    return { name, evidence: normalizeEvidence(item.evidence, messageCount) };
+    return {
+        name,
+        mode: normalizeMode(item.mode),
+        evidence: normalizeEvidence(item.evidence, messageCount),
+    };
 }
 
 function normalizeEvidence(value, messageCount) {
@@ -889,7 +953,18 @@ function findCandidateActiveMode(message, candidate, identityVariants, personaNa
     // A single assistant response may contain several location/camera cuts.
     // A character in another location still counts when the narration actually
     // follows their current POV and shows active involvement in the player thread.
-    for (const block of splitPresenceBlocks(text)) {
+    // The final top-level block is the live camera even when the persona has not
+    // entered it yet (for example, friends already waiting in a karaoke room).
+    const blocks = splitPresenceBlocks(text);
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+        // A horizontal-rule block is a top-level camera/scene cut in the RP
+        // corpus. Scene-limited modes from an earlier block cannot leak into
+        // the final camera merely because the character was named earlier in
+        // the same assistant response. Deliberate live remote channels may
+        // survive the cut; physical and parallel presence must be re-grounded.
+        if (blockIndex > 0) lastMode = "unknown";
+        const block = blocks[blockIndex];
+        const currentCameraBlock = blockIndex === blocks.length - 1;
         const directPlayerScene = message?.is_user === true || hasDirectPlayerSceneAnchor(block, personaName);
         const playerReference = hasDirectPlayerReference(block, personaName);
         const surveillanceTarget = hasSurveillanceSceneTarget(block, personaName);
@@ -905,11 +980,15 @@ function findCandidateActiveMode(message, candidate, identityVariants, personaNa
                         if (hasExplicitRemoteInfluence(block, variant, personaName)) {
                             mode = inferRemoteInfluenceMode(block, playerReference, surveillanceTarget);
                         } else if (message?.is_user !== true
-                            && hasParallelNarrativeInvolvement(block, variant, personaName, messagePlayerReference)) {
+                            && hasParallelNarrativeInvolvement(block, variant, personaName, messagePlayerReference)
+                            && (!currentCameraBlock || hasExplicitParallelCameraCue(block))) {
                             mode = "parallel";
-                        } else {
+                        } else if (!currentCameraBlock) {
                             continue;
                         }
+                        // Otherwise this is a physically grounded subject in the
+                        // live/final camera block. Keep mode=physical even if the
+                        // persona has not entered that room yet.
                     }
                 } else if (mode === "call" || mode === "message") {
                     // A call/message with another NPC inside the character's own
@@ -930,7 +1009,9 @@ function findCandidateActiveMode(message, candidate, identityVariants, personaNa
                     if (!surveillanceTarget && !messagePlayerReference) continue;
                 }
 
-                if (mode === "physical" && isRemoteMode(lastMode) && !hasStrongPhysicalEntry(segment, variant)) continue;
+                if (mode === "physical" && isRemoteMode(lastMode)
+                    && !hasStrongPhysicalEntry(segment, variant)
+                    && !(currentCameraBlock && blockIndex > 0)) continue;
                 lastMode = mode;
             }
         }
@@ -957,7 +1038,16 @@ function findUnknownActiveMode(message, name, personaName = "") {
     if (!text || isEmbeddedDocumentMessage(message, null)) return "unknown";
     const messagePlayerReference = hasDirectPlayerReference(text, personaName);
     let lastMode = "unknown";
-    for (const block of splitPresenceBlocks(text)) {
+    const blocks = splitPresenceBlocks(text);
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+        // A horizontal-rule block is a top-level camera/scene cut in the RP
+        // corpus. Scene-limited modes from an earlier block cannot leak into
+        // the final camera merely because the character was named earlier in
+        // the same assistant response. Deliberate live remote channels may
+        // survive the cut; physical and parallel presence must be re-grounded.
+        if (blockIndex > 0) lastMode = "unknown";
+        const block = blocks[blockIndex];
+        const currentCameraBlock = blockIndex === blocks.length - 1;
         const directPlayerScene = message?.is_user === true || hasDirectPlayerSceneAnchor(block, personaName);
         const playerReference = hasDirectPlayerReference(block, personaName);
         const surveillanceTarget = hasSurveillanceSceneTarget(block, personaName);
@@ -967,11 +1057,14 @@ function findUnknownActiveMode(message, name, personaName = "") {
             if (mode === "unknown") continue;
             if (mode === "physical" && !directPlayerScene) {
                 if (message?.is_user !== true
-                    && hasParallelNarrativeInvolvement(block, name, personaName, messagePlayerReference)) {
+                    && hasParallelNarrativeInvolvement(block, name, personaName, messagePlayerReference)
+                    && (!currentCameraBlock || hasExplicitParallelCameraCue(block))) {
                     mode = "parallel";
-                } else {
+                } else if (!currentCameraBlock) {
                     continue;
                 }
+                // Final live camera: physical placement remains physical even
+                // before the persona enters the room.
             }
             if ((mode === "call" || mode === "message") && !directPlayerScene) {
                 if (hasPlayerLinkedChannel(segment, block, personaName)) {
@@ -984,11 +1077,97 @@ function findUnknownActiveMode(message, name, personaName = "") {
                 }
             }
             if (mode === "surveillance" && !surveillanceTarget && !messagePlayerReference) continue;
-            if (mode === "physical" && isRemoteMode(lastMode) && !hasStrongPhysicalEntry(segment, name)) continue;
+            if (mode === "physical" && isRemoteMode(lastMode)
+                && !hasStrongPhysicalEntry(segment, name)
+                && !(currentCameraBlock && blockIndex > 0)) continue;
             lastMode = mode;
         }
     }
     return lastMode;
+}
+
+/**
+ * Validate that a newly discovered proper name was actively depicted somewhere
+ * in the cited message. Unlike current-presence validation, this intentionally
+ * does not discard a newcomer merely because the same long-form assistant turn
+ * later cuts to another camera. Profile discovery and live presence are separate
+ * questions.
+ */
+function findUnknownDiscoveryMode(message, name, declaredMode = "unknown", personaName = "") {
+    const text = message?.mes || "";
+    if (!text || isEmbeddedDocumentMessage(message, null)) return "unknown";
+
+    let lastSupportedMode = "unknown";
+    for (const block of splitPresenceBlocks(text)) {
+        for (const segment of splitEvidenceSegments(block)) {
+            if (!nameAppears(segment, name)) continue;
+
+            const strict = findSubjectLinkedMode(segment, name);
+            if (strict !== "unknown") {
+                lastSupportedMode = strict;
+                continue;
+            }
+
+            const fallback = findNarrativeActivityFallback(segment, name, declaredMode, personaName);
+            if (fallback !== "unknown") lastSupportedMode = fallback;
+        }
+    }
+    return lastSupportedMode;
+}
+
+function findNarrativeActivityFallback(segment, name, declaredMode = "unknown", personaName = "") {
+    const raw = String(segment || "");
+    const text = normalizeForMatch(raw).replace(/[*_`]/g, "");
+    const needle = searchableText(name);
+    if (!text || !needle || !nameAppears(raw, name)) return "unknown";
+
+    const escaped = escapeRegExp(needle).replace(/ /g, "\\s+");
+    const localIndex = text.indexOf(needle);
+    if (localIndex < 0) return "unknown";
+    const local = text.slice(Math.max(0, localIndex - 150), Math.min(text.length, localIndex + needle.length + 260));
+
+    // Strong negative/absence language must never become discovery evidence.
+    const negativeBefore = new RegExp(`\\b(?:without|not with|isn't with|wasn't with|is not with|was not with)\\b[^.!?]{0,70}\\b${escaped}\\b`, "i");
+    const negativeAfter = new RegExp(`\\b${escaped}\\b[^.!?]{0,70}\\b(?:isn't here|is not here|wasn't here|was not here|is absent|was absent|is gone|was gone|left earlier)\\b`, "i");
+    if (negativeBefore.test(local) || negativeAfter.test(local)) return "unknown";
+    if (hasReferenceOnlyCue(local)) return "unknown";
+
+    // A named voice/body/form actively doing something is grounded narrative
+    // evidence even when the prose does not use one of the narrow legacy verbs.
+    const possessiveEmbodied = new RegExp(
+        `\\b${escaped}(?:-(?:san|kun|chan|sama|sensei|senpai))?'s\\s+(?:[a-z0-9'’-]+\\s+){0,4}` +
+        `(?:voice|eyes?|gaze|expression|face|hand|hands|head|shoulders?|body|figure|form|posture)\\b[^.!?]{0,90}` +
+        `\\b(?:cuts?|cut|breaks?|broke|drifts?|drifted|moves?|moved|shifts?|shifted|turns?|turned|lifts?|lifted|drops?|dropped|flicks?|flicked|narrows?|narrowed|widens?|widened|hardens?|hardened|softens?|softened|tenses?|tensed|relaxes?|relaxed|trembles?|trembled|shakes?|shook|settles?|settled)\\b`,
+        "i",
+    );
+    if (possessiveEmbodied.test(local)) return normalizeMode(declaredMode) === "unknown" ? "physical" : normalizeMode(declaredMode);
+
+    // Common placement constructions such as "the figure of Morgan appeared"
+    // identify an embodied character even though the proper name is the object
+    // of an "of" phrase rather than the grammatical subject.
+    const figureOfName = new RegExp(
+        `\\b(?:figure|form|silhouette|shape|presence)\\s+of\\s+(?:the\\s+)?${escaped}\\b[^.!?]{0,100}` +
+        `\\b(?:appears?|appeared|emerges?|emerged|enters?|entered|stands?|stood|waits?|waited|moves?|moved|steps?|stepped)\\b`,
+        "i",
+    );
+    if (figureOfName.test(local)) return normalizeMode(declaredMode) === "unknown" ? "physical" : normalizeMode(declaredMode);
+
+    // Final safety net for model-declared active newcomers. Require the proper
+    // name to act as a narrative subject followed by an ordinary action-shaped
+    // verb, while still excluding future/reference/absence framing above. This
+    // is intentionally broader than the live-presence grammar because a popup
+    // proposal is reviewable and does not itself alter relationship stats.
+    const subjectAction = new RegExp(
+        `\\b${escaped}(?:-(?:san|kun|chan|sama|sensei|senpai))?(?:'s)?\\b[^.!?]{0,75}` +
+        `\\b(?:[a-z]{3,}(?:s|ed|ing)|said|says|asks|asked|replied|answers?|appears?|appeared|watches?|watched|observes?|observed|glances?|glanced|gazes?|gazed|speaks?|spoke|laughs?|laughed|smiles?|smiled|nods?|nodded|shrugs?|shrugged|flinches?|flinched|freezes?|froze|pauses?|paused|blinks?|blinked)\\b`,
+        "i",
+    );
+    if (subjectAction.test(local)) {
+        const requested = normalizeMode(declaredMode);
+        return requested === "unknown" ? "physical" : requested;
+    }
+
+    return "unknown";
 }
 
 function splitPresenceBlocks(text) {
@@ -996,6 +1175,13 @@ function splitPresenceBlocks(text) {
         .split(/^\s*---+\s*$/gm)
         .map((block) => block.trim())
         .filter(Boolean);
+}
+
+function hasExplicitParallelCameraCue(block) {
+    const raw = String(block || "").trimStart();
+    const plain = normalizeForMatch(raw.slice(0, 420));
+    return /^(?:meanwhile|elsewhere)(?:,|\s)/i.test(plain)
+        || /^back (?:at|in)\s+/i.test(plain);
 }
 
 function personaIdentityVariants(personaName) {
@@ -1030,7 +1216,14 @@ function hasDirectPlayerSceneAnchor(text, personaName) {
     const playerAction = /\byou\s+(?:stand|stood|sit|sat|walk|walked|look|looked|say|said|ask|asked|reach|reached|turn|turned|watch|watched|notice|noticed|arrive|arrived|enter|entered|leave|left|move|moved|lean|leaned|hold|held|take|took|keep|kept|remain|remained|stare|stared|wait|waited|open|opened|close|closed|pull|pulled|push|pushed|pick|picked|set|cross|crossed|follow|followed|breathe|breathed|cough|coughed)\b/i;
     const playerBodyOrPlace = /\byour\s+(?:hand|hands|face|eyes|body|voice|breathing|shoulder|shoulders|head|arm|arms|wrist|wrists|coat|hair|feet|foot|knee|knees|chest|stomach|side)\b/i;
     const directProximity = /\b(?:both of you|beside you|next to you|across from you|in front of you|behind you|toward you|with you)\b/i;
-    if (playerAction.test(normalized) || playerBodyOrPlace.test(normalized) || directProximity.test(normalized)) return true;
+    // Natural RP often establishes co-location through interaction with the
+    // user's immediate belongings/space rather than another explicit player
+    // action: "stole food from your bowl", "set it on your table", etc.
+    // Treat those as local scene anchors, but keep passive remote observation
+    // such as "watched your apartment" out of this rule by requiring a
+    // proximity/transfer preposition tied to a small immediate-scene object.
+    const playerOwnedLocalObject = /\b(?:from|beside|next to|across from|toward|towards|against|into|onto|off|on|at)\s+your\s+(?:[\p{L}\p{N}'’-]+\s+){0,2}(?:plate|bowl|cup|glass|container|food|drink|table|desk|chair|sofa|couch|bed|bag|purse|phone|book|blanket|door|genkan)\b/iu;
+    if (playerAction.test(normalized) || playerBodyOrPlace.test(normalized) || directProximity.test(normalized) || playerOwnedLocalObject.test(normalized)) return true;
 
     const physicalVerbs = "stands|sits|walks|looks|says|asks|replies|reaches|turns|holds|nods|stood|sat|walked|looked|said|asked|replied|answered|slept|woke|entered|arrived|left|moved|turned|reached|held|took|waited|remained|coughed|breathed|nodded|smiled|frowned";
     for (const variant of personaIdentityVariants(personaName)) {
@@ -1165,14 +1358,19 @@ function hasStrongPhysicalEntry(segment, variant) {
     if (!text || !needle) return false;
     const escaped = escapeRegExp(needle).replace(/ /g, "\\s+");
     const pattern = new RegExp(
-        `\\b${escaped}\\b[^.!?]{0,70}\\b(?:arrived|entered|stepped (?:inside|in|through)|walked in|came in|appeared in the doorway|opened the door|took the stairs|crossed the threshold|sat beside|stood beside)\\b`,
+        `\\b${escaped}\\b[^.!?]{0,70}\\b(?:arrives|arrived|enters|entered|steps? (?:inside|in|through)|walks? in|walked in|comes? in|came in|appears? in the doorway|appeared in the doorway|opens? the door|opened the door|takes? the stairs|took the stairs|crosses? the threshold|crossed the threshold|sits? beside|sat beside|stands? beside|stood beside)\\b`,
         "i",
     );
     return pattern.test(text);
 }
 
 function findSubjectLinkedMode(segment, variant) {
-    const narration = String(segment || "").replace(/“[^”]*”|"[^"]*"/g, " ");
+    // Strip actual dialogue spans without letting a closing straight quote at the
+    // start of a sentence fragment consume the italic narration before the next
+    // opening quote. Sentence segmentation can split inside quoted dialogue, as
+    // in: `...melt." *Maya had claimed the couch...* "Also...`
+    let narration = String(segment || "").replace(/“[^”]*”/g, " ");
+    narration = narration.replace(/(^|[\s(\[{:;—-])"[^"]*"/g, "$1 ");
     const text = normalizeForMatch(narration).replace(/[*_`]/g, "");
     const needle = searchableText(variant);
     if (!text || !needle) return "unknown";
@@ -1192,15 +1390,19 @@ function findSubjectLinkedMode(segment, variant) {
     const referenceOnly = hasReferenceOnlyCue(local);
 
     const nameThenCallAction = new RegExp(
-        `\\b${escaped}(?:'s)?\\b[^.!?]{0,70}\\b(?:voice|answered|dialed|called|spoke|said|replied|breathed|went quiet)\\b`,
+        `\\b${escaped}(?:'s)?\\b[^.!?]{0,70}\\b(?:answered|dialed|called|spoke|said|replied|breathed|went quiet)\\b`,
+        "i",
+    );
+    const nameVoiceThroughChannel = new RegExp(
+        `\\b${escaped}(?:'s)?\\s+voice\\b[^.!?]{0,70}\\b(?:came|comes|carried|carries|crackled|crackles|spoke|speaks|sounded|sounds)\\b[^.!?]{0,60}\\b(?:through|over|from)\\s+(?:(?:the|your|a)\\s+)?(?:phone|line|speaker|speakerphone|radio|intercom|earpiece)\\b`,
         "i",
     );
     const channelThenName = new RegExp(
         `\\b(?:through|over|on)\\s+the\\s+(?:phone|line|speaker|speakerphone|radio|intercom)[^.!?]{0,100}\\b${escaped}\\b`,
         "i",
     );
-    if ((nameThenCallAction.test(local) || channelThenName.test(local))
-        && /\b(?:phone|call|line|speaker|speakerphone|radio|intercom|voice)\b/i.test(local)) {
+    if ((nameThenCallAction.test(local) || nameVoiceThroughChannel.test(local) || channelThenName.test(local))
+        && /\b(?:phone|call|line|speaker|speakerphone|radio|intercom|earpiece)\b/i.test(local)) {
         return "call";
     }
 
@@ -1224,20 +1426,102 @@ function findSubjectLinkedMode(segment, variant) {
 
     const physicalVerbs = [
         "interrupts", "interrupted", "murmurs", "murmured", "whispers", "whispered",
-        "says", "asks", "replies", "answers", "nods", "smiles", "frowns", "laughs",
-        "stands", "sits", "leans", "turns", "looks", "reaches", "holds", "touches",
-        "arrived", "entered", "stepped", "walked", "came", "stood", "sat", "crouched",
-        "leaned", "approached", "reached", "grabbed", "held", "spoke", "said", "asked",
-        "replied", "answered", "nodded", "smiled", "frowned", "laughed", "placed", "set",
-        "followed", "waited", "remained", "stayed", "turned", "looked", "moved", "crossed",
-        "took", "opened", "closed", "knelt", "rose", "paced", "padded", "slipped", "dropped",
-        "lifted", "pulled", "pushed", "touched", "stared", "breathed", "sighed", "lay",
+        "says", "said", "asks", "asked", "replies", "replied", "answers", "answered",
+        "nods", "nodded", "smiles", "smiled", "frowns", "frowned", "laughs", "laughed",
+        "stands", "stood", "sits", "sat", "leans", "leaned", "turns", "turned",
+        "looks", "looked", "reaches", "reached", "holds", "held", "touches", "touched",
+        "arrives", "arrived", "enters", "entered", "steps", "stepped", "walks", "walked",
+        "comes", "came", "crouches", "crouched", "approaches", "approached",
+        "appears", "appeared", "emerges", "emerged", "watches", "watched",
+        "observes", "observed", "glances", "glanced", "gazes", "gazed",
+        "gestures", "gestured", "shrugs", "shrugged", "flinches", "flinched",
+        "freezes", "froze", "pauses", "paused", "blinks", "blinked",
+        "tilts", "tilted",
+        "grabs", "grabbed", "speaks", "spoke", "places", "placed", "sets", "set",
+        "follows", "followed", "waits", "waited", "remains", "remained", "stays", "stayed",
+        "moves", "moved", "crosses", "crossed", "takes", "took", "opens", "opened",
+        "closes", "closed", "kneels", "knelt", "rises", "rose", "paces", "paced",
+        "pads", "padded", "slips", "slipped", "drops", "dropped", "lifts", "lifted",
+        "pulls", "pulled", "pushes", "pushed", "stares", "stared", "breathes", "breathed",
+        "sighs", "sighed", "lies", "lay", "hangs", "hung", "swings", "swinging",
+        // Progressive/current-action forms are common in long-form RP and must
+        // ground a character just as strongly as simple present/past verbs.
+        "walking", "standing", "sitting", "leaning", "turning", "looking",
+        "reaching", "holding", "touching", "moving", "crossing", "taking",
+        "opening", "closing", "waiting", "remaining", "staying", "following",
+        "approaching", "entering", "stepping", "coming", "resting", "hanging",
+        "appearing", "emerging", "watching", "observing", "glancing", "gazing",
+        "gesturing", "shrugging", "flinching", "freezing", "pausing", "blinking", "tilting",
+        // Strong placement/posture verbs used heavily in ensemble prose.
+        "occupies", "occupied", "claims", "claimed", "perches", "perched",
+        "sprawls", "sprawled", "lounges", "lounged", "settles", "settled",
+        "reclines", "reclined", "shuffles", "shuffled", "shuffling",
     ].join("|");
     const nameThenPhysicalAction = new RegExp(
-        `\\b${escaped}(?:-(?:san|kun|chan|sama|sensei|senpai))?\\b(?:\\s+(?:quietly|carefully|slowly|immediately|suddenly|still|then|just)){0,3}\\s+\\b(?:${physicalVerbs})\\b`,
+        `\\b${escaped}(?:-(?:san|kun|chan|sama|sensei|senpai))?\\b(?:\\s+(?:had|has|have|was|were|is|are|had been|has been|have been|keeps?|kept|continues?|continued|starts?|started|begins?|began))?(?:\\s+(?:quietly|carefully|slowly|immediately|suddenly|still|then|just|already)){0,3}\\s+\\b(?:${physicalVerbs})\\b`,
         "i",
     );
-    if (nameThenPhysicalAction.test(local) && !referenceOnly) return "physical";
+    const physicalMatch = nameThenPhysicalAction.exec(local);
+    if (physicalMatch) {
+        // Reference cues elsewhere in a long sentence must not erase an explicit
+        // current placement/action. Example from the supplied karaoke scene:
+        // "Haru occupied the corner seat ... and would not sing ...". Only
+        // reference/future framing close to the actual subject-action phrase
+        // disqualifies it ("Tomorrow Haru would sit...", "I recalled Haru sat...").
+        const actionStart = Math.max(0, physicalMatch.index - 70);
+        const actionEnd = Math.min(local.length, physicalMatch.index + physicalMatch[0].length + 70);
+        const actionContext = local.slice(actionStart, actionEnd);
+        if (!hasReferenceOnlyCue(actionContext)) return "physical";
+    }
+
+    // Natural ensemble prose often introduces/grounds a character indirectly:
+    // "Alex's calm voice cut through..." or "the figure of Morgan appeared".
+    // These are just as concrete as "Alex said" / "Morgan entered" and must
+    // not be rejected merely because the proper name is possessive or inside an
+    // `of` phrase.
+    const possessiveEmbodiedAction = new RegExp(
+        `\\b${escaped}(?:-(?:san|kun|chan|sama|sensei|senpai))?'s\\s+(?:[a-z0-9'’-]+\\s+){0,4}` +
+        `(?:voice|eyes?|gaze|expression|face|hand|hands|head|shoulders?|body|figure|form|posture)\\b[^.!?]{0,90}` +
+        `\\b(?:cuts?|cut|breaks?|broke|drifts?|drifted|moves?|moved|shifts?|shifted|turns?|turned|lifts?|lifted|drops?|dropped|flicks?|flicked|narrows?|narrowed|widens?|widened|hardens?|hardened|softens?|softened|tenses?|tensed|relaxes?|relaxed|trembles?|trembled|shakes?|shook|settles?|settled)\\b`,
+        "i",
+    );
+    if (possessiveEmbodiedAction.test(local) && !referenceOnly) {
+        return /\b(?:phone|call|line|speaker|radio|intercom)\b/i.test(local) ? "call" : "physical";
+    }
+
+    const figureOfName = new RegExp(
+        `\\b(?:figure|form|silhouette|shape|presence)\\s+of\\s+(?:the\\s+)?${escaped}\\b[^.!?]{0,100}` +
+        `\\b(?:appears?|appeared|emerges?|emerged|enters?|entered|stands?|stood|waits?|waited|moves?|moved|steps?|stepped)\\b`,
+        "i",
+    );
+    if (figureOfName.test(local) && !referenceOnly) return "physical";
+
+    // Copular placement is equally strong scene evidence and is extremely common
+    // in prose: "Morgan is behind the counter", "Alex was by the door". Keep
+    // this deliberately spatial so descriptive statements such as "X is angry"
+    // do not become presence evidence.
+    const spatialPlacement = new RegExp(
+        `\\b${escaped}(?:-(?:san|kun|chan|sama|sensei|senpai))?\\b[^.!?]{0,35}\\b(?:is|are|was|were)\\s+(?:already\\s+|still\\s+)?(?:behind|beside|inside|outside|at|in|near|by|across from|next to|against|under|over|on)\\b`,
+        "i",
+    );
+    if (spatialPlacement.test(local) && !referenceOnly) return "physical";
+
+    // A named character can also be grounded through an explicitly current body
+    // or form state (for example, a character being carried in another embodied form). This catches
+    // "the companion's plush body swinging" without making arbitrary possessives count.
+    const embodiedMotion = new RegExp(
+        `\\b${escaped}(?:-(?:san|kun|chan|sama|sensei|senpai))?'s\\s+(?:[a-z0-9'’-]+\\s+){0,2}(?:body|form|figure|hand|hands|head|feet|foot|arm|arms|shoulder|shoulders)\\s+(?:is\\s+|was\\s+|were\\s+|are\\s+)?(?:swinging|moving|hanging|resting|shifting|trembling|shaking|turning|leaning|lying|sitting|standing)\\b`,
+        "i",
+    );
+    if (embodiedMotion.test(local) && !referenceOnly) return "physical";
+
+    // Limited current-state predicates can establish presence in the live camera
+    // when prose uses a state instead of an action: "Alex is sulking or asleep."
+    const currentPhysicalState = new RegExp(
+        `\\b${escaped}(?:-(?:san|kun|chan|sama|sensei|senpai))?\\b[^.!?]{0,30}\\b(?:is|are|was|were)\\s+(?:already\\s+|still\\s+)?(?:asleep|awake|sulking|seated|standing|sitting|waiting|resting|lying|motionless)\\b`,
+        "i",
+    );
+    if (currentPhysicalState.test(local) && !referenceOnly) return "physical";
 
     // Dialogue attribution can place the name after the verb.
     const dialogueAttribution = new RegExp(
@@ -1373,11 +1657,15 @@ function isEmbeddedDocumentMessage(message, previousMessage) {
     const raw = String(message?.mes || "").trimStart();
     if (!raw) return false;
     if (/^```/.test(raw)) return true;
-    if (/^(?:---+\s*\n+)?\s*#{1,6}\s+[^\n]+/.test(raw)) return true;
 
+    // Markdown headings are normal long-form RP structure in the supplied chats
+    // (date cards, location cards, camera cuts). Never classify a message as an
+    // embedded document merely because it starts with `#`/`##` or `---` + a
+    // heading. Require actual document-reading context from the preceding turn.
     const previous = normalizeForMatch(previousMessage?.mes || "");
+    const headingOrQuote = /^(?:(?:---+)\s*\n+)?\s*(?:#{1,6}\s|>(?:.|\n){20,})/.test(raw);
     if (/\b(?:read|reading|chapter|novel|book|article|post|document|report|letter|message)\b/i.test(previous)
-        && /^(?:#{1,6}\s|>(?:.|\n){20,})/.test(raw)) {
+        && headingOrQuote) {
         return true;
     }
     return false;
@@ -1386,12 +1674,32 @@ function isEmbeddedDocumentMessage(message, previousMessage) {
 function isStrongSceneBoundary(message, previousMessage) {
     const raw = String(message?.mes || "").trimStart();
     if (!raw || isEmbeddedDocumentMessage(message, previousMessage)) return false;
-    const first = normalizeForMatch(raw.slice(0, 420));
+    const firstRaw = raw.slice(0, 700);
+    const first = normalizeForMatch(firstRaw);
 
     if (/^---+\s*(?!#)/.test(raw)) return true;
-    // Common long-form RP scene headers do not always include a horizontal
-    // rule. Treat a leading bold location/time card as a top-level camera cut.
-    if (/^\*\*[^\n*]{2,180}(?:\s[-–—|]\s|\b(?:am|pm)\b)[^\n*]{0,120}\*\*/i.test(raw)) return true;
+
+    // Multi-camera long-form replies frequently contain one or more explicit
+    // horizontal-rule cuts *inside* a single SillyTavern message. Treat that
+    // message as containing a verified boundary so stale physical presence is
+    // cleared and then re-grounded from the final camera block.
+    if (/\n\s*---+\s*\n/.test(raw)) return true;
+
+    // Common long-form RP scene headers may be bold or bold+italic. Support
+    // both **LOCATION — time** and ***LOCATION — time*** forms.
+    if (/^\*{2,3}[^\n*]{2,180}(?:\s[-–—|]\s|\b(?:am|pm)\b)[^\n*]{0,120}\*{2,3}/i.test(raw)) return true;
+
+    // Continuous ingress at the very start of a response is a real location
+    // transition even when the author omits a scene card: entering a shop,
+    // room, building, gate, curtain, etc. Keep this anchored to second-person
+    // movement so ordinary descriptive paragraphs do not reset the cast.
+    const openingIngress = /(?:^|[.!?]\s+)\*?[^.!?]{0,120}\b(?:you|your)\b[^.!?]{0,100}\b(?:enter|entered|step|steps|stepped|walk|walked|pass|passed|push|pushed|cross|crossed|move|moved)\b[^.!?]{0,80}\b(?:inside|through|into|across|past|door|doors|entrance|threshold|gate|noren|curtain|shop|store|room|building|hallway|stairwell)\b/i;
+    if (openingIngress.test(firstRaw)) return true;
+
+    // Another common camera-opening idiom in long-form RP logs:
+    // establish an NPC already waiting at a new location with a concrete time.
+    if (/\b(?:(?:he|she|they)(?:'s| has)|[\p{L}][\p{L}\p{N}'’.-]{1,40} has) been here since\s+\d{1,2}(?::\d{2})?/iu.test(firstRaw)) return true;
+
     return /^(?:hours?|days?|weeks?|months?) later\b/i.test(first)
         || /^(?:the )?next (?:morning|afternoon|evening|night|day)\b/i.test(first)
         || /^the following (?:morning|afternoon|evening|night|day)\b/i.test(first)

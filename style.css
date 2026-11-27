@@ -771,7 +771,10 @@
 /* --- Stat Grid --- */
 .rst-stat-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
+    /* Pending stat cards must remain readable inside narrow ST drawers and on
+       smaller monitors. Categories stack automatically instead of being
+       crushed into three fixed columns. */
+    grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
     gap: 8px;
     margin-top: 8px;
 }
@@ -810,6 +813,11 @@
 
 .rst-sn {
     color: var(--rst-text-muted);
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
 }
 
 .rst-sv {
@@ -823,13 +831,14 @@
 
 /* --- Stat Commentary (hidden until category opened) --- */
 .rst-sc {
-    font-size: 11px;
+    font-size: 12px;
     color: var(--rst-text-muted);
-    line-height: 1.4;
-    padding: 5px 0 2px;
+    line-height: 1.5;
+    padding: 7px 0 2px;
     border-top: 0.5px solid var(--rst-border);
-    margin-top: 3px;
+    margin-top: 4px;
     display: none;
+    overflow-wrap: anywhere;
 }
 
 .rst-stat-cat.open .rst-sc {
@@ -1079,6 +1088,7 @@
     border-radius: 8px;
     overflow: hidden;
     margin-bottom: 8px;
+    container-type: inline-size;
 }
 
 .rst-char-pending-hdr {
@@ -1088,6 +1098,27 @@
     align-items: center;
     gap: 8px;
     cursor: pointer;
+    min-width: 0;
+}
+
+.rst-char-pending-name {
+    font-weight: 500;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.rst-char-pending-count {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--rst-text-muted);
+    white-space: nowrap;
+}
+
+.rst-char-pending-chevron {
+    font-size: 11px;
+    color: var(--rst-text-muted);
+    margin-left: 2px;
+    flex-shrink: 0;
 }
 
 .rst-char-pending-hdr:hover {
@@ -1101,6 +1132,37 @@
 
 .rst-char-pending.open .rst-char-pending-body {
     display: block;
+}
+
+@container (max-width: 420px) {
+    .rst-char-pending-hdr {
+        flex-wrap: wrap;
+        align-items: flex-start;
+    }
+
+    .rst-char-pending-name {
+        flex: 1 1 calc(100% - 70px);
+    }
+
+    .rst-char-pending-count {
+        order: 3;
+        width: 100%;
+        margin-left: 36px;
+        white-space: normal;
+    }
+
+    .rst-char-pending-body {
+        padding: 10px;
+    }
+
+    .rst-stat-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .rst-btn-row > button {
+        flex: 1 1 140px;
+        min-width: 0;
+    }
 }
 
 /* --- Message Action Buttons (Scene Start/End) --- */
@@ -1713,7 +1775,7 @@ dialog.popup .editor_maximize:hover {
     border: 1px solid color-mix(in srgb, #E8A317 40%, transparent);
     padding: 1px 6px;
     border-radius: 100px;
-    margin-left: 6px;
+    margin-left: 2px;
     white-space: nowrap;
     display: inline-flex;
     align-items: center;
@@ -2071,4 +2133,50 @@ dialog.popup .editor_maximize:hover {
     align-items: center;
     gap: 5px;
     font-size: 12px;
+}
+
+/* --- Profile-only discoveries from stat review --- */
+.rst-new-detected-label {
+    margin-top: 14px;
+}
+
+.rst-new-character-proposal {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.rst-new-character-proposal-main {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.rst-new-character-proposal-name {
+    font-size: 13px;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.rst-new-character-proposal-meta {
+    margin-top: 3px;
+    font-size: 11px;
+    color: var(--rst-text-muted);
+}
+
+.rst-new-character-proposal-actions {
+    flex: 0 1 auto;
+    justify-content: flex-end;
+}
+
+@container (max-width: 420px) {
+    .rst-new-character-proposal {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .rst-new-character-proposal-actions {
+        width: 100%;
+        justify-content: stretch;
+    }
 }

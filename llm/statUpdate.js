@@ -98,16 +98,18 @@ async function generateStatUpdateImpl(sceneId, guidance = "") {
         let sceneSummary = "";
         let sceneTitle = "";
         let characterUpdates = [];
+        let newCharactersDetected = [];
 
         // Handle new characters with flexible initial stat generation
         if (newChars.length > 0 || characters.length === 0) {
-            toastr?.info?.("Generating initial stats for new characters...");
+            toastr?.info?.(newChars.length > 0 ? "Generating initial stats for new characters..." : "Reviewing scene and detecting characters...");
             const initialResult = await rstScope1.wait(() => (generateInitialStatsForScene(
                 sceneMessages, newChars, profileName, settings
             )));
             sceneSummary = initialResult.sceneSummary || "";
             sceneTitle = initialResult.sceneTitle || "";
             characterUpdates = characterUpdates.concat(initialResult.characterUpdates || []);
+            newCharactersDetected = newCharactersDetected.concat(initialResult.newCharactersDetected || []);
         }
 
         // Handle existing characters with constrained stat update
@@ -141,6 +143,7 @@ async function generateStatUpdateImpl(sceneId, guidance = "") {
                 sceneTitle = parsed.sceneTitle || "";
             }
             characterUpdates = characterUpdates.concat(parsed.characterUpdates || []);
+            newCharactersDetected = newCharactersDetected.concat(parsed.newCharactersDetected || []);
         }
 
         // If only new characters existed and they generated the scene summary,
@@ -160,6 +163,11 @@ async function generateStatUpdateImpl(sceneId, guidance = "") {
             deleteCharacter(id);
             autoCreatedIdsForChat().delete(id);
         }
+        // Profile-only discovery is intentionally separate from relationship
+        // updates. Keep only genuinely unknown, active scene participants after
+        // the ordinary relationship fallback has had a chance to create any
+        // relationship-relevant newcomers.
+        newCharactersDetected = normalizePendingProfileDetections(newCharactersDetected);
         // Scene-roster enrichment is factual metadata, but it must remain
         // transactional with the stat review. The old path persisted the
         // pre-request candidate scan before the LLM response parsed, so a
@@ -177,6 +185,7 @@ async function generateStatUpdateImpl(sceneId, guidance = "") {
             sceneTitle,
             summaryGuidance: guidance,
             characterUpdates,
+            newCharactersDetected,
             autoCreatedIds: getAutoCreatedIds(),
         };
     } catch (err) {
@@ -209,13 +218,15 @@ function buildStatUpdateSystemPrompt(settings) {
     return [
         'You are a relationship stat update generator.',
         'IMMUTABLE RELATIONSHIP ANCHOR: Every stat, title, commentary, summary, milestone, condition, and lock describes TARGET CHARACTER -> USER/PERSONA. Narrative prominence never changes the anchor. A different NPC may dominate the scene or act as viewpoint character; that does NOT make NPC-to-NPC relationships valid output.',
-        'FAILSAFE CHARACTER DISCOVERY: Identify additional named participants missed by the roster/sidecar. Include them with full stats and commentary, grounded in the scene. Existing profiles use their established state; genuinely new profiles receive initial estimates for review. Do not include reference-only names or generic narrator/card labels.',
+        'FAILSAFE RELATIONSHIP DISCOVERY: Identify additional named participants missed by the roster/sidecar when they have relationship-relevant exposure to the user. Existing profiles use their established state; genuinely new relationship-relevant profiles may still use the existing relationship initialization path.',
+        'PROFILE-ONLY DISCOVERY: ALSO return every actively depicted named individual in detectedCharacters, even when they have no interaction or relationship-relevant exposure to the user. detectedCharacters is only for optional blank profile creation and NEVER implies a stat update. Prefer the name form actually used in the scene; do not expand a partial name from outside knowledge.',
         'Output ONLY a JSON object.',
         '',
         'Schema:',
         '  {',
         '    "sceneTitle": "...",',
         '    "sceneSummary": "...",',
+        '    "detectedCharacters": ["Every actively depicted named individual in the scene, including NPC-only subplot participants"],',
         '    "characters": {',
         '      "[NAME]": {',
         '        "relationshipEvidence": "One factual sentence naming the USER/PERSONA and stating what this target character directly did, observed, learned, or decided about them in this scene; use an empty string when there is no relationship-relevant exposure",',
@@ -247,8 +258,10 @@ function buildStatUpdateSystemPrompt(settings) {
         '',
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
+        '- detectedCharacters is a profile-discovery list, NOT relationship output. Include named people who are actively depicted as present, speaking, acting, observing, or occupying the current/parallel scene even if they never interact with {{user}}. Exclude names that are only mentioned, historical, planned for later, read from a dossier/document, or generic roles/titles without a stable personal name.',
+        '- A name in detectedCharacters does NOT require a characters entry. Do not invent relationship stats just because someone is physically present or has an NPC-only subplot.',
         '- Never substitute a prominent NPC for {{user}}. If the scene spends many paragraphs on another NPC, a rival, a friend, or any other NPC, relationships such as NPC-A->NPC-B, NPC-C->NPC-B, or one NPC caring for another are still OUT OF SCOPE.',
-        '- relationshipEvidence is REQUIRED for every returned character. It must explicitly name {{user}} and identify current scene evidence linking this character to {{user}}. If the character only interacts with another NPC, is merely present in that NPC\'s subplot, or has never met/learned/reacted to {{user}}, use an empty string and leave all relationship state unchanged.',
+        '- relationshipEvidence is REQUIRED for every returned character, but eligibility is NOT the same as change. It must explicitly name {{user}} and identify NEW relationship-relevant evidence from this scene: something this character did, learned, observed, decided, or experienced that could alter their relationship state toward {{user}}. Mere physical/POV presence, whereabouts, routine activity, continued containment, unchanged surveillance, or a report of what the character is doing is NOT relationship evidence. If there is no new relational evidence, use an empty string and leave stats, title, summary, milestones, conditions, and locks unchanged.',
         '- Per-character category visibility is authoritative. If a character is shown with only some visible/active categories, ONLY output stats/commentary/criticalStats/locks/pressure/reviews for those visible categories. Do not infer, update, propose locks for, unlock, or mention hidden categories.',
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
@@ -256,7 +269,7 @@ function buildStatUpdateSystemPrompt(settings) {
         `- proposedConditions: OPTIONAL. Conditions are temporary contextual lenses, not permanent personality traits or buffs. At most ${MAX_NEW_CONDITIONS_PER_UPDATE} new condition per character per scene and never more than ${MAX_ACTIVE_RELATIONSHIP_CONDITIONS} active total. Allowed types: ${getRelationshipConditionCatalogForPrompt()}. Give why it is active and what specific narrative development should resolve it.`,
         '- resolvedConditions: ONLY for an active condition whose stated resolution has actually occurred in this scene. Use the exact condition id shown in CURRENT CHARACTER STATS and explain why it resolved.',
         '- Conditions influence how evidence should be interpreted, but NEVER override hard locks, soft locks, critical-change rules, or established personality. Example: Possessive can raise attention/affection without implying trust; Guarded can make ordinary warmth insufficient for openness.',
-        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Only a critical that actually fires mechanically receives the wider critical range. Still provide your normal stat value for it.',
+        '- criticalStats is a MECHANICAL EXCEPTION, not an importance badge. List "category.stat" ONLY when a genuinely pivotal event justifies a desired stat target OUTSIDE the normal per-scene range, or when the desired target must break an existing hard-lock cap. If the justified movement is still within the normal range (for example +2, +3, or +5 when the normal maximum is +5), DO NOT flag it critical no matter how emotionally important the scene is. For a valid critical candidate, put the FULL desired post-scene target in stats; code will decide whether the critical fires and may clamp it back to the ordinary range. Most scenes have ZERO critical stats.',
         '- proposedHardLocks: OPTIONAL. ONLY for characters marked "Hard-lock eligible: YES". If "NO", you MUST leave this empty for that character. When eligible, and if the character\'s defined personality/psychology/history makes a stat realistically incapable of exceeding a certain level (e.g. a deeply traumatized character who cannot trust past ~40%), propose a cap as {"stat":"category.stat","cap":NUMBER,"reason":"..."}. Propose ONLY when strongly justified \u2014 a hard lock is exceptional, reserved for a true defining ceiling, never routine. Most scenes should propose ZERO. Do not lock a stat just because it is plausible or currently low. When in doubt, leave it empty. Grounded in their stated personality — never guess on a blank slate. Leave empty for most characters. Do NOT propose caps below the stat\'s current value.',
         '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If no slots are open, propose NONE. The "Soft-lock slots OPEN" number is a CEILING, not a target — propose anywhere from zero up to that many, and zero or one is the typical, expected answer. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Each entry: {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. Never propose a lock just to use an available slot — only when it is genuinely warranted by the story.',
         '- unlockedSoftLocks: for any EXISTING soft lock listed in the character\'s data, if its condition was FULFILLED during this scene, list its "category.stat" here. The stat will then auto-unlock and resume normal growth. Only include locks that are genuinely satisfied by what happened.',
@@ -406,7 +419,8 @@ function buildStatUpdateRequestPrompt(messages, characters, pastSummaries, setti
         parts.push(`\nUSER GUIDANCE: ${guidance}`);
     }
 
-    parts.push(`FAILSAFE CHARACTER DISCOVERY: The sidecar may have missed characters, and the supplied roster may be empty. Include an additional named participant ONLY when the messages show relationship-relevant exposure to ${userName}: they directly interact with, observe, learn about, direct, or currently react to ${userName}. Mere activity in another NPC's subplot is insufficient. Never invent a name or treat a generic narrator/card label as a person.`);
+    parts.push(`PROFILE-ONLY DISCOVERY: Populate detectedCharacters with every named person who is actively depicted in this scene, including people in NPC-only subplots who never interact with ${userName}. This list is only for optional blank profile creation. Prefer the name form actually used in the scene. Exclude reference-only names, historical names, future plans, dossier/document names, and generic roles.`);
+    parts.push(`FAILSAFE RELATIONSHIP DISCOVERY: The sidecar may have missed relationship-relevant characters, and the supplied roster may be empty. Add a characters entry ONLY when the messages show relationship-relevant exposure to ${userName}: they directly interact with, observe, learn about, direct, or currently react to ${userName}. Mere activity in another NPC's subplot is insufficient.`);
     parts.push("NO CHANGE IS THE DEFAULT for a mere mention. A known character can change after directly interacting, watching, learning about, directing, or reacting to the persona in a parallel scene. Explain the actual exposure and what it changes toward the persona; NPC-to-NPC feelings do not count.");
 
     // Force JSON-only output
@@ -671,13 +685,27 @@ export function buildEstablishedCharacterUpdate(char, rawCharData, { source = "l
     const statsBefore = cloneStats(char.stats);
     const range = resolvedSettings.statChangeRange || { min: -5, max: 5 };
     const mergedStats = mergeWithExistingStats(statsBefore, charData.stats || {});
-    const firedCriticals = resolveFiredCriticalStats(charData.criticalStats, resolvedSettings);
-    const inertiaResult = applyRelationshipInertia(char, statsBefore, clampStats(mergedStats), firedCriticals, range, charData.criticalStats);
+    const proposedStats = clampStats(mergedStats);
+    // "Critical" is a mechanical exception, not a decorative story label.
+    // A candidate is eligible for RNG only when the requested target actually
+    // needs the wider critical range OR would break an existing hard-lock cap.
+    // Ordinary +1/+2/etc. movement can still be narratively important, but it
+    // is not mechanically critical and must never receive the badge.
+    const qualifiedCriticalCandidates = qualifyCriticalCandidates(
+        charData.criticalStats,
+        statsBefore,
+        proposedStats,
+        range,
+        char.hardLocks,
+        resolvedSettings,
+    );
+    const firedCriticals = resolveFiredCriticalStats(qualifiedCriticalCandidates, resolvedSettings);
+    const inertiaResult = applyRelationshipInertia(char, statsBefore, proposedStats, firedCriticals, range, qualifiedCriticalCandidates);
     const statsAfter = applyDeltaRange(
         statsBefore,
         inertiaResult.statsAfter,
         range,
-        charData.criticalStats,
+        qualifiedCriticalCandidates,
         resolvedSettings,
         char.hardLocks,
         char.softLocks,
@@ -687,6 +715,13 @@ export function buildEstablishedCharacterUpdate(char, rawCharData, { source = "l
     );
     const raisedCaps = statsAfter.__raisedCaps || [];
     const unlockedSoftLocks = statsAfter.__unlockedSoftLocks || [];
+    const effectiveCriticals = filterEffectiveCriticalStats(
+        firedCriticals,
+        statsBefore,
+        statsAfter,
+        range,
+        raisedCaps,
+    );
 
     let commentary = charData.commentary || null;
     if (!commentary || hasEmptyCommentary(commentary)) {
@@ -707,7 +742,7 @@ export function buildEstablishedCharacterUpdate(char, rawCharData, { source = "l
         dynamicTitleBefore: char.dynamicTitle || "",
         dynamicTitleAfter: charData.dynamicTitle || char.dynamicTitle || "",
         narrativeSummary: charData.narrativeSummary || char.narrativeSummary || "",
-        criticalStats: firedCriticals,
+        criticalStats: effectiveCriticals,
         raisedCaps,
         proposedHardLocks: Array.isArray(charData.proposedHardLocks) ? charData.proposedHardLocks : [],
         proposedSoftLocks: Array.isArray(charData.proposedSoftLocks) ? charData.proposedSoftLocks : [],
@@ -746,7 +781,8 @@ function parseStatUpdateResponse(response, characters, messageCount = Infinity, 
         throw new Error("Failed to parse stat update response as JSON. Response may be truncated — try increasing max tokens.");
     }
 
-    if (!parsed.characters || typeof parsed.characters !== "object" || Array.isArray(parsed.characters)) throw new Error("Invalid stat response: missing characters object.");
+    if (parsed.characters === undefined || parsed.characters === null) parsed.characters = {};
+    if (typeof parsed.characters !== "object" || Array.isArray(parsed.characters)) throw new Error("Invalid stat response: characters must be an object.");
     const sceneSummary = parsed.sceneSummary || "";
     const sceneTitle = parsed.sceneTitle || "";
     const characterUpdates = [];
@@ -772,7 +808,80 @@ function parseStatUpdateResponse(response, characters, messageCount = Infinity, 
     }
 
     if (allowDiscovery) appendDiscoveredCharacterUpdates(parsed, characters, characterUpdates, messages);
-    return { sceneSummary, sceneTitle, characterUpdates: dedupeCharacterUpdates(characterUpdates) };
+    const newCharactersDetected = collectProfileOnlyDetections(parsed?.detectedCharacters, messages);
+    return { sceneSummary, sceneTitle, characterUpdates: dedupeCharacterUpdates(characterUpdates), newCharactersDetected };
+}
+
+function normalizeDetectedCharacterList(value) {
+    if (!Array.isArray(value)) return [];
+    const result = [];
+    const seen = new Set();
+    for (const item of value) {
+        const display = String(typeof item === "string" ? item : (item?.name || "")).trim().slice(0, 100);
+        const key = normalizeCharacterName(display);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        result.push(display);
+    }
+    return result;
+}
+
+function inferDetectedProfileMode(name, messages) {
+    const personaName = getContext().name1 || "";
+    const target = normalizeCharacterName(name);
+    let mode = "unknown";
+    for (const message of (Array.isArray(messages) ? messages : [])) {
+        if (!isNarrativeMessage(message)) continue;
+        if (!message.is_user && normalizeCharacterName(message.name || "") === target) mode = "physical";
+
+        // Profile discovery covers the whole reviewed scene, not only whoever
+        // survives into the final camera of a long multi-block assistant turn.
+        // Validate each top-level camera block independently and keep any active
+        // evidence found anywhere in the scene.
+        const blocks = String(message.mes || "").split(/^\s*---+\s*$/gm).map((part) => part.trim()).filter(Boolean);
+        const identityForms = [name, ...normalizeCharacterName(name).split(/\s+/).filter((token) => token.length >= 3)];
+        for (const block of (blocks.length ? blocks : [String(message.mes || "")])) {
+            for (const identity of identityForms) {
+                const inferred = inferActivePresenceMode({ ...message, mes: block }, identity, personaName);
+                if (inferred !== "unknown") mode = inferred;
+            }
+        }
+    }
+    return mode;
+}
+
+function collectProfileOnlyDetections(rawNames, messages) {
+    const personaName = getContext().name1 || "";
+    const detections = [];
+    for (const name of normalizeDetectedCharacterList(rawNames)) {
+        if (isNameBlacklisted(name, [personaName, "{{user}}", "user", "narrator", "story", "assistant", "system"])) continue;
+        if (/\b(?:rpg|roleplay|role play|narrator|storyteller)\b/i.test(name)) continue;
+        const mode = inferDetectedProfileMode(name, messages);
+        if (mode === "unknown") {
+            dlog(`[RST] Rejected profile-only detection ${name}: no active scene evidence.`);
+            continue;
+        }
+        detections.push({ name, mode, source: "stat_scan" });
+    }
+    return detections;
+}
+
+function normalizePendingProfileDetections(detections) {
+    const result = [];
+    const seen = new Set();
+    for (const raw of (Array.isArray(detections) ? detections : [])) {
+        const name = String(raw?.name || raw || "").trim().slice(0, 100);
+        const key = normalizeCharacterName(name);
+        if (!key || seen.has(key)) continue;
+        if (isNameBlacklisted(name, [getContext().name1 || "", "{{user}}", "user"])) continue;
+        // Existing canonical/alias identities are not profile proposals. This also
+        // removes relationship-relevant newcomers created by the established stat
+        // fallback, leaving this section exclusively for profile-only discovery.
+        if (findCharacterByName(name) || findCharacterByFuzzyName(name)) continue;
+        seen.add(key);
+        result.push({ name, mode: String(raw?.mode || "unknown"), source: "stat_scan" });
+    }
+    return result;
 }
 
 // Stat-update discovery is an independent fallback, not another sidecar call.
@@ -807,6 +916,18 @@ function appendDiscoveredCharacterUpdates(parsed, inputCharacters, updates, mess
                 return words.every(word => tokens.includes(word));
             }));
             if (possible.length) continue;
+
+            // New-character fallback discovery must prove relationship-relevant
+            // exposure *before* it creates even a temporary Library profile.
+            // This prevents future plans, reports, friend-group lists, dossiers,
+            // and other reference-only names from briefly becoming characters
+            // just because the model returned speculative initial stats.
+            const probeProfile = { name, nameAliases: [] };
+            if (!hasGroundedRelationshipEvidence(probeProfile, data, messages)) {
+                dlog(`[RST] Rejected discovered identity ${name} before creation: no grounded persona exposure.`);
+                continue;
+            }
+
             const existingIds = new Set(getAllCharacters().map((character) => character.id));
             profile = createCharacter(name, { source: "auto_generated", automatic: true });
             if (!profile) {
@@ -1352,6 +1473,65 @@ function clampStats(stats) {
  * the fired set: a candidate that loses RNG still gets the full *ordinary* range
  * for a pivotal reversal, while only a fired critical receives the widened range.
  */
+
+function parseStatKey(key) {
+    const [cat, stat, extra] = String(key || "").toLowerCase().trim().split(".");
+    if (extra || !STAT_CATEGORIES.includes(cat) || !STAT_NAMES.includes(stat)) return null;
+    return { cat, stat, key: `${cat}.${stat}` };
+}
+
+/**
+ * Critical candidates must request a mechanically exceptional outcome.
+ * Emotional importance alone is insufficient: a normal-range delta is handled
+ * as an ordinary stat update. The one exception is a hard-lock breakthrough,
+ * where even a small numeric delta can be mechanically critical.
+ */
+export function qualifyCriticalCandidates(criticalStats = null, statsBefore = {}, proposedStats = {}, range = null, hardLocks = null, settings = null) {
+    const crit = settings?.criticalChanges || {};
+    if (crit.enabled === false || !Array.isArray(criticalStats) || criticalStats.length === 0) return [];
+    const minDelta = Number.isFinite(range?.min) ? range.min : -5;
+    const maxDelta = Number.isFinite(range?.max) ? range.max : 5;
+    const locksOn = settings?.hardLocks?.enabled !== false;
+    const qualified = [];
+    const seen = new Set();
+
+    for (const raw of criticalStats) {
+        const parsed = parseStatKey(raw);
+        if (!parsed || seen.has(parsed.key)) continue;
+        seen.add(parsed.key);
+        const before = Number(statsBefore?.[parsed.cat]?.[parsed.stat] ?? 0);
+        const proposed = Number(proposedStats?.[parsed.cat]?.[parsed.stat] ?? before);
+        if (!Number.isFinite(before) || !Number.isFinite(proposed)) continue;
+        const delta = proposed - before;
+        const exceedsOrdinaryRange = delta < minDelta || delta > maxDelta;
+        const cap = locksOn ? hardLocks?.[parsed.cat]?.[parsed.stat]?.cap : null;
+        const breaksHardCap = Number.isFinite(cap) && proposed > cap && proposed > before;
+        if (exceedsOrdinaryRange || breaksHardCap) qualified.push(parsed.key);
+    }
+    return qualified;
+}
+
+/**
+ * Keep only criticals that survived downstream clamps and had an actual
+ * mechanical effect visible in the committed state: a wider-than-normal delta
+ * or a hard-lock cap breakthrough.
+ */
+export function filterEffectiveCriticalStats(firedCriticals = [], statsBefore = {}, statsAfter = {}, range = null, raisedCaps = []) {
+    const minDelta = Number.isFinite(range?.min) ? range.min : -5;
+    const maxDelta = Number.isFinite(range?.max) ? range.max : 5;
+    const raised = new Set((Array.isArray(raisedCaps) ? raisedCaps : []).map((item) => String(item?.stat || "").toLowerCase().trim()).filter(Boolean));
+    const effective = [];
+    for (const raw of (Array.isArray(firedCriticals) ? firedCriticals : [])) {
+        const parsed = parseStatKey(raw);
+        if (!parsed) continue;
+        const before = Number(statsBefore?.[parsed.cat]?.[parsed.stat] ?? 0);
+        const after = Number(statsAfter?.[parsed.cat]?.[parsed.stat] ?? before);
+        const delta = after - before;
+        if (delta < minDelta || delta > maxDelta || raised.has(parsed.key)) effective.push(parsed.key);
+    }
+    return [...new Set(effective)];
+}
+
 function resolveFiredCriticalStats(criticalStats = null, settings = null) {
     const crit = settings?.criticalChanges || {};
     if (crit.enabled === false || !Array.isArray(criticalStats) || criticalStats.length === 0) return [];
@@ -1698,7 +1878,7 @@ async function generateInitialStatsForScene(messages, characters, profileName, s
  */
 function buildInitialStatSystemPrompt(settings) {
     return [
-        'You are a relationship stat generator for new characters.',
+        'You are a relationship stat generator and scene character detector.',
         'IMMUTABLE RELATIONSHIP ANCHOR: Every field evaluates TARGET CHARACTER -> USER/PERSONA. Narrative prominence never changes the anchor. Do not evaluate relationships between NPCs.',
         'Output ONLY a JSON object.',
         '',
@@ -1707,6 +1887,7 @@ function buildInitialStatSystemPrompt(settings) {
         '  {',
         '    "sceneTitle": "A short evocative title for this scene",',
         '    "sceneSummary": "Concise summary of the scene...",',
+        '    "detectedCharacters": ["Every actively depicted named individual in the scene, even without user interaction"],',
         '    "characters": {',
         '      "[CHARACTER_NAME]": {',
         '        "relationshipEvidence": "One factual sentence naming the USER/PERSONA and stating what this character directly did, observed, learned, or decided about them in this scene; empty string if none",',
@@ -1735,14 +1916,16 @@ function buildInitialStatSystemPrompt(settings) {
         '',
         'Rules:',
         '- Stats represent character\'s feelings toward {{user}}, not reverse.',
-        '- relationshipEvidence is REQUIRED. Explicitly name {{user}}. If this character only interacts with or thinks about another NPC, or has no relationship-relevant exposure to {{user}}, use an empty string and return unchanged zero stats with empty relationship prose.',
+        '- detectedCharacters is independent profile discovery. Include every actively depicted named person in the scene even if their only activity is with other NPCs. Exclude mention-only, historical, future-plan, dossier/document-only, and generic-role names.',
+        '- A detectedCharacters entry does not require relationshipEvidence, stats, commentary, or any characters entry.',
+        '- relationshipEvidence is REQUIRED. Explicitly name {{user}} and identify concrete relationship-relevant exposure, not merely the character\'s whereabouts, unrelated activity, or mention in a parallel subplot. If this character only interacts with or thinks about another NPC, or has no relationship-relevant exposure to {{user}}, use an empty string and return unchanged zero stats with empty relationship prose.',
         '- A prominent viewpoint NPC is never a substitute for {{user}}. Do not output NPC-A->NPC-B, NPC-C->NPC-B, NPC-D->NPC-B, or any other NPC-to-NPC relationship under a character entry.',
         '- Per-character category visibility is authoritative. If a character is shown with only some visible/active categories, ONLY output stats/commentary/criticalStats/locks/pressure/reviews for those visible categories. Do not infer, update, propose locks for, unlock, or mention hidden categories.',
         '- A character can be affected by a scene WITHOUT face-to-face interaction. If a character observes, surveils, directs, or remotely influences events involving {{user}} (even unknown to {{user}}), their feelings can still shift. Base their stat changes on what they witness, learn, or do from afar — e.g. watching {{user}} can deepen fixation (affection), build a sense of knowing them (openness), or erode/strengthen trust based on what is observed.',
         '- Asymmetric awareness is valid: only update a character based on what THAT character is aware of. If {{user}} does not know a character is involved, {{user}}-facing dynamics may be one-sided, and that is correct.',
         '- proposedMilestones is a REQUIRED ASSESSMENT FIELD for every returned character. Evaluate it on EVERY initial/update result and never omit it. If this scene materially and durably redefines THIS CHARACTER <-> {{user}}, return exactly one factual milestone object with title, description, and relevant domains; otherwise return []. Rarity is not a reason to suppress a qualifying milestone, but do not invent one. Never use an NPC<->NPC event, and do not treat a thank-you, food/comfort gesture, ordinary encouragement, first meeting, routine apology, generic fight, or single vulnerable line as a milestone by itself.',
         `- proposedConditions: OPTIONAL. At most ${MAX_NEW_CONDITIONS_PER_UPDATE} new temporary relationship condition. Allowed types: ${getRelationshipConditionCatalogForPrompt()}. Give why it is active and a specific resolution condition. Conditions are contextual lenses, not permanent personality traits or stat bonuses.`,
-        '- criticalStats: list "category.stat" entries (e.g. "romantic.affection") ONLY for stats where a genuinely PIVOTAL, story-defining moment occurred this scene that would justify a much larger-than-usual shift — a confession, betrayal, rescue, profound vulnerability, or similar turning point. Be sparing: most scenes have ZERO critical stats. Do not flag ordinary progress. Flagging a stat does not guarantee a larger change; it only marks it as eligible. Only a critical that actually fires mechanically receives the wider critical range. Still provide your normal stat value for it.',
+        '- criticalStats: ALWAYS return [] during initial relationship estimation. Initial absolute baselines are not per-scene deltas and cannot be critical changes.',
         '- proposedHardLocks: OPTIONAL. ONLY for characters marked "Hard-lock eligible: YES". If "NO", you MUST leave this empty for that character. When eligible, and if the character\'s defined personality/psychology/history makes a stat realistically incapable of exceeding a certain level (e.g. a deeply traumatized character who cannot trust past ~40%), propose a cap as {"stat":"category.stat","cap":NUMBER,"reason":"..."}. Propose ONLY when strongly justified \u2014 a hard lock is exceptional, reserved for a true defining ceiling, never routine. Most scenes should propose ZERO. Do not lock a stat just because it is plausible or currently low. When in doubt, leave it empty. Grounded in their stated personality — never guess on a blank slate. Leave empty for most characters. Do NOT propose caps below the stat\'s current value.',
         '- proposedSoftLocks: OPTIONAL, eligible characters only, and ONLY if the character\'s "Soft-lock slot" is OPEN. A character may have at most ONE active soft lock at a time, and a cooldown applies after one is set or resolved. If no slots are open, propose NONE. The "Soft-lock slots OPEN" number is a CEILING, not a target — propose anywhere from zero up to that many, and zero or one is the typical, expected answer. A soft lock caps a stat UNTIL {{user}} fulfills a specific narrative condition you define (e.g. romantic.affection capped at 45 until they share several genuine meals together); it is removed by meeting the condition, not by a critical. Each entry: {"stat":"category.stat","cap":NUMBER,"condition":"...","progress":"..."}. Never propose a lock just to use an available slot — only when it is genuinely warranted by the story.',
         '- unlockedSoftLocks: for any EXISTING soft lock listed in the character\'s data, if its condition was FULFILLED during this scene, list its "category.stat" here. The stat will then auto-unlock and resume normal growth. Only include locks that are genuinely satisfied by what happened.',
@@ -1753,6 +1936,7 @@ function buildInitialStatSystemPrompt(settings) {
         '- DECREASES require direct negative relational evidence toward {{user}}; mere distance, silence, awkwardness, or lack of progress is insufficient.',
         '- Range: -100 to 100. 0 = neutral.',
         '- Commentary must be DYNAMIC RELATIONSHIP COMMENTARY, not a scene summary: explain the character-to-{{user}} interpretation behind the stat.',
+        '- narrativeSummary is relationship-state metadata, not a character activity report. Rewrite it ONLY when this update contains an actual relationship-state mutation (stats, dynamic title, milestone, condition, or lock/pressure state). If nothing relational changed, preserve the existing summary exactly.',
         '- Dynamic title: character\'s relationship role/attitude toward {{user}}.',
     ].join('\n');
 }
@@ -1803,15 +1987,16 @@ function buildInitialStatRequestPrompt(messages, characters, settings) {
         parts.push("[" + i + "]" + isUser + " " + speaker + ": " + text);
     });
 
-    // Character discovery instruction — be INCLUSIVE by default
+    // Profile discovery is broader than relationship initialization. The same
+    // response may identify an NPC-only participant for optional profile creation
+    // without inventing a relationship toward the persona.
     parts.push('');
-    parts.push('CRITICAL — Scan for ALL additional characters:');
-    parts.push(`- Identify named individuals only when they have relationship-relevant exposure to ${userName}: direct interaction, observation, learning, direction, or a current reaction/decision about ${userName}.`);
-    parts.push(`- EXCLUDE a character whose only scene role is interacting with another NPC. Being present, speaking, or doing something in an NPC-only subplot does not establish a relationship with ${userName}.`);
-    parts.push('- Example of INCLUDE: a character says "I talked with [Name]" or "[Name] handed me the package" — [Name] is interacting. ALSO INCLUDE remote involvement: "[Name] watched the feed of her" or "[Name]\'s operatives tailed her on his orders" — [Name] is shaping/observing the scene from afar and IS affected by it.');
-    parts.push('- Example of EXCLUDE: "I heard about [Name]\'s reputation" — [Name] is merely discussed with no described interaction.');
-    parts.push(`- When uncertain whether the evidence concerns ${userName} rather than another NPC, do not initialize the relationship.`);
-    parts.push(`Include qualifying characters with full estimates grounded only in their behavior, knowledge, and decisions toward ${userName}.`);
+    parts.push('PROFILE-ONLY DISCOVERY — populate detectedCharacters:');
+    parts.push('- Include every actively depicted named individual in the scene, including NPC-only subplot participants. Prefer the name form actually used in the scene.');
+    parts.push('- Exclude reference-only names, historical names, future plans, dossiers/documents, and generic roles.');
+    parts.push(`RELATIONSHIP DISCOVERY — populate characters only when there is relationship-relevant exposure to ${userName}: direct interaction, observation, learning, direction, or a current reaction/decision about ${userName}.`);
+    parts.push(`- A person may appear in detectedCharacters without any characters entry. Do not initialize a relationship merely because someone is physically present.`);
+    parts.push(`- When uncertain whether relationship evidence concerns ${userName} rather than another NPC, do not initialize the relationship.`);
     parts.push('');
 
     // Force JSON-only output
@@ -1838,7 +2023,8 @@ function parseInitialStatResponse(response, characters, messageCount = Infinity,
         throw new Error("Invalid initial stat response. Retry the scene review.");
     }
 
-    if (!parsed.characters || typeof parsed.characters !== "object" || Array.isArray(parsed.characters)) throw new Error("Invalid stat response: missing characters object.");
+    if (parsed.characters === undefined || parsed.characters === null) parsed.characters = {};
+    if (typeof parsed.characters !== "object" || Array.isArray(parsed.characters)) throw new Error("Invalid stat response: characters must be an object.");
     const sceneSummary = parsed.sceneSummary || "";
     const sceneTitle = parsed.sceneTitle || "";
     const characterUpdates = [];
@@ -1861,7 +2047,8 @@ function parseInitialStatResponse(response, characters, messageCount = Infinity,
     }
 
     appendDiscoveredCharacterUpdates(parsed, characters, characterUpdates, messages);
-    return { sceneSummary, sceneTitle, characterUpdates: dedupeCharacterUpdates(characterUpdates) };
+    const newCharactersDetected = collectProfileOnlyDetections(parsed?.detectedCharacters, messages);
+    return { sceneSummary, sceneTitle, characterUpdates: dedupeCharacterUpdates(characterUpdates), newCharactersDetected };
 }
 
 /**
@@ -1912,8 +2099,12 @@ export function hasGroundedRelationshipEvidence(profile, charData, messages = []
 
     return messages.some((message, index) => {
         if (!isNarrativeMessage(message)) return false;
-        if (profileNames.some((variant) => inferActivePresenceMode(message, variant, personaName) !== "unknown")) return true;
 
+        // Presence is only eligibility for analysis; it is never, by itself,
+        // relationship evidence. A character can be physically on-camera in an
+        // NPC-only setup (or a parallel subplot) without having learned, done,
+        // or experienced anything about the persona. Concrete relational
+        // grounding is proven below from the actual scene text/user exchange.
         const relationalVerb = /\b(?:greet(?:ed|ing|s)?|meet(?:s|ing)?|met|introduc(?:e|es|ed|ing)|speak(?:s|ing)?|spoke|talk(?:s|ed|ing)?|ask(?:s|ed|ing)?|tell(?:s|ing)?|told|answer(?:s|ed|ing)?|reply|replies|replied|watch(?:es|ed|ing)?|observ(?:e|es|ed|ing)|monitor(?:s|ed|ing)?|surveil(?:s|led|ling)?|learn(?:s|ed|ing)?|hear(?:s|d|ing)?|help(?:s|ed|ing)?|protect(?:s|ed|ing)?|treat(?:s|ed|ing)?|touch(?:es|ed|ing)?|hug(?:s|ged|ging)?|kiss(?:es|ed|ing)?|attack(?:s|ed|ing)?|threaten(?:s|ed|ing)?|thank(?:s|ed|ing)?|apologi[sz](?:e|es|ed|ing))\b/i;
         for (const segment of String(message.mes || "").split(/(?<=[.!?])\s+|\n+/)) {
             const normalizedSegment = normalizeNameForMatch(segment);

@@ -24,6 +24,7 @@ import {
     getPresenceModes,
     addNamesToBlacklist,
     isNameBlacklisted,
+    getNameMatchKeys,
     setMessageCounter,
     syncMessageCounterToLiveCount,
     setSidecarRetryDue,
@@ -495,7 +496,7 @@ async function onMessageReceived(mesId, fromAssistant = false) {
                 return;
             }
 
-            dlog("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length, "valid:", result.valid);
+            dlog("[RST] Sidecar detection result — detected:", result.detected.length, "unknown:", result.unknown.length, "currentUnknown:", (result.currentUnknown || []).length, "valid:", result.valid);
 
             // Malformed, truncated, or otherwise invalid sidecar output fails closed.
             // Preserve the current list rather than clearing it or accepting parser noise.
@@ -513,6 +514,11 @@ async function onMessageReceived(mesId, fromAssistant = false) {
             const isExcludedDetectedName = (name) => isNameBlacklisted(name, ["{{user}}", "user", personaName]);
             const filteredDetected = result.detected.filter((name) => !isExcludedDetectedName(name));
             const filteredUnknown = result.unknown.filter((name) => !isExcludedDetectedName(name));
+            const currentUnknownSource = Array.isArray(result.currentUnknown) ? result.currentUnknown : result.unknown;
+            const currentUnknownKeys = new Set(
+                currentUnknownSource.flatMap((name) => getNameMatchKeys(name)),
+            );
+            const isCurrentUnknown = (name) => getNameMatchKeys(name).some((key) => currentUnknownKeys.has(key));
 
             // Build detected character IDs:
             // - filteredDetected: already canonical names from categorizeNames() — map directly
@@ -535,6 +541,7 @@ async function onMessageReceived(mesId, fromAssistant = false) {
             }
             for (const unknownName of filteredUnknown) {
                 if (!requestIsCurrent()) return;
+                if (!isCurrentUnknown(unknownName)) continue;
                 const existing = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
                 if (existing && !detectedIds.has(existing.id)) {
                     detectedIds.add(existing.id);
@@ -552,15 +559,19 @@ async function onMessageReceived(mesId, fromAssistant = false) {
                 // Missing legacy values mean enabled, matching the Settings UI and
                 // the default setting. Only an explicit false disables prompts.
                 if (settings.newCharPopup !== false) {
+                    dlog("[RST] Newcomer proposal reached popup stage:", unknownName, "current=", isCurrentUnknown(unknownName));
                     const created = await showNewCharacterDetected(unknownName, requestIsCurrent);
                     if (!requestIsCurrent()) {
                         dlog("[RST] Sidecar ownership changed during character confirmation — aborting commit");
                         return;
                     }
                     if (created === true) {
-                        // Character was created — re-find and include as present
+                        // Discovery and live presence are separate. A newcomer
+                        // depicted earlier in a multi-camera response still gets
+                        // a profile prompt, but only a newcomer grounded in the
+                        // current/final camera joins the live presence roster.
                         const newChar = findCharacterByFuzzyName(unknownName) || findCharacterByName(unknownName);
-                        if (newChar && !detectedIds.has(newChar.id)) {
+                        if (newChar && isCurrentUnknown(unknownName) && !detectedIds.has(newChar.id)) {
                             newDetected.push(newChar.id);
                             detectedIds.add(newChar.id);
                             detectedModes[newChar.id] = normalizePresenceMode(resultModes[unknownName]);

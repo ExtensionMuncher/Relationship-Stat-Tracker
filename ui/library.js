@@ -2502,7 +2502,10 @@ export async function showNewCharacterDetected(name, stillValid = null, options 
         throw error;
     }
 
-    if (result === POPUP_RESULT.NEGATIVE) {
+    // Popup.show.confirm() is boolean in current SillyTavern, while older
+    // builds/test harnesses may expose POPUP_RESULT.NEGATIVE. Treat both forms
+    // as the user's explicit Ignore action.
+    if (result === false || result === POPUP_RESULT.NEGATIVE) {
         return false;
     }
     if (result !== true && result !== POPUP_RESULT.AFFIRMATIVE) {
